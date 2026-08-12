@@ -81,7 +81,7 @@ afterwards so the enclave re-provisions its vault, then `pnpm seed` again.
 
 ```bash
 pnpm test                                  # policy fixtures, canonicalisation, crypto, invariants
-pnpm test:e2e                              # 21 security, routing and privacy cases (§53–56, §36)
+pnpm test:e2e                              # 26 security, routing and privacy cases (§53–56, §36, §5.1)
 pnpm privacy-test                          # canary sweep across every persisted surface
 pnpm verify-receipt <requestId>            # independent receipt + proof + binding check
 ```

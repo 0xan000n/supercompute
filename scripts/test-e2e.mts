@@ -1200,6 +1200,73 @@ async function run63(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// §5.1 UNKNOWN OUTCOMES
+// ---------------------------------------------------------------------------
+
+async function run64(): Promise<void> {
+  await test("64", "unknown outcome books conservative spend against the cap (slow: ~21s)", async () => {
+    // MODEL_B deliberately: Erin's rate-limited key does not serve it, so the
+    // dispatch this test needs cannot be pre-empted by a 429.
+    const before = new Map(
+      (await getCredentials()).map((c) => [c.id, { requests: c.today.requests, cost: c.today.estimatedCostUsd }])
+    );
+
+    // The mock provider stalls 25s on this prompt; the enclave's provider
+    // timeout is 20s, so the dispatch aborts with no answer — and the upstream
+    // goes on to produce (and, in the real world, bill for) the completion.
+    let completed: string | null = null;
+    let failure: unknown = null;
+    try {
+      completed = (
+        await client.completion({
+          model: MODEL_B,
+          messages: [{ role: "user", content: `summarize this please -HANG ${randomUUID()}` }],
+        })
+      ).requestId;
+    } catch (err) {
+      failure = err;
+    }
+    assert(!completed, `expected the hung dispatch to FAIL, got a completion: ${completed}`);
+    assert(failure instanceof CtnApiError, `expected CtnApiError, got ${String(failure)}`);
+    assert(failure.code === "CTN_PROVIDER_ERROR", `expected CTN_PROVIDER_ERROR, got ${failure.code}`);
+    assert(failure.requestId, "the failure must still name its request");
+    const requestId = failure.requestId;
+
+    const detail = await (await fetch(`${COORD}/v1/requests/${requestId}`)).json();
+    assert(detail.request.status === "FAILED", `expected FAILED, got ${detail.request.status}`);
+
+    // Attempts come back as stored rows, hence snake_case.
+    const attempt = detail.attempts.find((a: any) => a.upstream_outcome_unknown === 1);
+    assert(attempt, `no attempt flagged unknown: ${describeAttempts(detail.attempts)}`);
+    assert(
+      attempt.classification === "timeout",
+      `expected a timeout classification, got ${attempt.classification}`
+    );
+    const assumed = attempt.assumed_spend_micro_usd;
+    assert(typeof assumed === "number" && assumed > 0, `assumed spend must be positive, got ${assumed}`);
+
+    const charged = (await getCredentials()).find((c) => c.id === attempt.credential_id);
+    const was = before.get(attempt.credential_id);
+    assert(was, `credential ${attempt.credential_id} vanished mid-test`);
+    assert(
+      charged.today.estimatedCostUsd > was.cost,
+      `assumed spend must appear in cap accounting: ${was.cost} -> ${charged.today.estimatedCostUsd}`
+    );
+    assert(
+      charged.today.requests === was.requests + 1,
+      `request slot consumed: ${was.requests} -> ${charged.today.requests}`
+    );
+    // The number booked is the enclave's bound, not an invention of the coordinator.
+    const delta = charged.today.estimatedCostUsd - was.cost;
+    assert(
+      Math.abs(delta - assumed / 1_000_000) < 1e-6,
+      `booked $${delta} but the enclave assumed $${assumed / 1_000_000}`
+    );
+    return `${attempt.credential_id} charged ${assumed}µUSD for a timed-out dispatch, requests ${was.requests} -> ${charged.today.requests}`;
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -1263,6 +1330,9 @@ async function main(): Promise<void> {
 
   console.log("\n=== §5.1 SINGLE DISPATCH ===");
   await run63();
+
+  console.log("\n=== §5.1 UNKNOWN OUTCOMES ===");
+  await run64();
 
   // ---- Summary ----
   console.log("\n\n=========================== SUMMARY ===========================");

@@ -14,7 +14,7 @@ import type { SecureRequestEnvelope } from "@ctn/protocol";
 import { db, migrate, nowIso, today } from "./db.js";
 import { safeLog } from "./safe-log.js";
 import { bus, emitEvent, graphSnapshot, startProjector } from "./events.js";
-import { applyAttemptOutcome, discoverCandidates, recordUsage } from "./routing.js";
+import { applyAttemptOutcome, discoverCandidates, recordAssumedUsage, recordUsage } from "./routing.js";
 import {
   EnclaveRejectionError,
   EnclaveUnavailableError,
@@ -551,8 +551,8 @@ async function runSecureRequest(
   for (const attempt of result.attempts) {
     const outcome = applyAttemptOutcome(attempt.credentialId, attempt.status, attempt.classification);
     db.prepare(
-      `INSERT INTO provider_attempts (id, request_id, credential_id, contributor_id, attempt_number, status, http_status, classification, latency_ms, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO provider_attempts (id, request_id, credential_id, contributor_id, attempt_number, status, http_status, classification, latency_ms, created_at, upstream_outcome_unknown, assumed_spend_micro_usd)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       `att_${requestId}_${attempt.attemptNumber}`,
       requestId,
@@ -563,8 +563,37 @@ async function runSecureRequest(
       attempt.httpStatus,
       attempt.classification ?? null,
       attempt.latencyMs,
-      nowIso()
+      nowIso(),
+      attempt.upstreamOutcomeUnknown ? 1 : 0,
+      attempt.assumedSpendMicroUsd ?? null
     );
+
+    /**
+     * §5.1 — the enclave dispatched and never learned the outcome. Nothing
+     * downstream will ever tell us what this cost, and `recordUsage` only runs
+     * for a success, so without this the request is free: no spend, no request
+     * slot, and a wedged provider becomes an unmetered way to drain a
+     * contributor's cap. Book the enclave's conservative upper bound instead.
+     *
+     * The flag alone is the trigger, not the flag AND a number: an unknown
+     * outcome that arrived without a bound still consumed a request slot, and
+     * skipping it because the dollar figure is missing is exactly the
+     * under-counting this guard exists to prevent.
+     */
+    if (attempt.upstreamOutcomeUnknown) {
+      recordAssumedUsage({
+        requestId,
+        credentialId: attempt.credentialId,
+        contributorId: attempt.contributorId,
+        assumedSpendMicroUsd: attempt.assumedSpendMicroUsd ?? 0,
+      });
+      safeLog("warn", "provider.assumed_spend", {
+        request_id: requestId,
+        credential_id: attempt.credentialId,
+        classification: attempt.classification,
+        assumed_spend_micro_usd: attempt.assumedSpendMicroUsd,
+      });
+    }
 
     if (attempt.status === "FAILED") {
       emitEvent("provider.failed", requestId, {

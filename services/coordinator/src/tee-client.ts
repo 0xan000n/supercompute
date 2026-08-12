@@ -150,6 +150,14 @@ export interface AttemptResult {
   httpStatus: number;
   latencyMs: number;
   classification?: string;
+  /**
+   * §5.1 — the enclave dispatched this attempt and never learned the outcome.
+   * The provider may have processed and billed it, so `assumedSpendMicroUsd`
+   * is the conservative upper bound this coordinator must charge against the
+   * credential's cap. Mirrors AttemptRecord in services/tee-sim/src/index.ts.
+   */
+  upstreamOutcomeUnknown?: boolean;
+  assumedSpendMicroUsd?: number;
 }
 
 export interface ExecuteResult {

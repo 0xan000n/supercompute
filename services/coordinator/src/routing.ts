@@ -220,3 +220,53 @@ export function recordUsage(args: {
       WHERE id = ?`
   ).run(args.estimatedCostUsd, today(), args.credentialId);
 }
+
+/**
+ * §5.1 — book the conservative upper bound for a dispatch whose outcome we never
+ * learned (timeout, mid-flight transport failure, a 200 we could not parse).
+ *
+ * The provider may have run the completion and billed for it. Recording nothing
+ * would make a wedged provider the cheapest capacity on the network: every such
+ * request would be free of both cost and request-slot, and a credential could be
+ * drained past its cap without a single counter moving. So an unknown outcome
+ * consumes exactly what a known one does — a request slot plus a cost estimate —
+ * with tokens recorded as 0 because no token count was ever reported.
+ *
+ * Both writes go in one transaction. Half of this pair is worse than neither:
+ * a ledger row without the counter bump silently under-enforces the cap, and a
+ * counter bump without the ledger row makes the dashboard's totals unexplainable.
+ * (node:sqlite has no `db.transaction()` wrapper, hence the explicit BEGIN.)
+ */
+export function recordAssumedUsage(args: {
+  requestId: string;
+  credentialId: string;
+  contributorId: string;
+  assumedSpendMicroUsd: number;
+}): void {
+  const estimatedCostUsd = args.assumedSpendMicroUsd / 1_000_000;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.prepare(
+      `INSERT INTO usage (id, request_id, credential_id, contributor_id, input_tokens, output_tokens, estimated_cost_usd, created_at)
+       VALUES (?, ?, ?, ?, 0, 0, ?, ?)`
+    ).run(
+      `use_${args.requestId}`,
+      args.requestId,
+      args.credentialId,
+      args.contributorId,
+      estimatedCostUsd,
+      nowIso()
+    );
+    db.prepare(
+      `UPDATE credentials
+          SET requests_today = requests_today + 1,
+              estimated_cost_today_usd = estimated_cost_today_usd + ?,
+              usage_day = ?
+        WHERE id = ?`
+    ).run(estimatedCostUsd, today(), args.credentialId);
+    db.exec("COMMIT");
+  } catch (err) {
+    db.exec("ROLLBACK");
+    throw err;
+  }
+}

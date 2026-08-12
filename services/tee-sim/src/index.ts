@@ -247,6 +247,13 @@ export interface AttemptRecord {
   httpStatus: number;
   latencyMs: number;
   classification?: string;
+  /**
+   * §5.1 — dispatched, outcome never learned. These two travel to the
+   * coordinator because the cap accounting lives there: dropping them here
+   * would turn "the provider may have billed us" into "the request was free".
+   */
+  upstreamOutcomeUnknown?: true;
+  assumedSpendMicroUsd?: number;
 }
 
 app.post("/execute", async (request, reply) => {
@@ -389,6 +396,8 @@ app.post("/execute", async (request, reply) => {
       httpStatus: outcome.ok ? outcome.response.httpStatus : outcome.httpStatus,
       latencyMs: outcome.ok ? outcome.response.latencyMs : outcome.latencyMs,
       classification: outcome.ok ? undefined : outcome.classification,
+      upstreamOutcomeUnknown: outcome.ok ? undefined : outcome.upstreamOutcomeUnknown,
+      assumedSpendMicroUsd: outcome.ok ? undefined : outcome.assumedSpendMicroUsd,
     });
 
     if (outcome.ok) {

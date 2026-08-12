@@ -357,11 +357,11 @@ reproducible with `pnpm test`, `pnpm test:e2e`, `pnpm privacy-test` and
 
 | Suite | Cases |
 |---|---|
-| `packages/protocol` | 16 — canonicalisation, commitments, HPKE seal/open/AAD, Ed25519, tamper detection, attestation nonce binding |
+| `packages/protocol` | 19 — canonicalisation, commitments, HPKE seal/open/AAD, Ed25519, tamper detection, attestation nonce binding |
 | `packages/policy` | 7 — 125 fixtures, determinism, normalisation, policy-id stability, hard blocks |
-| `services/tee-sim` | 20 — type-state gate, capability substitution, blob binding, attribution binding, decrypt ordering, egress bypasses |
-| `services/coordinator` | 7 — `safeLog` redaction incl. nesting, arrays, case, depth |
-| `scripts/test-e2e.mts` | 21 — §56 security, §55 routing, §53/§54 canaries, §36 invariants |
+| `services/tee-sim` | 44 — type-state gate, capability substitution, blob binding, attribution binding, decrypt ordering, egress bypasses, pricing, adapter response validation |
+| `services/coordinator` | 9 — `safeLog` redaction incl. nesting, arrays, case, depth; assumed-spend cap accounting and its rollback |
+| `scripts/test-e2e.mts` | 26 — §56 security, §55 routing, §53/§54 canaries, §36 invariants, §5.1 sealed intent, single dispatch and unknown outcomes |
 | `scripts/privacy-test.ts` | 16 surfaces swept for two independent canaries |
 
 Every finding in §2.4, §2.7, §2.8, §2.9 and §2.10 has a regression test, because each

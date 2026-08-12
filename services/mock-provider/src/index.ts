@@ -9,6 +9,13 @@
  *   key ending in AUTH   -> 401
  *   unknown prefix       -> 401
  *
+ * Prompt-content behaviour:
+ *   any message containing "-HANG" -> 25s stall, then a normal 200
+ *
+ * The stall is keyed on the prompt, not the key, because the outcome it
+ * provokes (§5.1 unknown outcome) has to be reachable with a perfectly good
+ * credential.
+ *
  * This service is the ONE place in the local stack that legitimately sees the
  * prompt — it plays the role of the upstream provider, which the spec (§4)
  * explicitly does not hide the prompt from. It records prompts to a canary log
@@ -85,6 +92,18 @@ app.post("/v1/chat/completions", async (request, response) => {
     return response
       .code(400)
       .send({ error: { message: "model and messages are required", type: "invalid_request_error" } });
+  }
+
+  /**
+   * §5.1 — the wedged upstream. Keyed on the PROMPT rather than the key suffix
+   * (unlike RATE/FAIL/AUTH above) so any seeded credential can trigger it: the
+   * behaviour under test is what the network does when a HEALTHY credential's
+   * dispatch never comes back, which a dedicated broken key could not show.
+   * Longer than the enclave's 20s provider timeout, and it still answers
+   * afterwards — a hang is not a refusal, and the provider may well have billed.
+   */
+  if (body.messages.some((m) => typeof m.content === "string" && m.content.includes("-HANG"))) {
+    await new Promise((r) => setTimeout(r, 25_000));
   }
 
   // Deliberate: the upstream provider records what it received (§54 canary proof).
