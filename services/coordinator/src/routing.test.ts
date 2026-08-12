@@ -84,10 +84,16 @@ test("assumed usage enforces the cap exactly like real usage", () => {
 
 /**
  * The ledger row and the cap counters are one fact stated twice. If they can
- * come apart, a wedged provider gets a free request every time the write half
- * fails — so the failure path is tested, not assumed.
+ * come apart, a contributor is charged for a request with nothing on record to
+ * explain it — so the failure path is tested, not assumed.
+ *
+ * This discriminates only because `recordAssumedUsage` bumps the counters BEFORE
+ * the insert that can fail. Written the other way round the insert would throw
+ * first, the counters would never move, and this test would pass with the
+ * transaction deleted. Verified by deleting the BEGIN/COMMIT/ROLLBACK and
+ * watching it fail: `requests_today` came back 2 instead of 1.
  */
-test("a rejected assumed-usage write leaves the cap counters untouched", () => {
+test("a rejected assumed-usage write rolls back the cap counters", () => {
   seedCredential("cred_atomic", "contrib_atomic");
   seedRequest("req_atomic");
 
@@ -100,12 +106,34 @@ test("a rejected assumed-usage write leaves the cap counters untouched", () => {
   recordAssumedUsage(args);
   const after = counters("cred_atomic");
 
-  // Same request id -> the usage insert violates the primary key mid-transaction.
+  // Same request id -> the usage insert violates its primary key, AFTER the
+  // counters for this second booking have already been incremented.
   assert.throws(() => recordAssumedUsage(args));
 
-  assert.deepEqual(counters("cred_atomic"), after, "a rolled-back write must not move the counters");
+  assert.deepEqual(counters("cred_atomic"), after, "the rolled-back bump must not survive");
   const rows = db.prepare(`SELECT COUNT(*) AS n FROM usage WHERE request_id = ?`).get("req_atomic") as unknown as {
     n: number;
   };
   assert.equal(rows.n, 1);
+});
+
+/**
+ * An unknown outcome with no priceable bound still consumed a request slot.
+ * Pins the `?? 0` at the call site: zero dollars is not zero requests.
+ */
+test("a zero-dollar assumed spend still consumes a request slot", () => {
+  seedCredential("cred_zero", "contrib_zero");
+  seedRequest("req_zero");
+
+  const before = counters("cred_zero");
+  recordAssumedUsage({
+    requestId: "req_zero",
+    credentialId: "cred_zero",
+    contributorId: "contrib_zero",
+    assumedSpendMicroUsd: 0,
+  });
+  const after = counters("cred_zero");
+
+  assert.equal(after.requests_today, before.requests_today + 1, "request slot consumed");
+  assert.equal(after.estimated_cost_today_usd, before.estimated_cost_today_usd, "no cost to book");
 });

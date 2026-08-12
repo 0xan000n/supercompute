@@ -236,6 +236,13 @@ export function recordUsage(args: {
  * a ledger row without the counter bump silently under-enforces the cap, and a
  * counter bump without the ledger row makes the dashboard's totals unexplainable.
  * (node:sqlite has no `db.transaction()` wrapper, hence the explicit BEGIN.)
+ *
+ * The counter bump goes FIRST and the ledger insert LAST, because the insert is
+ * the statement that can fail: its primary key is what makes double-booking a
+ * request impossible. Running it last means a duplicate is caught with a counter
+ * already incremented, so the rollback has something real to undo — the ordering
+ * is what gives the transaction a job, rather than merely a wrapper around a
+ * statement that never got that far.
  */
 export function recordAssumedUsage(args: {
   requestId: string;
@@ -247,6 +254,13 @@ export function recordAssumedUsage(args: {
   db.exec("BEGIN IMMEDIATE");
   try {
     db.prepare(
+      `UPDATE credentials
+          SET requests_today = requests_today + 1,
+              estimated_cost_today_usd = estimated_cost_today_usd + ?,
+              usage_day = ?
+        WHERE id = ?`
+    ).run(estimatedCostUsd, today(), args.credentialId);
+    db.prepare(
       `INSERT INTO usage (id, request_id, credential_id, contributor_id, input_tokens, output_tokens, estimated_cost_usd, created_at)
        VALUES (?, ?, ?, ?, 0, 0, ?, ?)`
     ).run(
@@ -257,16 +271,16 @@ export function recordAssumedUsage(args: {
       estimatedCostUsd,
       nowIso()
     );
-    db.prepare(
-      `UPDATE credentials
-          SET requests_today = requests_today + 1,
-              estimated_cost_today_usd = estimated_cost_today_usd + ?,
-              usage_day = ?
-        WHERE id = ?`
-    ).run(estimatedCostUsd, today(), args.credentialId);
     db.exec("COMMIT");
   } catch (err) {
-    db.exec("ROLLBACK");
+    // SQLite auto-rolls-back some errors (BUSY, IOERR, full-disk), which makes
+    // this ROLLBACK a "no transaction is active" throw that would replace the
+    // error the caller actually needs to see.
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      /* already rolled back */
+    }
     throw err;
   }
 }
