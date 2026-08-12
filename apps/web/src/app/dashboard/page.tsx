@@ -168,30 +168,40 @@ export default function DashboardPage() {
                       </div>
                     </div>
 
-                    <div className="flex flex-wrap gap-1.5">
-                      <Button
-                        variant={credential.status === "ACTIVE" ? "ghost" : "secondary"}
-                        busy={busyId === credential.id}
-                        onClick={() =>
-                          mutate(credential.id, {
-                            status: credential.status === "ACTIVE" ? "DISABLED" : "ACTIVE",
-                          })
-                        }
-                        className="!px-3 !py-1.5 !text-[12px]"
-                      >
-                        {credential.status === "ACTIVE" ? "Disable" : "Enable"}
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        busy={busyId === credential.id}
-                        onClick={() =>
-                          mutate(credential.id, { weight: credential.weight === 1 ? 2 : 1 })
-                        }
-                        className="!px-3 !py-1.5 !text-[12px]"
-                      >
-                        Weight ×{credential.weight === 1 ? 2 : 1}
-                      </Button>
-                    </div>
+                    {/* Revocation is terminal server-side: a DELETED credential
+                        refuses status writes with CTN_CREDENTIAL_DELETED. Offering
+                        an "Enable" button that can only ever error would present
+                        that rule as a glitch, so a revoked credential keeps its row
+                        — the usage history is still the contributor's — and loses
+                        its controls. */}
+                    {credential.status === "DELETED" ? (
+                      <span className="text-[11.5px] text-ink-4">revoked · not routable</span>
+                    ) : (
+                      <div className="flex flex-wrap gap-1.5">
+                        <Button
+                          variant={credential.status === "ACTIVE" ? "ghost" : "secondary"}
+                          busy={busyId === credential.id}
+                          onClick={() =>
+                            mutate(credential.id, {
+                              status: credential.status === "ACTIVE" ? "DISABLED" : "ACTIVE",
+                            })
+                          }
+                          className="!px-3 !py-1.5 !text-[12px]"
+                        >
+                          {credential.status === "ACTIVE" ? "Disable" : "Enable"}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          busy={busyId === credential.id}
+                          onClick={() =>
+                            mutate(credential.id, { weight: credential.weight === 1 ? 2 : 1 })
+                          }
+                          className="!px-3 !py-1.5 !text-[12px]"
+                        >
+                          Weight ×{credential.weight === 1 ? 2 : 1}
+                        </Button>
+                      </div>
+                    )}
                   </div>
 
                   <div className="mt-3 grid gap-x-6 gap-y-0 sm:grid-cols-2">

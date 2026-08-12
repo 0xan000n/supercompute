@@ -347,7 +347,37 @@ app.patch("/v1/credentials/:id", async (request, reply) => {
     | undefined;
   if (!row) return reply.code(404).send({ error: { code: "CTN_INTERNAL", message: "unknown credential" } });
 
-  if (body.status) {
+  if (body.status !== undefined) {
+    /**
+     * The TypeScript annotation on `body` is a description of what callers are
+     * supposed to send, not a check — this handler previously wrote whatever
+     * string arrived straight into the status column. Two rules, both of which
+     * something else in this system already claims to be true:
+     *
+     * 1. Only ACTIVE and DISABLED are settable. DELETED is reached through
+     *    DELETE, and an unrecognised status would silently make a credential
+     *    unroutable (routing tests `status !== 'ACTIVE'`) under a name nothing
+     *    else understands.
+     * 2. Revocation is terminal. The e2e smoke tests revoke a REAL provider key
+     *    by DELETE and the docs say it is "never routable again"; without this,
+     *    one PATCH {status:"ACTIVE"} put that key back in the pool.
+     */
+    if (body.status !== "ACTIVE" && body.status !== "DISABLED") {
+      return reply.code(400).send({
+        error: {
+          code: "CTN_INVALID_STATUS",
+          message: "status must be ACTIVE or DISABLED; use DELETE to revoke a credential",
+        },
+      });
+    }
+    if (row.status === "DELETED") {
+      return reply.code(409).send({
+        error: {
+          code: "CTN_CREDENTIAL_DELETED",
+          message: "This credential was revoked. Revocation is terminal — contribute a new credential.",
+        },
+      });
+    }
     db.prepare(`UPDATE credentials SET status = ?, cooldown_until = NULL WHERE id = ?`).run(body.status, id);
   }
   if (body.weight !== undefined) {

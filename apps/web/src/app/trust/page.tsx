@@ -119,6 +119,11 @@ export default function TrustPage() {
               />
               <Claim
                 negative
+                title="The numbers on this build came from a mock upstream"
+                body="pnpm seed contributes five mock provider keys against ctn/demo-model-*, so every count, latency and dollar figure on the graph, contributor and trust pages — including the measurement below — is stand-in traffic. The Anthropic and OpenAI adapters are real and are exercised by two opt-in smoke cases; unless those were run with a key, nothing on this build is paid inference."
+              />
+              <Claim
+                negative
                 title="Safety Policy v1 is not proof of harmlessness"
                 body="The proof establishes SafetyPolicyV1(request) == ALLOW and nothing more. The policy is a small deterministic scoring engine with false positives and false negatives. Correct phrasing is “verified against Safety Policy v1”; “cryptographically proven safe” would be a lie."
               />
@@ -291,14 +296,16 @@ npx tsx scripts/test-e2e.mts        # security, routing and privacy canary suite
 npx tsx scripts/verify-receipt.ts <requestId>   # independent receipt + proof check
 npx tsx scripts/privacy-test.ts     # canary sweep across every stored surface
 
-ANTHROPIC_API_KEY=sk-ant-… npx tsx scripts/test-e2e.mts   # adds the real-provider smoke case`}
+ANTHROPIC_API_KEY=sk-ant-… OPENAI_API_KEY=sk-… npx tsx scripts/test-e2e.mts   # adds the two real-provider smoke cases`}
             </pre>
             <p>
               Unless that last line was run, every number on this build came from the local mock
               upstream: the adapters that call Anthropic and OpenAI are real and are exercised by
-              those two cases, but the seeded demo traffic is not paid inference. The smoke case
-              contributes the key, spends well under a cent, and revokes the credential afterwards
-              whether it passed or failed.
+              those two cases, but the seeded demo traffic is not paid inference. Each case
+              contributes its key, spends well under a cent, and revokes the credential afterwards
+              whether it passed or failed. Revocation takes the credential out of routing for good
+              — it does not erase the sealed ciphertext from the enclave vault, so rotate any key
+              you smoke-test with, or run <span className="mono">pnpm reset</span> afterwards.
             </p>
             <p>
               The privacy sweep submits a unique canary prompt and a unique credential secret, then

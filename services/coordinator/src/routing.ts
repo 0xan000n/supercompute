@@ -174,8 +174,18 @@ export function applyAttemptOutcome(
   if (classification === "auth_failed") {
     // A credential the provider rejects is useless and possibly revoked: disable
     // it rather than retrying it on every subsequent request.
+    //
+    // The CASE guard is not decoration. A dispatch already in flight when the
+    // credential is DELETED lands here afterwards, and a plain write to
+    // 'DISABLED' would move a revoked row back into a status that PATCH is
+    // allowed to flip to ACTIVE — resurrecting, by way of a failure handler,
+    // exactly the key the owner revoked.
     db.prepare(
-      `UPDATE credentials SET status = 'DISABLED', failure_count = failure_count + 1, last_used_at = ? WHERE id = ?`
+      `UPDATE credentials
+          SET status = CASE WHEN status = 'DELETED' THEN 'DELETED' ELSE 'DISABLED' END,
+              failure_count = failure_count + 1,
+              last_used_at = ?
+        WHERE id = ?`
     ).run(nowIso(), credentialId);
     return { action: "disabled" };
   }

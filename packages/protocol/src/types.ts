@@ -362,6 +362,12 @@ export type CtnErrorCode =
   | "CTN_INTENT_REPLAY"
   | "CTN_ATTESTATION_REQUIRED"
   | "CTN_ENCLAVE_UNAVAILABLE"
+  /** §50 — a capability is derived once from the sealed intent and never edited. */
+  | "CTN_CAPABILITY_IMMUTABLE"
+  /** A credential status write that is not one of the two states a caller may set. */
+  | "CTN_INVALID_STATUS"
+  /** Revocation is terminal: a DELETED credential cannot be brought back. */
+  | "CTN_CREDENTIAL_DELETED"
   | "CTN_INTERNAL";
 
 export interface CtnError {

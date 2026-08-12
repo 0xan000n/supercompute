@@ -81,7 +81,7 @@ afterwards so the enclave re-provisions its vault, then `pnpm seed` again.
 
 ```bash
 pnpm test                                  # policy fixtures, canonicalisation, crypto, invariants
-pnpm test:e2e                              # 27 security, routing and privacy cases (§53–56, §36, §5.1)
+pnpm test:e2e                              # 28 security, routing and privacy cases (§53–56, §36, §5.1)
 pnpm privacy-test                          # canary sweep across every persisted surface
 pnpm verify-receipt <requestId>            # independent receipt + proof + binding check
 ```
@@ -97,7 +97,8 @@ ANTHROPIC_API_KEY=sk-ant-… OPENAI_API_KEY=sk-… pnpm test:e2e   # adds cases 
 Each contributes the key as a capped credential, sends one 16-token prompt (well
 under a cent), asserts the receipt carries real provider-reported token counts and
 the pinned price table's digest, and then revokes the credential — whether the case
-passed or failed. Revocation removes it from routing; it does not erase the sealed
+passed or failed. Revocation is terminal: the coordinator refuses to write any status
+over `DELETED`, so a revoked key cannot be re-enabled. It does not erase the sealed
 ciphertext from the enclave vault, so rotate any key you smoke-test with, or
 `pnpm reset` afterwards.
 

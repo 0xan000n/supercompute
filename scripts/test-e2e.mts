@@ -75,6 +75,13 @@ interface TestResult {
   detail: string;
 }
 const results: TestResult[] = [];
+/**
+ * Cases that did not run at all. Tracked separately and printed in the summary
+ * because "27/27 passed" over a suite that quietly skipped two of its cases
+ * reads as full coverage, which is the one thing a test summary must not
+ * misrepresent.
+ */
+const skipped: Array<{ id: string; name: string; reason: string }> = [];
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(msg);
@@ -198,13 +205,20 @@ async function getCredentials(): Promise<any[]> {
   const json = (await res.json()) as { data: any[] };
   return json.data;
 }
-async function patchCredential(id: string, body: Record<string, unknown>): Promise<any> {
+/** PATCH with the HTTP status kept — a refusal is only testable if its code survives. */
+async function patchCredentialRaw(
+  id: string,
+  body: Record<string, unknown>
+): Promise<{ status: number; json: any }> {
   const res = await fetch(`${COORD}/v1/credentials/${id}`, {
     method: "PATCH",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
-  return res.json();
+  return { status: res.status, json: await res.json().catch(() => ({})) };
+}
+async function patchCredential(id: string, body: Record<string, unknown>): Promise<any> {
+  return (await patchCredentialRaw(id, body)).json;
 }
 
 /** Mirrors ComputeTrustClient.sealRequest but allows overriding the request nonce. */
@@ -1312,13 +1326,20 @@ async function contributeViaClient(input: {
   allowedModels: string[];
   label: string;
 }): Promise<{ id: string }> {
-  const contributor = (await (
-    await fetch(`${COORD}/v1/contributors`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ displayName: input.label }),
-    })
-  ).json()) as { id: string };
+  const contributorRes = await fetch(`${COORD}/v1/contributors`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ displayName: input.label }),
+  });
+  // Not `assert(res.ok, `…${await res.text()}`)`: the template argument is
+  // evaluated before the assertion runs, which consumes the body the success
+  // path is about to parse.
+  if (!contributorRes.ok) {
+    throw new Error(
+      `could not create a contributor: ${contributorRes.status} ${await contributorRes.text()}`
+    );
+  }
+  const contributor = (await contributorRes.json()) as { id: string };
 
   const credential = await client.contributeCredential({
     contributorId: contributor.id,
@@ -1393,7 +1414,9 @@ async function submitPrompt(
  * Takes the credential out of the pool for good.
  *
  * DELETE, not `status: DISABLED`: a disable is a PATCH away from being an
- * ACTIVE real key again. What this CANNOT do is erase the sealed secret from
+ * ACTIVE real key again, whereas the coordinator refuses any status write on a
+ * DELETED row (409 CTN_CREDENTIAL_DELETED — case 66 holds it to that). What
+ * this CANNOT do is erase the sealed secret from
  * the enclave vault on disk (`pnpm reset` does that), so a live-key run should
  * still be followed by rotating the key upstream. Never throws — it runs while
  * an assertion failure may already be in flight, and replacing that failure
@@ -1410,6 +1433,92 @@ async function revokeCredential(id: string): Promise<string> {
 }
 
 /**
+ * Revokes by LABEL, not by the id the happy path returned.
+ *
+ * The id only exists once `contributeViaClient` has returned, and the case that
+ * matters is the one where the credential row was written and the call threw
+ * anyway. Cleaning up by the label the run chose means a live key cannot survive
+ * the test just because the suite lost track of its id. Never throws: it runs
+ * while an assertion failure may already be in flight.
+ */
+async function revokeSmokeCredentials(label: string): Promise<{ ok: boolean; detail: string }> {
+  let targets: any[];
+  try {
+    targets = (await getCredentials()).filter((c) => c.label === label && c.status !== "DELETED");
+  } catch (err) {
+    return { ok: false, detail: `could not list credentials: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  if (targets.length === 0) return { ok: true, detail: "nothing to revoke" };
+  const results: string[] = [];
+  for (const target of targets) results.push(`${target.id}=${await revokeCredential(target.id)}`);
+  return { ok: results.every((r) => r.endsWith("=DELETED")), detail: results.join(", ") };
+}
+
+// ---------------------------------------------------------------------------
+// §50 REVOCATION IS TERMINAL
+// ---------------------------------------------------------------------------
+
+async function run66(): Promise<void> {
+  await test("66", "revocation is terminal: a DELETED credential cannot be re-activated", async () => {
+    const label = `terminal-revocation-${randomHex(4)}`;
+    const cred = await contributeViaClient({
+      provider: "mock",
+      apiKey: `mock-provider-key-${label}`,
+      allowedModels: [MODEL_A],
+      label,
+    });
+
+    // A status the API does not define is not "some other state" — it is a
+    // string nothing downstream understands, written into the column routing
+    // reads. Refused, and the refusal has to be inert.
+    const bogus = await patchCredentialRaw(cred.id, { status: "TOTALLY_FINE" });
+    assert(bogus.status === 400, `expected 400 for an undefined status, got ${bogus.status}`);
+    assert(bogus.json.error?.code === "CTN_INVALID_STATUS", `got ${bogus.json.error?.code}`);
+    assert(
+      (await getCredentials()).find((c) => c.id === cred.id)?.status === "ACTIVE",
+      "a refused status write must not touch the row"
+    );
+
+    assert((await revokeCredential(cred.id)) === "DELETED", "DELETE should leave the credential DELETED");
+
+    // The claim under test. The real-provider smoke tests below revoke a live
+    // API key exactly this way, and both the README and VALIDATION say a revoked
+    // credential is never routable again — which is only true if the coordinator
+    // refuses to write ACTIVE over DELETED.
+    const revive = await patchCredentialRaw(cred.id, { status: "ACTIVE" });
+    assert(revive.status === 409, `expected 409 reviving a revoked credential, got ${revive.status}`);
+    assert(revive.json.error?.code === "CTN_CREDENTIAL_DELETED", `got ${revive.json.error?.code}`);
+    assert(
+      (await getCredentials()).find((c) => c.id === cred.id)?.status === "DELETED",
+      "the revoked credential must still be DELETED"
+    );
+
+    // Status is the field routing reads, so unroutable follows from it — but the
+    // point of the guard is traffic, so check traffic.
+    for (let i = 0; i < 3; i++) {
+      let requestId: string | undefined;
+      try {
+        requestId = (
+          await client.completion({
+            model: MODEL_A,
+            messages: [{ role: "user", content: `post-revocation-${i} ${randomUUID()}` }],
+          })
+        ).requestId;
+      } catch (err) {
+        requestId = err instanceof CtnApiError ? err.requestId : undefined;
+      }
+      if (!requestId) continue;
+      const detail = await (await fetch(`${COORD}/v1/requests/${requestId}`)).json();
+      assert(
+        !detail.attempts.some((a: any) => a.credential_id === cred.id),
+        `a revoked credential was dispatched to on request ${requestId}`
+      );
+    }
+    return `undefined status=400 CTN_INVALID_STATUS (inert), re-activation=409 CTN_CREDENTIAL_DELETED, 0 attempts after revocation`;
+  });
+}
+
+/**
  * The one test in this suite that talks to a real provider on a real account.
  *
  * Skipped unless the key is present, and gated per provider rather than as a
@@ -1423,21 +1532,21 @@ async function runRealProviderSmoke(
 ): Promise<void> {
   const apiKey = process.env[envVar];
   if (!apiKey) {
+    const reason = `no ${envVar}`;
+    skipped.push({ id, name: `REAL ${provider} round-trip`, reason });
     console.log(`  · skipping real-provider smoke for ${provider} (set ${envVar} to run)`);
     return;
   }
 
   await test(id, `REAL ${provider} round-trip (spends ~<$0.01)`, async () => {
-    const cred = await contributeViaClient({
-      provider,
-      apiKey,
-      allowedModels: [model],
-      label: `smoke-${provider}`,
-    });
-
+    const label = `smoke-${provider}`;
     let detail: string;
-    let revokedStatus = "not attempted";
+    let credId = "(never contributed)";
+    let revocation: { ok: boolean; detail: string } = { ok: false, detail: "not attempted" };
+    // The contribution is INSIDE the try: it is the statement that puts a real
+    // key in the vault, so it is the first statement the cleanup must cover.
     try {
+      credId = (await contributeViaClient({ provider, apiKey, allowedModels: [model], label })).id;
       const res = await submitPrompt("Reply with the single word: pong", { model, maxTokens: 16 });
       assert(
         res.status === "COMPLETE",
@@ -1447,7 +1556,7 @@ async function runRealProviderSmoke(
       // the pool, so a route anywhere else would mean the assertions below are
       // describing some other key's traffic.
       assert(
-        res.route?.credential_id === cred.id,
+        res.route?.credential_id === credId,
         `the smoke credential should have served it, got ${res.route?.credential_id}`
       );
       assert(res.receipt, "a COMPLETE request must carry a signed receipt");
@@ -1462,15 +1571,19 @@ async function runRealProviderSmoke(
         `est $${cost.toFixed(6)} from price table ${res.receipt.usage.pricingTableDigest?.slice(0, 10)}`;
     } finally {
       // A real key must not outlive this test, whether it passed or failed.
-      revokedStatus = await revokeCredential(cred.id);
-      if (revokedStatus !== "DELETED") {
+      revocation = await revokeSmokeCredentials(label);
+      if (!revocation.ok) {
         console.log(
-          `\n  !! ${provider} smoke credential ${cred.id} is ${revokedStatus}, NOT revoked — rotate that key`
+          `\n  !! ${provider} smoke credential NOT revoked (${revocation.detail}) — rotate that key`
         );
       }
     }
-    assert(revokedStatus === "DELETED", `the smoke credential must not survive the test, got ${revokedStatus}`);
-    return `${detail}; credential ${cred.id} revoked`;
+    assert(revocation.ok, `the smoke credential must not survive the test: ${revocation.detail}`);
+    assert(
+      revocation.detail.includes(`${credId}=DELETED`),
+      `the contributed credential ${credId} was not the one revoked: ${revocation.detail}`
+    );
+    return `${detail}; credential ${credId} revoked`;
   });
 }
 
@@ -1545,20 +1658,36 @@ async function main(): Promise<void> {
   console.log("\n=== §5.1 PROVIDER CATALOG ===");
   await run65();
 
+  console.log("\n=== §50 REVOCATION IS TERMINAL ===");
+  await run66();
+
   console.log("\n=== §5.1 REAL PROVIDER SMOKE (env-gated) ===");
   await runRealProviderSmoke("70", "anthropic", "ANTHROPIC_API_KEY", "claude-haiku-4-5-20251001");
   await runRealProviderSmoke("71", "openai", "OPENAI_API_KEY", "gpt-4o-mini-2024-07-18");
 
   // ---- Summary ----
   console.log("\n\n=========================== SUMMARY ===========================");
-  const idWidth = Math.max(...results.map((r) => r.id.length), 6);
-  const nameWidth = Math.min(70, Math.max(...results.map((r) => r.name.length)));
+  const idWidth = Math.max(...results.map((r) => r.id.length), ...skipped.map((s) => s.id.length), 6);
+  const nameWidth = Math.min(
+    70,
+    Math.max(...results.map((r) => r.name.length), ...skipped.map((s) => s.name.length))
+  );
   for (const r of results) {
     const status = r.pass ? "PASS" : "FAIL";
     console.log(`${status.padEnd(5)} [${r.id.padEnd(idWidth)}] ${r.name.padEnd(nameWidth)} ${r.pass ? "" : "— " + r.detail}`);
   }
+  for (const s of skipped) {
+    console.log(`SKIP  [${s.id.padEnd(idWidth)}] ${s.name.padEnd(nameWidth)} — ${s.reason}`);
+  }
   const passCount = results.filter((r) => r.pass).length;
-  console.log(`\n${passCount}/${results.length} passed.`);
+  // The skip count is part of the headline, not a footnote: a suite that ran 27
+  // of 29 cases has not verified 29 things.
+  console.log(
+    `\n${passCount}/${results.length} passed` +
+      (skipped.length > 0
+        ? `, ${skipped.length} skipped (${skipped.map((s) => `${s.id}: ${s.reason}`).join("; ")}).`
+        : ".")
+  );
 
   // ---- State restoration check ----
   const finalCreds = await getCredentials();

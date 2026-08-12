@@ -359,17 +359,38 @@ case 65 fails if any published model id matches the alias shape.
 Two e2e cases (70, 71) contribute a real key, send one 16-token prompt, assert the
 receipt carries provider-reported token counts and the pinned price table's digest,
 and revoke the credential in a `finally` so a failed assertion cannot leave a live
-key routable. They are skipped — with a printed reason — unless the key is present:
+key routable — by label rather than by id, because the case worth designing for is a
+contribution that persisted a row and then threw. They are skipped — with a printed
+reason, and counted as skipped in the summary — unless the key is present:
 
 ```bash
 ANTHROPIC_API_KEY=sk-ant-… OPENAI_API_KEY=sk-… pnpm test:e2e
 ```
 
 They deliberately do not use the suite's rate-limit retry helper: a real 429 is the
-result, not something to spend past. Revocation is a `DELETE` (status `DELETED`,
-never routable again) rather than a `DISABLED` a later `PATCH` could undo — but it
-does not erase the sealed ciphertext from the enclave vault, so a key smoke-tested
-here should be rotated, or `pnpm reset` run afterwards.
+result, not something to spend past.
+
+### Revocation had to be made terminal before it could be described as terminal
+
+Revocation is a `DELETE` (status `DELETED`) rather than a `DISABLED` that a later
+`PATCH` could undo. That sentence was written first and was not true: the PATCH
+handler took the caller's `status` string on trust — its TypeScript annotation was a
+description, not a check — so `PATCH {status:"ACTIVE"}` revived a revoked credential,
+and any unrecognised string could be written straight into the column routing reads.
+A failure handler could do it accidentally too: an `auth_failed` dispatch already in
+flight when the DELETE landed wrote `DISABLED` over `DELETED`, which is a status PATCH
+*is* allowed to flip back to ACTIVE.
+
+Now the coordinator refuses a status outside `{ACTIVE, DISABLED}` with 400
+`CTN_INVALID_STATUS`, refuses any status write on a `DELETED` row with 409
+`CTN_CREDENTIAL_DELETED`, and the failure handler's disable is written so it can never
+resurrect a revoked row. E2E case 66 asserts all three, including that the refusals are
+inert and that no traffic reaches the credential afterwards. The dashboard drops the
+enable/disable control on a revoked row rather than offering a button that can only
+error.
+
+What revocation still does **not** do is erase the sealed ciphertext from the enclave
+vault, so a key smoke-tested here should be rotated, or `pnpm reset` run afterwards.
 
 ---
 
@@ -466,7 +487,7 @@ reproducible with `pnpm test`, `pnpm test:e2e`, `pnpm privacy-test` and
 | `packages/policy` | 7 — 125 fixtures, determinism, normalisation, policy-id stability, hard blocks |
 | `services/tee-sim` | 48 — type-state gate, capability substitution, blob binding, attribution binding, decrypt ordering, egress bypasses, pricing, adapter response validation, sealed-intent parsing |
 | `services/coordinator` | 12 — `safeLog` redaction incl. nesting, arrays, case, depth, key names and `sk-` values; assumed-spend cap accounting and its rollback |
-| `scripts/test-e2e.mts` | 27 — §56 security, §55 routing, §53/§54 canaries, §36 invariants, §5.1 sealed intent, single dispatch, unknown outcomes and the provider catalog — plus 2 env-gated real-provider cases that are skipped without a key |
+| `scripts/test-e2e.mts` | 28 — §56 security, §55 routing, §53/§54 canaries, §36 invariants, §5.1 sealed intent, single dispatch, unknown outcomes, the provider catalog and terminal revocation — plus 2 env-gated real-provider cases, counted as skipped in the summary rather than silently absent |
 | `scripts/privacy-test.ts` | 16 surfaces swept for two independent canaries |
 
 Every finding in §2.4, §2.7, §2.8, §2.9 and §2.10 has a regression test, because each
