@@ -8,7 +8,7 @@
  * only replaces the transport.
  */
 import type { AuthorizedRequest, AuthorizedCredential } from "./authorize.js";
-import { canonicalHash } from "@ctn/protocol";
+import { canonicalHash, sha256Hex } from "@ctn/protocol";
 import {
   assertPriced,
   estimateCostMicroUsd,
@@ -217,9 +217,21 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       temperature: request.request.temperature_millis / 1000,
       max_tokens: request.request.max_tokens,
     };
-    // Hash of what we sent upstream — binds the receipt to the exact upstream
-    // call without recording its contents (§30).
-    const upstreamRequestHash = "0x" + canonicalHash(body);
+    /**
+     * Digest of the EXACT bytes sent upstream — binds the receipt to the
+     * upstream call without recording its contents (§30).
+     *
+     * Deliberately sha256 over the serialized body rather than
+     * `canonicalHash(body)`. Canonical JSON rejects non-integer numbers by
+     * design, and `temperature` here is `temperature_millis / 1000` — so an
+     * ordinary temperature of 0.7 threw a CanonicalizationError out of
+     * `complete()` entirely, handing the routing loop an unclassified exception
+     * instead of a ProviderOutcome. Hashing the wire bytes is also the stronger
+     * claim: it commits to what the provider actually received, not to a
+     * canonicalized reconstruction of it.
+     */
+    const bodyJson = JSON.stringify(body);
+    const upstreamRequestHash = "0x" + sha256Hex(bodyJson);
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), providerTimeoutMs());
@@ -231,7 +243,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
           // The only place the contributed secret is ever used.
           authorization: `Bearer ${credential.secret}`,
         },
-        body: JSON.stringify(body),
+        body: bodyJson,
         signal: controller.signal,
         /**
          * Redirects are NOT followed. fetch follows them by default, which would
@@ -319,8 +331,8 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
  * 400. Unclamped, an ordinary client request at temperature 1.5 would 400 on
  * EVERY anthropic credential in turn — each one recorded as an upstream
  * `server_error` against a contributor whose key was fine. Clamping keeps the
- * receipt honest because `upstreamRequestHash` is computed over the body
- * actually sent, so what the verifier sees is what the provider saw.
+ * receipt honest because `upstreamRequestHash` is the digest of the exact bytes
+ * sent, so what the verifier sees is what the provider saw.
  */
 const ANTHROPIC_MAX_TEMPERATURE = 1;
 /**
@@ -430,7 +442,11 @@ export class AnthropicAdapter implements ProviderAdapter {
         .map((m) => ({ role: m.role, content: m.content })),
       temperature: Math.min(request.request.temperature_millis / 1000, ANTHROPIC_MAX_TEMPERATURE),
     };
-    const upstreamRequestHash = "0x" + canonicalHash(body);
+    // Digest of the EXACT bytes sent upstream — see the same line in
+    // OpenAICompatibleAdapter for why this is sha256 of the wire body rather
+    // than canonicalHash of a reconstruction.
+    const bodyJson = JSON.stringify(body);
+    const upstreamRequestHash = "0x" + sha256Hex(bodyJson);
 
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), providerTimeoutMs());
@@ -443,7 +459,7 @@ export class AnthropicAdapter implements ProviderAdapter {
           "x-api-key": credential.secret,
           "anthropic-version": "2023-06-01",
         },
-        body: JSON.stringify(body),
+        body: bodyJson,
         signal: controller.signal,
         // Not followed: a redirect would carry the key and the prompt to a host
         // the allowlist refused.

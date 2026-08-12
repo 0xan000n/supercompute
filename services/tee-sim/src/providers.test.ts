@@ -1,7 +1,7 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
-import { canonicalHash } from "@ctn/protocol";
+import { sha256Hex } from "@ctn/protocol";
 import { AnthropicAdapter, OpenAICompatibleAdapter } from "./providers.js";
 
 // The §69 gate blocks direct construction of authorized values; adapter unit
@@ -122,9 +122,46 @@ test("anthropic adapter clamps temperature and max_tokens the API would 400 on",
   // not to the un-clamped values the client asked for.
   assert.equal(
     outcome.response.upstreamRequestHash,
-    "0x" + canonicalHash(JSON.parse(lastReq.body)),
-    "upstreamRequestHash must be over the bytes actually sent"
+    "0x" + sha256Hex(lastReq.body),
+    "upstreamRequestHash must be the digest of the exact bytes received upstream"
   );
+});
+
+test("a fractional temperature is dispatched, not thrown — both adapters", async () => {
+  for (const { payload, make } of [
+    {
+      payload: { content: [{ type: "text", text: "ok" }], usage: { input_tokens: 1, output_tokens: 1 } },
+      make: (port: number) =>
+        new AnthropicAdapter("anthropic", `http://127.0.0.1:${port}`, ["claude-haiku-4-5-20251001"]),
+    },
+    {
+      payload: { choices: [{ message: { content: "ok" } }], usage: { prompt_tokens: 1, completion_tokens: 1 } },
+      make: (port: number) =>
+        new OpenAICompatibleAdapter("openai", `http://127.0.0.1:${port}`, ["claude-haiku-4-5-20251001"]),
+    },
+  ]) {
+    const port = await start(200, payload);
+    process.env.CTN_EGRESS_ALLOWLIST = `127.0.0.1:${port}`;
+    const adapter = make(port);
+    // 0.7 is a legal canonical temperature (temperature_millis 700) and NOT a
+    // safe integer. Hashing a reconstructed body with canonicalJson threw a
+    // CanonicalizationError out of complete() before the try block, so the
+    // routing loop got an exception rather than any ProviderOutcome at all.
+    const { request, credential } = fakeAuthorized(
+      "claude-haiku-4-5-20251001",
+      [{ role: "user", content: "hi" }],
+      { temperature_millis: 700 }
+    );
+    const outcome = await adapter.complete(request, credential);
+
+    assert.ok(outcome.ok, `${adapter.name}: a fractional temperature must produce a classified outcome`);
+    assert.equal(JSON.parse(lastReq.body).temperature, 0.7, `${adapter.name}: sent verbatim, not rounded`);
+    assert.equal(
+      outcome.response.upstreamRequestHash,
+      "0x" + sha256Hex(lastReq.body),
+      `${adapter.name}: hash is the digest of the exact bytes sent`
+    );
+  }
 });
 
 test("anthropic adapter: a text block whose text is not a string is malformed, never coerced", async () => {
