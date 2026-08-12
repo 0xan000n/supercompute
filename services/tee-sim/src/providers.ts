@@ -314,6 +314,51 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
 }
 
 /**
+ * The canonical request permits temperature_millis up to 2000 (§21,
+ * `toCanonicalRequest`), but /v1/messages rejects anything above 1.0 with a hard
+ * 400. Unclamped, an ordinary client request at temperature 1.5 would 400 on
+ * EVERY anthropic credential in turn — each one recorded as an upstream
+ * `server_error` against a contributor whose key was fine. Clamping keeps the
+ * receipt honest because `upstreamRequestHash` is computed over the body
+ * actually sent, so what the verifier sees is what the provider saw.
+ */
+const ANTHROPIC_MAX_TEMPERATURE = 1;
+/**
+ * Same shape of guard for the output ceiling: the canonical cap is 128000,
+ * claude-haiku-4-5 tops out at 64K, and the overage is another blanket 400 that
+ * would be blamed on credentials.
+ */
+const ANTHROPIC_MAX_OUTPUT_TOKENS = 64_000;
+
+/**
+ * Render the `content` array of a Messages response, or null if ANY member is
+ * not a well-formed block.
+ *
+ * Null rather than a best-effort string on purpose. The obvious version —
+ * `blocks.filter((b) => b.type === "text").map((b) => b.text ?? "").join("")` —
+ * coerces a block like `{type:"text", text:123}` into the string "123" (or an
+ * object into "[object Object]") and signs a receipt over it, which is exactly
+ * the wrong-structure 200 this adapter exists to reject. It also throws outright
+ * on `content:[null]`, landing in the catch as a transport `server_error` and
+ * misreporting a garbled body as a network fault.
+ */
+function anthropicText(blocks: unknown): string | null {
+  if (!Array.isArray(blocks)) return null;
+  let out = "";
+  for (const b of blocks) {
+    if (typeof b !== "object" || b === null) return null;
+    const { type, text } = b as { type?: unknown; text?: unknown };
+    if (typeof type !== "string") return null;
+    // A non-text block (tool_use, thinking, …) is well-formed and contributes
+    // nothing to the rendered answer.
+    if (type !== "text") continue;
+    if (typeof text !== "string") return null;
+    out += text;
+  }
+  return out;
+}
+
+/**
  * Anthropic Messages API. Structurally a mirror of the adapter above — same
  * egress gate, same manual redirect, same refusal to read error bodies — and
  * deliberately a separate class rather than a wire-format flag: the two APIs
@@ -377,12 +422,13 @@ export class AnthropicAdapter implements ProviderAdapter {
       .join("\n");
     const body = {
       model: request.request.model,
-      max_tokens: request.request.max_tokens,
+      // Clamped, not passed through — see ANTHROPIC_MAX_* above.
+      max_tokens: Math.min(request.request.max_tokens, ANTHROPIC_MAX_OUTPUT_TOKENS),
       ...(system ? { system } : {}),
       messages: request.request.messages
         .filter((m) => m.role !== "system")
         .map((m) => ({ role: m.role, content: m.content })),
-      temperature: request.request.temperature_millis / 1000,
+      temperature: Math.min(request.request.temperature_millis / 1000, ANTHROPIC_MAX_TEMPERATURE),
     };
     const upstreamRequestHash = "0x" + canonicalHash(body);
 
@@ -420,7 +466,7 @@ export class AnthropicAdapter implements ProviderAdapter {
       }
 
       let json: {
-        content?: Array<{ type?: string; text?: string }>;
+        content?: unknown;
         usage?: { input_tokens?: unknown; output_tokens?: unknown };
       };
       try {
@@ -430,13 +476,12 @@ export class AnthropicAdapter implements ProviderAdapter {
       }
       const inputTokens = json.usage?.input_tokens;
       const outputTokens = json.usage?.output_tokens;
-      const blocks = json.content;
-      if (!validUsage(inputTokens) || !validUsage(outputTokens) || !Array.isArray(blocks)) {
+      const content = anthropicText(json.content);
+      if (!validUsage(inputTokens) || !validUsage(outputTokens) || content === null) {
         // The provider processed the request; a response we cannot account for
         // must never become a zero-spend success.
         return unknownOutcome(request, latencyMs, "malformed_response");
       }
-      const content = blocks.filter((b) => b.type === "text").map((b) => b.text ?? "").join("");
 
       return {
         ok: true,

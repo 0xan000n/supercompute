@@ -1,12 +1,19 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
+import { canonicalHash } from "@ctn/protocol";
 import { AnthropicAdapter, OpenAICompatibleAdapter } from "./providers.js";
 
 // The §69 gate blocks direct construction of authorized values; adapter unit
 // tests only need the structural fields complete() reads.
-function fakeAuthorized(model: string, messages: Array<{ role: string; content: string }>) {
-  const request = { request: { model, messages, temperature_millis: 0, max_tokens: 64 } } as never;
+function fakeAuthorized(
+  model: string,
+  messages: Array<{ role: string; content: string }>,
+  overrides: { temperature_millis?: number; max_tokens?: number } = {}
+) {
+  const request = {
+    request: { model, messages, temperature_millis: 0, max_tokens: 64, ...overrides },
+  } as never;
   const credential = { secret: "sk-ant-test-000000000000" } as never;
   return { request, credential };
 }
@@ -87,6 +94,86 @@ test("a malformed 200 is NEVER a zero-cost success — both adapters", async () 
     assert.ok((outcome.assumedSpendMicroUsd ?? 0) > 0);
     server!.close();
   }
+});
+
+test("anthropic adapter clamps temperature and max_tokens the API would 400 on", async () => {
+  const port = await start(200, {
+    content: [{ type: "text", text: "ok" }],
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  process.env.CTN_EGRESS_ALLOWLIST = `127.0.0.1:${port}`;
+  const adapter = new AnthropicAdapter("anthropic", `http://127.0.0.1:${port}`, ["claude-haiku-4-5-20251001"]);
+  // Both values are legal in the canonical request and both are hard 400s at
+  // /v1/messages. Passed through, one ordinary client request would fail
+  // identically on every anthropic credential and each contributor would wear a
+  // server_error for a request that was never valid upstream.
+  const { request, credential } = fakeAuthorized(
+    "claude-haiku-4-5-20251001",
+    [{ role: "user", content: "hi" }],
+    { temperature_millis: 2000, max_tokens: 128_000 }
+  );
+  const outcome = await adapter.complete(request, credential);
+
+  assert.ok(outcome.ok, "a clamped request is a normal request, not a failure");
+  const sent = JSON.parse(lastReq.body);
+  assert.equal(sent.temperature, 1, "temperature clamped to the anthropic ceiling");
+  assert.equal(sent.max_tokens, 64_000, "max_tokens clamped to the model's output ceiling");
+  // The clamp is not a lie: the receipt commits to the body the provider saw,
+  // not to the un-clamped values the client asked for.
+  assert.equal(
+    outcome.response.upstreamRequestHash,
+    "0x" + canonicalHash(JSON.parse(lastReq.body)),
+    "upstreamRequestHash must be over the bytes actually sent"
+  );
+});
+
+test("anthropic adapter: a text block whose text is not a string is malformed, never coerced", async () => {
+  const port = await start(200, {
+    content: [{ type: "text", text: 123 }],
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  process.env.CTN_EGRESS_ALLOWLIST = `127.0.0.1:${port}`;
+  const adapter = new AnthropicAdapter("anthropic", `http://127.0.0.1:${port}`, ["claude-haiku-4-5-20251001"]);
+  const { request, credential } = fakeAuthorized("claude-haiku-4-5-20251001", [{ role: "user", content: "hi" }]);
+  const outcome = await adapter.complete(request, credential);
+  // "123" must never be signed as the model's answer.
+  assert.ok(!outcome.ok);
+  assert.equal(outcome.classification, "malformed_response");
+  assert.equal(outcome.upstreamOutcomeUnknown, true);
+});
+
+test("anthropic adapter: a null content block is malformed, not a transport error", async () => {
+  const port = await start(200, {
+    content: [null],
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  process.env.CTN_EGRESS_ALLOWLIST = `127.0.0.1:${port}`;
+  const adapter = new AnthropicAdapter("anthropic", `http://127.0.0.1:${port}`, ["claude-haiku-4-5-20251001"]);
+  const { request, credential } = fakeAuthorized("claude-haiku-4-5-20251001", [{ role: "user", content: "hi" }]);
+  const outcome = await adapter.complete(request, credential);
+  assert.ok(!outcome.ok);
+  assert.equal(
+    outcome.classification,
+    "malformed_response",
+    "reading b.type off null must not throw into the catch and read as server_error"
+  );
+});
+
+test("anthropic adapter: non-text blocks alongside text are well-formed", async () => {
+  const port = await start(200, {
+    content: [
+      { type: "thinking", thinking: "…" },
+      { type: "text", text: "answer" },
+      { type: "tool_use", id: "tu_1", name: "search", input: {} },
+    ],
+    usage: { input_tokens: 1, output_tokens: 1 },
+  });
+  process.env.CTN_EGRESS_ALLOWLIST = `127.0.0.1:${port}`;
+  const adapter = new AnthropicAdapter("anthropic", `http://127.0.0.1:${port}`, ["claude-haiku-4-5-20251001"]);
+  const { request, credential } = fakeAuthorized("claude-haiku-4-5-20251001", [{ role: "user", content: "hi" }]);
+  const outcome = await adapter.complete(request, credential);
+  assert.ok(outcome.ok, "an unfamiliar block TYPE is not a malformed block");
+  assert.equal(outcome.response.content, "answer");
 });
 
 test("negative or non-integer usage counts are malformed", async () => {
