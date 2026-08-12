@@ -86,7 +86,17 @@ export const teeClient = {
 
   buildManifest: () => call<Record<string, unknown>>("/build-manifest"),
 
-  ingestCredential: (body: unknown) =>
+  /**
+   * Relays the contributor's sealed intent verbatim. There is deliberately no
+   * capability block here: everything the enclave will sign comes out of the
+   * ciphertext, so this process has nothing to widen (§5.1).
+   */
+  ingestCredential: (body: {
+    enclaveKeyId: string;
+    enc: string;
+    encryptedSecret: string;
+    credentialId: string;
+  }) =>
     call<{
       credentialId: string;
       encryptedBlob: string;

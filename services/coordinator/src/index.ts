@@ -139,11 +139,9 @@ app.post("/v1/credentials", async (request, reply) => {
   const body = request.body as {
     contributorId: string;
     label: string;
-    provider: string;
-    allowedModels: string[];
-    allowedPolicies: string[];
     weight?: number;
     operationalLimits?: { dailyUsd?: number; dailyRequests?: number };
+    credentialId: string;
     enclaveKeyId: string;
     enc: string;
     encryptedSecret: string;
@@ -154,7 +152,21 @@ app.post("/v1/credentials", async (request, reply) => {
     return reply.code(404).send({ error: { code: "CTN_INTERNAL", message: "unknown contributor" } });
   }
 
-  const credentialId = `cred_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+  // The id is the contributor's, not ours: it is sealed inside the intent, so
+  // minting one here would only produce a mismatch the enclave then refuses.
+  const credentialId = body.credentialId;
+  if (!/^cred_[0-9a-f]{12}$/.test(credentialId)) {
+    return reply.code(400).send({
+      error: { code: "CTN_INVALID_ENVELOPE", message: "credentialId must be cred_ + 12 hex chars" },
+    });
+  }
+  // The enclave enforces the real invariant (one capability per sealed intent);
+  // this keeps coordinator state coherent rather than half-writing a duplicate.
+  if (db.prepare(`SELECT id FROM credentials WHERE id = ?`).get(credentialId)) {
+    return reply.code(409).send({
+      error: { code: "CTN_INTENT_REPLAY", message: "this credential id has already been contributed" },
+    });
+  }
 
   // The coordinator forwards ciphertext it cannot read and receives back a
   // vault-encrypted blob plus an enclave-signed capability. At no point does a
@@ -166,21 +178,28 @@ app.post("/v1/credentials", async (request, reply) => {
       enc: body.enc,
       encryptedSecret: body.encryptedSecret,
       credentialId,
-      contributorId: body.contributorId,
-      capability: {
-        provider: body.provider,
-        allowedModels: body.allowedModels,
-        allowedPolicies: body.allowedPolicies,
-      },
     });
   } catch (err) {
     if (err instanceof EnclaveRejectionError) {
       safeLog("warn", "credential.ingest_rejected", { credential_id: credentialId, code: err.code });
-      return reply.code(400).send({ error: { code: err.code, message: err.message } });
+      // A consumed intent is a conflict, not a malformed envelope: collapsing
+      // the enclave's 409 into a 400 would misdescribe why it was refused.
+      return reply
+        .code(err.httpStatus === 409 ? 409 : 400)
+        .send({ error: { code: err.code, message: err.message } });
     }
     safeLog("error", "credential.ingest_failed", { credential_id: credentialId });
     return reply.code(503).send({
       error: { code: "CTN_ENCLAVE_UNAVAILABLE", message: "The confidential service is unavailable." },
+    });
+  }
+
+  // The sealed intent is the authority on whose credential this is; the HTTP
+  // body is only a hint. If they disagree, the relay altered something.
+  if (ingested.capability.contributorId !== body.contributorId) {
+    safeLog("warn", "credential.intent_mismatch", { credential_id: body.credentialId });
+    return reply.code(400).send({
+      error: { code: "CTN_INTENT_MISMATCH", message: "sealed intent names a different contributor" },
     });
   }
 
@@ -193,7 +212,7 @@ app.post("/v1/credentials", async (request, reply) => {
   ).run(
     credentialId,
     body.contributorId,
-    body.provider,
+    ingested.capability.provider,
     body.label,
     ingested.encryptedBlob,
     JSON.stringify(ingested.capability),
@@ -209,7 +228,7 @@ app.post("/v1/credentials", async (request, reply) => {
   emitEvent("credential.created", credentialId, {
     credential_id: credentialId,
     contributor_id: body.contributorId,
-    provider: body.provider,
+    provider: ingested.capability.provider,
     label: body.label,
     allowed_models: ingested.capability.allowedModels,
     policy_id: ingested.policyId,
@@ -218,7 +237,7 @@ app.post("/v1/credentials", async (request, reply) => {
   safeLog("info", "credential.created", {
     credential_id: credentialId,
     contributor_id: body.contributorId,
-    provider: body.provider,
+    provider: ingested.capability.provider,
   });
 
   return {

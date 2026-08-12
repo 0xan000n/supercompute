@@ -16,7 +16,9 @@ import {
   randomHex,
   sha256Hex,
   canonicalHash,
+  intentDigest,
 } from "./crypto";
+import type { CredentialIntentV1 } from "./types";
 import { generateHpkeKeyPair, hpkeSeal, hpkeOpen } from "./hpke";
 
 test("canonical JSON sorts keys and omits whitespace", () => {
@@ -185,4 +187,41 @@ test("attestation signature covers the nonce, so a verifier must read it from th
   assert.ok(
     !verifyCanonical({ ...document, platformSignature: undefined, nonce: "other" }, signature, pub)
   );
+});
+
+// ---------------------------------------------------------------------------
+// §5.1 — the sealed contribution intent
+// ---------------------------------------------------------------------------
+
+const baseIntent: CredentialIntentV1 = {
+  version: 1,
+  credentialId: "cred_aaaaaaaaaaaa",
+  secret: "sk-test-000000000000",
+  provider: "anthropic",
+  allowedModels: ["claude-haiku-4-5-20251001"],
+  allowedPolicies: ["safety-v1"],
+  contributorId: "contrib_alice",
+  intentNonce: "a".repeat(64),
+};
+
+test("intentDigest is deterministic and 0x-prefixed", () => {
+  assert.equal(intentDigest(baseIntent), intentDigest({ ...baseIntent }));
+  assert.match(intentDigest(baseIntent), /^0x[0-9a-f]{64}$/);
+});
+
+test("intentDigest ignores the secret but binds every other field", () => {
+  const base = intentDigest(baseIntent);
+  assert.equal(intentDigest({ ...baseIntent, secret: "sk-test-999999999999" }), base);
+  assert.notEqual(intentDigest({ ...baseIntent, credentialId: "cred_bbbbbbbbbbbb" }), base);
+  assert.notEqual(intentDigest({ ...baseIntent, provider: "openai" }), base);
+  assert.notEqual(intentDigest({ ...baseIntent, allowedModels: ["gpt-4o-2024-08-06"] }), base);
+  assert.notEqual(intentDigest({ ...baseIntent, contributorId: "contrib_bob" }), base);
+  assert.notEqual(intentDigest({ ...baseIntent, intentNonce: "b".repeat(64) }), base);
+});
+
+test("a sealed intent round-trips: key, constraints, and credentialId in ONE envelope", async () => {
+  const enclave = await generateHpkeKeyPair();
+  const sealed = await hpkeSeal(enclave.publicKeyB64, new TextEncoder().encode(canonicalJson(baseIntent)));
+  const opened = JSON.parse(new TextDecoder().decode(await hpkeOpen(enclave.privateKeyB64, sealed))) as CredentialIntentV1;
+  assert.deepEqual(opened, baseIntent);
 });

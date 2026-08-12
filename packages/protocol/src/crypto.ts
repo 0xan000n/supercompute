@@ -1,6 +1,7 @@
 import { sha256, sha512 } from "@noble/hashes/sha2.js";
 import * as ed from "@noble/ed25519";
 import { canonicalJson } from "./canonical";
+import type { CredentialIntentV1 } from "./types";
 
 // Wire noble-ed25519 v3 to noble-hashes sha512 (enables sync sign/verify).
 ed.hashes.sha512 = sha512;
@@ -58,6 +59,19 @@ export function requestCommitment(canonical: Uint8Array, nonceHex: string): stri
   buf.set(domain, 0);
   buf.set(canonical, domain.length);
   buf.set(nonce, domain.length + canonical.length);
+  return "0x" + toHex(sha256(buf));
+}
+
+const INTENT_DOMAIN = "CTN_INTENT_V1";
+
+/** Digest of the canonical intent MINUS the secret, domain-separated. */
+export function intentDigest(intent: CredentialIntentV1): string {
+  const { secret: _secret, ...publicIntent } = intent;
+  const canonical = utf8(canonicalJson(publicIntent));
+  const domain = utf8(INTENT_DOMAIN);
+  const buf = new Uint8Array(domain.length + canonical.length);
+  buf.set(domain, 0);
+  buf.set(canonical, domain.length);
   return "0x" + toHex(sha256(buf));
 }
 

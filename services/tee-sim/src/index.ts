@@ -14,10 +14,12 @@ import Fastify from "fastify";
 import {
   canonicalHash,
   canonicalJson,
+  intentDigest,
   sha256Hex,
   toCanonicalRequest,
   type ComputeReceipt,
   type CredentialCapability,
+  type CredentialIntentV1,
   type SecurePayload,
   type SecureRequestEnvelope,
   type SignedComputeReceipt,
@@ -26,6 +28,8 @@ import {
 import { hpkeSeal } from "@ctn/protocol";
 import { loadPolicyPackage } from "@ctn/policy";
 import { SimulatedTEE, SIMULATION_WARNING, vaultDecrypt, vaultEncrypt } from "./tee.js";
+import { MODEL_CATALOG } from "./catalog.js";
+import { deriveCapability, InvalidIntentError, parseIntent } from "./intent.js";
 import { AuthorizedRequest, authorizeCandidate, type CandidateRecord } from "./authorize.js";
 import { buildRegistry, type ProviderOutcome } from "./providers.js";
 import { Prover } from "./prover.js";
@@ -141,13 +145,15 @@ interface IngestBody {
   enc: string;
   encryptedSecret: string;
   credentialId: string;
-  contributorId: string;
-  capability: {
-    provider: string;
-    allowedModels: string[];
-    allowedPolicies: string[];
-  };
 }
+
+/**
+ * §5.1 replay guard. In-memory: a restarted enclave forgets — LABELLED as such
+ * in VALIDATION.md. The client-generated credentialId sealed inside the intent
+ * is the structural half of the defence (a replayed envelope can only ever
+ * mint the SAME capability, never a second one under a new id).
+ */
+const consumedIntentDigests = new Set<string>();
 
 app.post("/credentials/ingest", async (request, reply) => {
   const body = request.body as IngestBody;
@@ -155,50 +161,49 @@ app.post("/credentials/ingest", async (request, reply) => {
     return reply.code(400).send({ error: { code: "CTN_INVALID_ENVELOPE", message: "unknown enclave key id" } });
   }
 
-  let secret: string;
+  let intent: CredentialIntentV1;
   try {
     const opened = await tee.openIngress({ enc: body.enc, ciphertext: body.encryptedSecret });
-    secret = new TextDecoder().decode(opened).trim();
-  } catch {
-    return reply
-      .code(400)
-      .send({ error: { code: "CTN_INVALID_ENVELOPE", message: "credential ciphertext failed to decrypt" } });
+    intent = parseIntent(opened, MODEL_CATALOG);
+  } catch (err) {
+    const message = err instanceof InvalidIntentError ? err.message : "credential ciphertext failed to decrypt";
+    return reply.code(400).send({ error: { code: "CTN_INVALID_ENVELOPE", message } });
   }
 
-  // Basic format validation only — never echo the secret, not even a prefix
-  // long enough to matter.
-  if (secret.length < 8 || /\s/.test(secret)) {
-    return reply
-      .code(400)
-      .send({ error: { code: "CTN_INVALID_ENVELOPE", message: "credential does not look like an API key" } });
+  if (intent.credentialId !== body.credentialId) {
+    return reply.code(400).send({
+      error: { code: "CTN_INTENT_MISMATCH", message: "sealed intent names a different credential id" },
+    });
+  }
+  const digest = intentDigest(intent);
+  if (consumedIntentDigests.has(digest)) {
+    return reply.code(409).send({
+      error: { code: "CTN_INTENT_REPLAY", message: "this sealed intent has already been consumed" },
+    });
   }
 
   // §13 — only ciphertext leaves the enclave; the DB never sees raw material.
-  const encryptedBlob = vaultEncrypt(vaultKey, secret);
+  const encryptedBlob = vaultEncrypt(vaultKey, intent.secret);
 
-  const capability: CredentialCapability = {
-    credentialId: body.credentialId,
-    provider: body.capability.provider as CredentialCapability["provider"],
-    allowedModels: [...body.capability.allowedModels].sort(),
-    // Contributors opt into an exact policy version, not a mutable label (§24).
-    allowedPolicyIds: body.capability.allowedPolicies.map((p) =>
-      p === "safety-v1" ? pkg.policyId : p
-    ),
-    contributorId: body.contributorId,
-    createdAt: Date.now(),
-    version: 1,
+  // §5.1 — derived from the DECRYPTED INTENT alone. Anything else in the HTTP
+  // body is ignored by construction.
+  const capability = deriveCapability({
+    intent,
     blobDigest: "0x" + sha256Hex(encryptedBlob),
-  };
+    resolvePolicyId: (p) => (p === "safety-v1" ? pkg.policyId : p),
+    now: Date.now(),
+  });
+  consumedIntentDigests.add(digest);
 
   return {
-    credentialId: body.credentialId,
+    credentialId: intent.credentialId,
     encryptedBlob,
     capability,
     // §15 — enclave signs the capability so the coordinator cannot widen it.
     capabilitySignature: tee.signReceipt(capability),
     // Keyed to the enclave's private signing key AND bound to this credential
     // id, so ingestion cannot be used as a guess-checking oracle. See tee.ts.
-    keyFingerprint: "0x" + tee.fingerprint(body.credentialId, secret),
+    keyFingerprint: "0x" + tee.fingerprint(intent.credentialId, intent.secret),
     policyId: pkg.policyId,
   };
 });

@@ -152,6 +152,14 @@ window is replayable in principle, which is a bounded weakness, whereas an unbou
 map is a denial-of-service. A production design needs monotonic enclave state, which
 is the same systems problem §4 already flags for usage counters.
 
+The same limitation applies to the contribution path (§5.1). The enclave refuses a
+sealed `CredentialIntentV1` whose digest it has already consumed, but that set is
+in memory: **a restarted enclave forgets, and a previously-consumed envelope could be
+ingested once more.** What survives a restart is structural rather than remembered —
+the credential id is sealed inside the intent, so a replayed envelope can only ever
+re-mint the *same* capability for the *same* contributor, never a second credential
+under a new id, and the coordinator's own unique-id check refuses the duplicate row.
+
 ### 2.7 The egress allowlist has bypasses the spec does not mention
 
 §20 requires a hostname allowlist. Two bypasses are easy to miss:

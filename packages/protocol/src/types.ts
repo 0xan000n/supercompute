@@ -97,20 +97,32 @@ export interface SimulatedAttestationDocument {
   warning: "SIMULATED TEE — NO HARDWARE CONFIDENTIALITY";
 }
 
-/** §13 — credential submission; encryptedSecret is HPKE-sealed to the enclave ingress key. */
+/**
+ * The contributor's sealed intent — the ONLY authority on what a credential
+ * may do. HPKE-sealed in the contributor's browser to the attested ingress
+ * key; the enclave derives the signed capability exclusively from this.
+ * The coordinator relays an opaque envelope: there is no plaintext metadata
+ * left for it to alter, and the credentialId inside forecloses minting the
+ * same envelope under a different id.
+ */
+export interface CredentialIntentV1 {
+  version: 1;
+  /** client-generated, "cred_" + 12 hex; the capability's id comes from HERE */
+  credentialId: string;
+  secret: string;
+  provider: Provider;
+  allowedModels: string[];
+  allowedPolicies: string[];
+  contributorId: string;
+  /** 32-byte hex, fresh per contribution; the enclave rejects repeats */
+  intentNonce: string;
+}
+
+/** §13 — credential submission; the intent (key + constraints) is HPKE-sealed. */
 export interface CredentialSubmission {
   enclaveKeyId: string;
   enc: string;
   encryptedSecret: string;
-  capability: {
-    provider: Provider;
-    allowedModels: string[];
-    allowedPolicies: string[];
-    operationalLimits?: {
-      dailyUsd?: number;
-      dailyRequests?: number;
-    };
-  };
   contributorDisplayId: string;
 }
 
@@ -135,6 +147,12 @@ export interface CredentialCapability {
    * closes that substitution.
    */
   blobDigest: string;
+  /**
+   * SHA-256 over the canonical intent minus the secret. Ties this capability
+   * to exactly what the contributor sealed — including the credentialId and
+   * a fresh nonce, so a relayed envelope cannot be re-minted.
+   */
+  intentDigest: string;
 }
 
 export type PolicyDecision = "ALLOW" | "DENY";
@@ -334,6 +352,8 @@ export type CtnErrorCode =
   | "CTN_PROVIDER_AUTH_FAILED"
   | "CTN_PROVIDER_ERROR"
   | "CTN_INVALID_ENVELOPE"
+  | "CTN_INTENT_MISMATCH"
+  | "CTN_INTENT_REPLAY"
   | "CTN_ATTESTATION_REQUIRED"
   | "CTN_ENCLAVE_UNAVAILABLE"
   | "CTN_INTERNAL";

@@ -31,6 +31,7 @@ import {
   hpkeSeal,
   randomHex,
   toCanonicalRequest,
+  type CredentialIntentV1,
   type SecureRequestEnvelope,
 } from "@ctn/protocol";
 
@@ -832,6 +833,94 @@ async function run36_21(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// §5.1 SEALED INTENT
+// ---------------------------------------------------------------------------
+
+/**
+ * Contributes one credential exactly the way packages/client/src/index.ts does
+ * — intent sealed here, only ciphertext posted — but keeps the raw envelope so
+ * a test can replay the identical bytes at the coordinator.
+ */
+async function contributeAndCaptureEnvelope(tag: string): Promise<{
+  envelope: Record<string, unknown>;
+  credentialId: string;
+}> {
+  const att = await client.attestation();
+  const contributor = (await (
+    await fetch(`${COORD}/v1/contributors`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ displayName: `ReplayProbe_${tag}` }),
+    })
+  ).json()) as { id: string };
+
+  const credentialId = `cred_${randomHex(6)}`;
+  const intent: CredentialIntentV1 = {
+    version: 1,
+    credentialId,
+    secret: `mock-provider-key-replay-${tag}`,
+    provider: "mock",
+    allowedModels: [MODEL_A],
+    allowedPolicies: ["safety-v1"],
+    contributorId: contributor.id,
+    intentNonce: randomHex(32),
+  };
+  const sealed = await hpkeSeal(
+    att.bundle.ingressPublicKey,
+    new TextEncoder().encode(canonicalJson(intent))
+  );
+  const envelope = {
+    contributorId: contributor.id,
+    label: `Replay probe ${tag}`,
+    weight: 1,
+    enclaveKeyId: att.bundle.enclaveKeyId,
+    enc: sealed.enc,
+    encryptedSecret: sealed.ciphertext,
+  };
+
+  const first = await fetch(`${COORD}/v1/credentials`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ...envelope, credentialId }),
+  });
+  assert(first.ok, `the first contribution should succeed, got ${first.status}`);
+  return { envelope, credentialId };
+}
+
+async function run59(): Promise<void> {
+  await test("59", "a sealed intent cannot be re-minted — not even under a fresh coordinator id", async () => {
+    // Capture one contribution's raw envelope by contributing via the client,
+    // then replay the same envelope directly against the coordinator.
+    const { envelope, credentialId } = await contributeAndCaptureEnvelope(randomUUID().slice(0, 8));
+    try {
+      const replay = await fetch(`${COORD}/v1/credentials`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...envelope, credentialId }), // same id → coordinator dedupe or enclave replay guard
+      });
+      assert(replay.status === 409, `expected 409 on same-id replay, got ${replay.status}`);
+
+      // A malicious coordinator submitting the SAME envelope under a DIFFERENT id
+      // hits the enclave's intent/body mismatch — the id inside the envelope wins.
+      const reminted = await fetch(`${COORD}/v1/credentials`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ ...envelope, credentialId: "cred_ffffffffffff" }),
+      });
+      const json = await reminted.json();
+      assert(reminted.status === 400 || reminted.status === 409, `expected rejection, got ${reminted.status}`);
+      assert(
+        ["CTN_INTENT_MISMATCH", "CTN_INTENT_REPLAY"].includes(json.error?.code),
+        `got ${json.error?.code}`
+      );
+      return `same-id replay=409, re-mint under a new id=${reminted.status} ${json.error?.code}`;
+    } finally {
+      await patchCredential(credentialId, { status: "DISABLED" });
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -885,6 +974,9 @@ async function main(): Promise<void> {
   await run36_19();
   await run36_20();
   await run36_21();
+
+  console.log("\n=== §5.1 SEALED INTENT ===");
+  await run59();
 
   // ---- Summary ----
   console.log("\n\n=========================== SUMMARY ===========================");
