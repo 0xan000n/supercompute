@@ -40,6 +40,7 @@ import {
   hpkeSeal,
   randomHex,
   toCanonicalRequest,
+  type ComputeReceipt,
   type CredentialIntentV1,
   type SecureRequestEnvelope,
 } from "@ctn/protocol";
@@ -1296,6 +1297,184 @@ async function run65(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// §5.1 REAL PROVIDER SMOKE — env-gated, because these SPEND REAL MONEY
+// ---------------------------------------------------------------------------
+
+/**
+ * Contributes one credential the way a real contributor does — sealed in this
+ * process to the attested ingress key, only ciphertext posted — under a fresh
+ * contributor, so the smoke run owns everything it creates and can take it all
+ * away again.
+ */
+async function contributeViaClient(input: {
+  provider: string;
+  apiKey: string;
+  allowedModels: string[];
+  label: string;
+}): Promise<{ id: string }> {
+  const contributor = (await (
+    await fetch(`${COORD}/v1/contributors`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ displayName: input.label }),
+    })
+  ).json()) as { id: string };
+
+  const credential = await client.contributeCredential({
+    contributorId: contributor.id,
+    label: input.label,
+    provider: input.provider,
+    apiKey: input.apiKey,
+    allowedModels: input.allowedModels,
+    /**
+     * A blast-radius bound, not a guarantee: caps are operationally enforced
+     * (§4), so this is what stops a bug in the suite from looping on somebody's
+     * real key — not what makes spending it impossible.
+     */
+    operationalLimits: { dailyUsd: 0.25, dailyRequests: 3 },
+  });
+  return { id: credential.id as string };
+}
+
+interface SmokeOutcome {
+  /** The coordinator's own record of how the request ended, not the client's inference from it. */
+  status: string;
+  requestId: string;
+  receipt: ComputeReceipt | null;
+  route: CompletionResult["route"];
+  error: { code: string; message: string; attempts: string } | null;
+}
+
+/**
+ * One completion, reported rather than thrown.
+ *
+ * Deliberately NOT `completionRetryingRateLimits`: that helper exists so tests
+ * about something else survive Erin's seeded 429, and every retry here would be
+ * another dispatch against a real, billed account. A real 429 (or auth failure)
+ * is the answer this test wants to print, not something to spend past.
+ */
+async function submitPrompt(
+  prompt: string,
+  opts: { model: string; maxTokens: number }
+): Promise<SmokeOutcome> {
+  let requestId: string;
+  let result: CompletionResult | null = null;
+  let error: { code: string; message: string } | null = null;
+  try {
+    result = await client.completion({
+      model: opts.model,
+      messages: [{ role: "user", content: prompt }],
+      max_tokens: opts.maxTokens,
+    });
+    requestId = result.requestId;
+  } catch (err) {
+    if (err instanceof PolicyDeniedError) {
+      requestId = err.requestId;
+      error = { code: "CTN_POLICY_DENIED", message: err.message };
+    } else if (err instanceof CtnApiError && err.requestId) {
+      requestId = err.requestId;
+      error = { code: err.code, message: err.message };
+    } else {
+      throw err;
+    }
+  }
+
+  const detail = await (await fetch(`${COORD}/v1/requests/${requestId}`)).json();
+  return {
+    status: (detail.request?.status as string) ?? "UNKNOWN",
+    requestId,
+    receipt: result?.receipt?.receipt ?? null,
+    route: result?.route ?? null,
+    error: error ? { ...error, attempts: describeAttempts(detail.attempts ?? []) } : null,
+  };
+}
+
+/**
+ * Takes the credential out of the pool for good.
+ *
+ * DELETE, not `status: DISABLED`: a disable is a PATCH away from being an
+ * ACTIVE real key again. What this CANNOT do is erase the sealed secret from
+ * the enclave vault on disk (`pnpm reset` does that), so a live-key run should
+ * still be followed by rotating the key upstream. Never throws — it runs while
+ * an assertion failure may already be in flight, and replacing that failure
+ * with a fetch error would hide the thing the run was for.
+ */
+async function revokeCredential(id: string): Promise<string> {
+  try {
+    await fetch(`${COORD}/v1/credentials/${id}`, { method: "DELETE" });
+    const after = (await getCredentials()).find((c) => c.id === id);
+    return (after?.status as string) ?? "GONE";
+  } catch (err) {
+    return `revoke failed: ${err instanceof Error ? err.message : String(err)}`;
+  }
+}
+
+/**
+ * The one test in this suite that talks to a real provider on a real account.
+ *
+ * Skipped unless the key is present, and gated per provider rather than as a
+ * block: a machine with one of the two keys should run the half it can pay for.
+ */
+async function runRealProviderSmoke(
+  id: string,
+  provider: string,
+  envVar: string,
+  model: string
+): Promise<void> {
+  const apiKey = process.env[envVar];
+  if (!apiKey) {
+    console.log(`  · skipping real-provider smoke for ${provider} (set ${envVar} to run)`);
+    return;
+  }
+
+  await test(id, `REAL ${provider} round-trip (spends ~<$0.01)`, async () => {
+    const cred = await contributeViaClient({
+      provider,
+      apiKey,
+      allowedModels: [model],
+      label: `smoke-${provider}`,
+    });
+
+    let detail: string;
+    let revokedStatus = "not attempted";
+    try {
+      const res = await submitPrompt("Reply with the single word: pong", { model, maxTokens: 16 });
+      assert(
+        res.status === "COMPLETE",
+        `expected COMPLETE, got ${res.status} on request ${res.requestId}: ${JSON.stringify(res.error)}`
+      );
+      // The pinned snapshot id is served by this credential and nothing else in
+      // the pool, so a route anywhere else would mean the assertions below are
+      // describing some other key's traffic.
+      assert(
+        res.route?.credential_id === cred.id,
+        `the smoke credential should have served it, got ${res.route?.credential_id}`
+      );
+      assert(res.receipt, "a COMPLETE request must carry a signed receipt");
+      assert((res.receipt.usage.inputTokens ?? 0) > 0, "real token counts recorded");
+      assert(
+        res.receipt.usage.pricingTableDigest?.startsWith("0x"),
+        `pricing digest present, got ${res.receipt.usage.pricingTableDigest}`
+      );
+      const cost = (res.receipt.usage.estimatedCostMicroUsd ?? 0) / 1_000_000;
+      detail =
+        `${model} → ${res.receipt.usage.inputTokens}/${res.receipt.usage.outputTokens} tok, ` +
+        `est $${cost.toFixed(6)} from price table ${res.receipt.usage.pricingTableDigest?.slice(0, 10)}`;
+    } finally {
+      // A real key must not outlive this test, whether it passed or failed.
+      revokedStatus = await revokeCredential(cred.id);
+      if (revokedStatus !== "DELETED") {
+        console.log(
+          `\n  !! ${provider} smoke credential ${cred.id} is ${revokedStatus}, NOT revoked — rotate that key`
+        );
+      }
+    }
+    assert(revokedStatus === "DELETED", `the smoke credential must not survive the test, got ${revokedStatus}`);
+    return `${detail}; credential ${cred.id} revoked`;
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -1365,6 +1544,10 @@ async function main(): Promise<void> {
 
   console.log("\n=== §5.1 PROVIDER CATALOG ===");
   await run65();
+
+  console.log("\n=== §5.1 REAL PROVIDER SMOKE (env-gated) ===");
+  await runRealProviderSmoke("70", "anthropic", "ANTHROPIC_API_KEY", "claude-haiku-4-5-20251001");
+  await runRealProviderSmoke("71", "openai", "OPENAI_API_KEY", "gpt-4o-mini-2024-07-18");
 
   // ---- Summary ----
   console.log("\n\n=========================== SUMMARY ===========================");
