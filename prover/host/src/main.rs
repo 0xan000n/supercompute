@@ -15,7 +15,7 @@
 //! got them wrong and published a number that was an artifact:
 //!
 //! 1. **Warmup.** The first execution and the first proof of a process pay
-//!    one-time costs (allocator growth, Metal pipeline construction, page-in).
+//!    one-time costs (allocator growth, page-in).
 //!    With sizes run in a fixed order those costs land entirely on the first
 //!    row, which made 256 B look *slower* than 4096 B. One warmup iteration per
 //!    size per measurement is run and discarded.

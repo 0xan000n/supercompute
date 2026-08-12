@@ -472,10 +472,12 @@ re-enables the GPU path would change it by an unmeasured amount.
 | 256 B | 1 | 16 | 24,927 | 65,536 | 24,870 | 15,739 |
 | 4096 B | 1 | 19 | 265,498 | 524,288 | 26,854 | 231,936 |
 
-A second full run gave prove medians of 5.78 s and 52.30 s — up to ~3.6% higher,
-which exceeds the within-run spread at 4096 B. So the timings are ±5% figures, not
-constants, and a difference of a few percent between future runs means nothing.
-The cycle counts, po2 and receipt sizes were identical across both runs.
+A second full run of the same binary drifted by up to **5.7%** — that worst case
+being verify at 256 B, the smallest measurement here; prove at 4096 B moved 3.6%,
+to 52.30 s. Between-run drift therefore exceeds the within-run spread at 4096 B,
+so read every timing above as **±6%** rather than as a constant, and treat a few
+percent of movement between future runs as meaningless. The cycle counts, po2 and
+receipt sizes were byte-identical across both runs.
 
 **The model was optimistic by roughly 20×.** Phase 1 assumed 2.4 s of proving and
 observed ~2.9 s at p50. Real composite proving of a program that only hashes 4 KB
@@ -516,7 +518,11 @@ documented as the cycles the proof system needs *including padding up to the
 nearest power of two*, and the numbers agree: `total_cycles` lands on exactly 2^po2
 in both rows, with reserved as the filler. The real work is user + paging — 49,797
 at 256 B, rounding to 2^16; 292,352 at 4096 B, rounding to 2^19 — which gives a
-usable rule for Tasks 4 and 7: **po2 = ceil(log2(user + paging))**. Note that
+planning rule for Tasks 4 and 7: **po2 ≥ ceil(log2(user + paging))**. A bound
+rather than an equality, because two rows consistent with `reserved` being pure
+padding cannot prove that it is; if some fixed non-padding allocation hides in
+there, the 256 B row caps it at 15,739 cycles, so the rule can under-predict by one
+po2 within ~15k cycles of a boundary. Note that
 paging is roughly half the real work at 256 B (24,870 against 24,927 user cycles),
 so the policy guest's memory access pattern will move its po2 as readily as its
 arithmetic. It also means po2 cannot be predicted from user cycles alone: an

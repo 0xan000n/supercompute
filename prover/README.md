@@ -134,10 +134,21 @@ Verify runs immediately after proving on a receipt still in memory, so it is a
 cache-hot number. A verifier reading a receipt off disk would pay more.
 
 The table above is one run. A second full run of the same binary gave medians of
-17.3 / 18.9 ms (executor), 5.78 / 52.30 s (prove) and 12.9 / 14.9 ms (verify) —
-up to ~3.6% higher, which is *more* than the within-run spread at 4096 B. Treat
-these as ±5% figures on an otherwise-idle laptop, not as constants. Cycle counts,
-po2 and receipt sizes were byte-identical across both runs, as they should be.
+17.3 / 18.9 ms (executor), 5.78 / 52.30 s (prove) and 12.9 / 14.9 ms (verify).
+Per-measurement drift between the two runs:
+
+| | 256 B | 4096 B |
+|---|---|---|
+| Executor | +2.4% | +3.3% |
+| Prove | +1.4% | +3.6% |
+| Verify | **+5.7%** | 0.0% |
+
+So the honest bound is **up to ~5.7% between runs** — verify at 256 B, the
+smallest and therefore proportionally noisiest measurement — with ~3.6% on prove
+at 4096 B. Treat everything here as **±6%** on an otherwise-idle laptop, not as
+constants; between-run drift exceeds the within-run spread at 4096 B. Cycle
+counts, po2 and receipt sizes were byte-identical across both runs, as they
+should be.
 
 Guest image id `d094ec7bbac59857234c8c316573b591e5830ed9656fec4cf332440a0e19ff50`
 — it changes whenever the guest or its dependency graph does, which is the point.
@@ -177,8 +188,15 @@ work is **user + paging**, and reserved is the filler:
 | 256 B | 49,797 | 65,536 = 2^16 | 15,739 |
 | 4096 B | 292,352 | 524,288 = 2^19 | 231,936 |
 
-That gives a usable predictive rule for Tasks 4 and 7:
-**po2 = ceil(log2(user_cycles + paging_cycles))**, and cost follows from po2.
+That gives a usable planning rule for Tasks 4 and 7:
+**po2 ≥ ceil(log2(user_cycles + paging_cycles))**, and cost follows from po2.
+
+It is a lower bound rather than an equality, and the two rows above are why: they
+are consistent with `reserved` being *pure* padding, but they cannot prove it. If
+the proof system also needs some fixed non-padding allocation inside `reserved`,
+the 256 B row caps it at 15,739 cycles — so the rule can under-predict by one po2
+for a guest landing within roughly 15k cycles below a boundary. Plan against the
+next po2 up when a guest lands that close.
 
 Two things fall out of it. Paging is half the real work at 256 B (24,870 against
 24,927 user cycles), so the policy guest's memory access pattern will move its po2

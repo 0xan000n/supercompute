@@ -404,6 +404,9 @@ rounded) signed → coordinator → Insights page.
    deck's proof beat absorbs it honestly. If > ~10 min, slim the policy via a
    **versioned policy change** (new ImageID, new manifest) — never host-side
    subsetting.
+   > [Phase 2a measured: ~50 s composite for a 4 KB hash-only guest, CPU-only —
+   > risc0 3.0.6 does not dispatch to Metal. The estimate's range was about
+   > right; its stated cause was not. See VALIDATION.md §2c.]
 3. **Rust port fidelity** — NFKC + token-aware matching must match TS exactly.
    Fixtures + required randomized differential tests (§8) are the contract.
 4. **ONNX embeddings inside the enclave process** — memory/startup cost unknown.
