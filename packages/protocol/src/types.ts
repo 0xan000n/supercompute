@@ -3,7 +3,13 @@
  * Spec: Compute Trust Network Prototype, Implementation Specification v0.1.
  */
 
-export type Provider = "openai" | "anthropic" | "google" | "mock";
+/**
+ * Exactly the providers an adapter exists for. Google was listed here before any
+ * Google adapter, price row, or egress entry existed, so the type advertised a
+ * capability the runtime refuses — the kind of gap a caller only finds by hitting
+ * it. The enclave's registry is the authority; this union now agrees with it.
+ */
+export type Provider = "openai" | "anthropic" | "mock";
 
 export interface CanonicalMessage {
   role: "system" | "user" | "assistant";
@@ -116,14 +122,6 @@ export interface CredentialIntentV1 {
   contributorId: string;
   /** 32-byte hex, fresh per contribution; the enclave rejects repeats */
   intentNonce: string;
-}
-
-/** §13 — credential submission; the intent (key + constraints) is HPKE-sealed. */
-export interface CredentialSubmission {
-  enclaveKeyId: string;
-  enc: string;
-  encryptedSecret: string;
-  contributorDisplayId: string;
 }
 
 /** §15 — capability object signed by the enclave at storage time. */
@@ -296,6 +294,15 @@ export type CtnEventType =
   | "policy.started"
   | "policy.allowed"
   | "policy.denied"
+  /**
+   * The request is over and it did not succeed. Distinct from `provider.failed`,
+   * which is about ONE attempt: a request can survive an attempt failing, and an
+   * attempt is not the only way a request dies (no capacity, an enclave refusal
+   * after policy allowed). Without this event the projection's last word on an
+   * allowed-then-failed request is `policy.allowed`, which leaves it rendering
+   * as permanently in-flight — a UI that quietly disagrees with the DB row.
+   */
+  | "request.failed"
   | "proof.started"
   | "proof.completed"
   | "proof.failed"

@@ -452,6 +452,12 @@ async function runSecureRequest(
   if (discovery.candidates.length === 0) {
     db.prepare(`UPDATE requests SET status = 'FAILED', error_code = 'CTN_NO_CAPACITY', completed_at = ? WHERE id = ?`)
       .run(nowIso(), requestId);
+    emitEvent("request.failed", requestId, {
+      request_id: requestId,
+      error_code: "CTN_NO_CAPACITY",
+      attempts: 0,
+      total_ms: Math.round(performance.now() - startedAt),
+    });
     return {
       code: 503,
       body: {
@@ -476,6 +482,12 @@ async function runSecureRequest(
       db.prepare(
         `UPDATE requests SET status = 'FAILED', error_code = ?, completed_at = ?, total_ms = ? WHERE id = ?`
       ).run(err.code, nowIso(), Math.round(performance.now() - startedAt), requestId);
+      emitEvent("request.failed", requestId, {
+        request_id: requestId,
+        error_code: err.code,
+        attempts: 0,
+        total_ms: Math.round(performance.now() - startedAt),
+      });
       safeLog("warn", "envelope.rejected", {
         request_id: requestId,
         code: err.code,
@@ -490,6 +502,12 @@ async function runSecureRequest(
     db.prepare(
       `UPDATE requests SET status = 'FAILED', error_code = 'CTN_ENCLAVE_UNAVAILABLE', completed_at = ? WHERE id = ?`
     ).run(nowIso(), requestId);
+    emitEvent("request.failed", requestId, {
+      request_id: requestId,
+      error_code: "CTN_ENCLAVE_UNAVAILABLE",
+      attempts: 0,
+      total_ms: Math.round(performance.now() - startedAt),
+    });
     safeLog("error", "enclave.unavailable", { request_id: requestId });
     return {
       code: 503,
@@ -510,6 +528,12 @@ async function runSecureRequest(
     db.prepare(
       `UPDATE requests SET status = 'FAILED', error_code = 'CTN_INTERNAL', completed_at = ? WHERE id = ?`
     ).run(nowIso(), requestId);
+    emitEvent("request.failed", requestId, {
+      request_id: requestId,
+      error_code: "CTN_INTERNAL",
+      attempts: 0,
+      total_ms: Math.round(performance.now() - startedAt),
+    });
     safeLog("error", "enclave.malformed_result", { request_id: requestId });
     return {
       code: 502,
@@ -630,18 +654,37 @@ async function runSecureRequest(
      * under-counting this guard exists to prevent.
      */
     if (attempt.upstreamOutcomeUnknown) {
-      recordAssumedUsage({
-        requestId,
-        credentialId: attempt.credentialId,
-        contributorId: attempt.contributorId,
-        assumedSpendMicroUsd: attempt.assumedSpendMicroUsd ?? 0,
-      });
-      safeLog("warn", "provider.assumed_spend", {
-        request_id: requestId,
-        credential_id: attempt.credentialId,
-        classification: attempt.classification,
-        assumed_spend_micro_usd: attempt.assumedSpendMicroUsd,
-      });
+      /**
+       * Accounting is allowed to fail; it is not allowed to decide the request's
+       * outcome. `recordAssumedUsage` throws on a primary-key collision (the same
+       * requestId booked twice — the check that makes double-booking impossible),
+       * and an escaping throw here would abandon the FAILED path mid-loop: the
+       * row stays at RECEIVED, no `request.failed` is emitted, and the caller
+       * gets a generic 500 instead of the classification the enclave worked out.
+       * Log it and carry on — the request's own failure is the news.
+       */
+      try {
+        recordAssumedUsage({
+          requestId,
+          credentialId: attempt.credentialId,
+          contributorId: attempt.contributorId,
+          assumedSpendMicroUsd: attempt.assumedSpendMicroUsd ?? 0,
+        });
+        safeLog("warn", "provider.assumed_spend", {
+          request_id: requestId,
+          credential_id: attempt.credentialId,
+          classification: attempt.classification,
+          assumed_spend_micro_usd: attempt.assumedSpendMicroUsd,
+        });
+      } catch (err) {
+        safeLog("error", "provider.assumed_spend_failed", {
+          request_id: requestId,
+          credential_id: attempt.credentialId,
+          classification: attempt.classification,
+          assumed_spend_micro_usd: attempt.assumedSpendMicroUsd,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
 
     if (attempt.status === "FAILED") {
@@ -665,22 +708,32 @@ async function runSecureRequest(
   }
 
   if (result.status === "FAILED" || !result.selected || !result.receipt) {
+    const errorCode = result.error?.code ?? "CTN_PROVIDER_ERROR";
+    const totalMs = Math.round(performance.now() - startedAt);
     db.prepare(
       `UPDATE requests SET status = 'FAILED', request_commitment = ?, policy_result = 'ALLOW',
               policy_ms = ?, error_code = ?, completed_at = ?, total_ms = ? WHERE id = ?`
-    ).run(
-      result.commitment,
-      result.policyMs,
-      result.error?.code ?? "CTN_PROVIDER_ERROR",
-      nowIso(),
-      Math.round(performance.now() - startedAt),
-      requestId
-    );
+    ).run(result.commitment, result.policyMs, errorCode, nowIso(), totalMs, requestId);
+    /**
+     * The DB row is now FAILED, and until this event existed the graph was not
+     * told. `policy.allowed` was the last projection to touch the node, so a
+     * failed request rendered AUTHORIZED forever — in-flight in the UI, dead in
+     * the database. The event carries the code and the attempt count only: the
+     * enclave's `message` is caller-facing prose and has no business in a
+     * projection that anyone can read.
+     */
+    emitEvent("request.failed", requestId, {
+      request_id: requestId,
+      commitment: result.commitment,
+      error_code: errorCode,
+      attempts: result.attempts.length,
+      total_ms: totalMs,
+    });
     return {
       code: 502,
       body: {
         error: {
-          code: result.error?.code ?? "CTN_PROVIDER_ERROR",
+          code: errorCode,
           message: result.error?.message ?? "The request could not be completed.",
           request_id: requestId,
         },

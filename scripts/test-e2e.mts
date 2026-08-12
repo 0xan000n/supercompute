@@ -200,6 +200,28 @@ function describeAttempts(attempts: any[]): string {
     .join(", ")}]`;
 }
 
+/**
+ * Poll the graph for a node's status. Polled rather than read once because the
+ * projector drains the outbox on a 120ms timer, so the node is authoritative a
+ * beat after the HTTP response the test is reacting to. Returns the last status
+ * seen (or undefined) so a failure message can say what it settled on instead of
+ * just "not FAILED".
+ */
+async function awaitGraphNodeStatus(
+  nodeId: string,
+  want: string,
+  timeoutMs = 5000
+): Promise<string | undefined> {
+  const deadline = Date.now() + timeoutMs;
+  let last: string | undefined;
+  for (;;) {
+    const graph = (await (await fetch(`${COORD}/v1/graph`)).json()) as { nodes: any[] };
+    last = graph.nodes.find((n) => n.id === nodeId)?.status;
+    if (last === want || Date.now() > deadline) return last;
+    await new Promise((r) => setTimeout(r, 120));
+  }
+}
+
 async function getCredentials(): Promise<any[]> {
   const res = await fetch(`${COORD}/v1/credentials`);
   const json = (await res.json()) as { data: any[] };
@@ -719,6 +741,16 @@ async function run55_15(): Promise<void> {
         `the dispatched attempt should be Erin's ${erin.id}, got ${dispatched[0].credential_id}`
       );
 
+      // The failure has to reach the graph, not just the requests table. Before
+      // `request.failed` existed, the last event to touch this node was
+      // `policy.allowed`, so a dead request kept rendering AUTHORIZED — pulsing
+      // as if still in flight — for the rest of the demo.
+      const graphStatus = await awaitGraphNodeStatus(`req:${failedRequestId}`, "FAILED");
+      assert(
+        graphStatus === "FAILED",
+        `graph node req:${failedRequestId} settled at ${graphStatus ?? "<missing>"}, expected FAILED — a failed request must not render as in-flight`
+      );
+
       const credsAfter = await getCredentials();
       const erinAfter = credsAfter.find((c) => c.id === erin.id);
       assert(
@@ -738,7 +770,7 @@ async function run55_15(): Promise<void> {
         followUp.route.credential_id !== erin.id,
         `the follow-up must not route back to the cooling-down credential ${erin.id}`
       );
-      return `429 → FAILED ${code} after 1 dispatch; Erin cooldownUntil=${erinAfter.cooldownUntil}; follow-up → ${followUp.route.credential_id}`;
+      return `429 → FAILED ${code} after 1 dispatch (graph node ${graphStatus}); Erin cooldownUntil=${erinAfter.cooldownUntil}; follow-up → ${followUp.route.credential_id}`;
     } finally {
       for (const o of others) await patchCredential(o.id, { status: "ACTIVE" });
       // Erin's cooldown is left in place rather than cleared here — but 55.16
