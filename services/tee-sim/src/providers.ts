@@ -9,6 +9,7 @@
  */
 import type { AuthorizedRequest, AuthorizedCredential } from "./authorize.js";
 import { canonicalHash } from "@ctn/protocol";
+import { estimateCostMicroUsd, PRICING_TABLE_DIGEST } from "./pricing.js";
 
 export class EgressDeniedError extends Error {
   constructor(host: string) {
@@ -48,6 +49,8 @@ export interface ProviderResponse {
   outputTokens: number;
   /** integer micro-USD — the receipt is signed over canonical bytes, so no floats */
   estimatedCostMicroUsd: number;
+  /** Digest of the pinned price table that produced the estimate above (§5.1). */
+  pricingTableDigest: string;
   upstreamRequestHash: string;
   upstreamResponseHash: string;
   httpStatus: number;
@@ -72,20 +75,6 @@ export interface ProviderAdapter {
    * is no overload that takes a raw request or a raw key.
    */
   complete(request: AuthorizedRequest, credential: AuthorizedCredential): Promise<ProviderOutcome>;
-}
-
-/** Per-1M-token estimates, used for operational (not cryptographic) accounting. */
-const PRICING: Record<string, { inUsdPerM: number; outUsdPerM: number }> = {
-  "ctn/demo-model-a": { inUsdPerM: 0.15, outUsdPerM: 0.6 },
-  "ctn/demo-model-b": { inUsdPerM: 2.5, outUsdPerM: 10 },
-  "ctn/demo-model-fast": { inUsdPerM: 0.05, outUsdPerM: 0.2 },
-};
-
-/** Returns integer micro-USD so every signed value stays exactly representable. */
-function estimateCostMicroUsd(model: string, inTok: number, outTok: number): number {
-  const p = PRICING[model] ?? { inUsdPerM: 0.5, outUsdPerM: 1.5 };
-  const usd = (inTok / 1_000_000) * p.inUsdPerM + (outTok / 1_000_000) * p.outUsdPerM;
-  return Math.round(usd * 1_000_000);
 }
 
 const OPENAI_TIMEOUT_MS = Number(process.env.CTN_PROVIDER_TIMEOUT_MS ?? 20_000);
@@ -191,6 +180,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
           inputTokens,
           outputTokens,
           estimatedCostMicroUsd: estimateCostMicroUsd(request.request.model, inputTokens, outputTokens),
+          pricingTableDigest: PRICING_TABLE_DIGEST,
           upstreamRequestHash,
           upstreamResponseHash: "0x" + canonicalHash({ content, inputTokens, outputTokens }),
           httpStatus: res.status,

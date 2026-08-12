@@ -238,6 +238,12 @@ export interface ComputeReceipt {
      * verifier in another runtime must recompute byte-identical bytes.
      */
     estimatedCostMicroUsd?: number;
+    /**
+     * Digest of the pinned price table the estimate was computed from. Costs are
+     * estimates, not measurements: without knowing WHICH prices produced the
+     * number, a verifier can check the arithmetic of nothing.
+     */
+    pricingTableDigest?: string;
   };
   timing: {
     receivedAt: string;

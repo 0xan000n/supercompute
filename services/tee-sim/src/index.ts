@@ -451,6 +451,7 @@ app.post("/execute", async (request, reply) => {
       inputTokens: outcome.response.inputTokens,
       outputTokens: outcome.response.outputTokens,
       estimatedCostMicroUsd: outcome.response.estimatedCostMicroUsd,
+      pricingTableDigest: outcome.response.pricingTableDigest,
     },
     timing: {
       receivedAt,
