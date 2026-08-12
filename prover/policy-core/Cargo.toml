@@ -1,0 +1,26 @@
+[package]
+name = "policy-core"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Safety Policy v1 engine — Rust port of packages/policy/src/engine.ts, shared by the prover host and the zkVM guest."
+
+# NOTE: this crate must never depend on risc0. It is compiled twice — once for
+# the host and once, unchanged, into the guest — so a host-only dependency here
+# would be a guest-side compile failure later, and a guest-only one would stop
+# the differential tests from running natively.
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# `rules.categories` must deserialize in the JSON's insertion order: engine.ts:175
+# iterates `Object.entries(rules.categories)`, and that order IS the order of the
+# category score vector in the evaluation output. IndexMap's own Serialize/
+# Deserialize preserve it for a typed field, so serde_json's `preserve_order`
+# feature is deliberately NOT enabled here — Cargo feature unification would turn
+# it on for every serde_json in the workspace (including risc0's, in the host
+# binary), which is a behaviour change we neither need nor want to audit.
+indexmap = { version = "2", features = ["serde"] }
+unicode-normalization = "0.1"
+unicode-properties = { version = "0.1", default-features = false, features = [
+    "general-category",
+] }
