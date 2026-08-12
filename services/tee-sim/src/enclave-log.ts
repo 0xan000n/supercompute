@@ -11,6 +11,10 @@
  * long or credential-shaped is replaced rather than truncated-and-hoped-for.
  */
 const SECRET_VALUE_PATTERNS = [
+  // Covers real key material as issued: `sk-ant-api03-…` (Anthropic) and
+  // `sk-…` / `sk-proj-…` (OpenAI). The `\b` matters — without it the pattern
+  // also fires on ordinary prose like "risk-assessment-framework", and a
+  // redaction that eats useful log lines gets loosened by the next person.
   /\bsk-[A-Za-z0-9_-]{8,}/,
   /\bBearer\s+\S+/i,
   /\bmock-provider-key-\S+/,

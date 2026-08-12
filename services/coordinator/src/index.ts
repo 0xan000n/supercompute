@@ -14,7 +14,7 @@ import type { SecureRequestEnvelope } from "@ctn/protocol";
 import { db, migrate, nowIso, today } from "./db.js";
 import { safeLog } from "./safe-log.js";
 import { bus, emitEvent, graphSnapshot, startProjector } from "./events.js";
-import { applyAttemptOutcome, discoverCandidates, recordUsage } from "./routing.js";
+import { applyAttemptOutcome, discoverCandidates, recordAssumedUsage, recordUsage } from "./routing.js";
 import {
   EnclaveRejectionError,
   EnclaveUnavailableError,
@@ -42,11 +42,20 @@ app.setErrorHandler((err: Error, request, reply) => {
   reply.code(500).send({ error: { code: "CTN_INTERNAL", message: err.message } });
 });
 
-const MODELS = [
-  { id: "ctn/demo-model-a", label: "Demo Model A", tier: "standard" },
-  { id: "ctn/demo-model-b", label: "Demo Model B", tier: "frontier" },
-  { id: "ctn/demo-model-fast", label: "Demo Model Fast", tier: "fast" },
-];
+/**
+ * Presentation only — labels and tiers for ids the enclave's catalog publishes.
+ * The catalog decides WHICH models exist; this decides what they are called in a
+ * picker. An id missing from here still lists, under its own name.
+ */
+const MODEL_META: Record<string, { label: string; tier: string }> = {
+  "ctn/demo-model-a": { label: "Demo Model A", tier: "standard" },
+  "ctn/demo-model-b": { label: "Demo Model B", tier: "frontier" },
+  "ctn/demo-model-fast": { label: "Demo Model Fast", tier: "fast" },
+  "claude-haiku-4-5-20251001": { label: "Claude Haiku 4.5", tier: "fast" },
+  "claude-sonnet-4-5-20250929": { label: "Claude Sonnet 4.5", tier: "frontier" },
+  "gpt-4o-mini-2024-07-18": { label: "GPT-4o mini", tier: "fast" },
+  "gpt-4o-2024-08-06": { label: "GPT-4o", tier: "frontier" },
+};
 
 app.get("/health", async () => ({ ok: true, service: "coordinator", env: CTN_ENV }));
 
@@ -69,18 +78,55 @@ app.get("/v1/models", async () => {
     }
   }
 
+  /**
+   * The id list comes from the enclave's catalog, not a literal here. It used to
+   * be three hardcoded demo ids, which meant a contributor could seal a
+   * capability for `claude-haiku-4-5-20251001` and the playground would show it
+   * with no contributor count at all — the two endpoints describing the same
+   * network disagreed about what was on it.
+   *
+   * If the enclave is unreachable, fall back to the ids we can still see capacity
+   * for rather than 503-ing: this endpoint's job is "what can I ask for", and a
+   * partial honest answer beats none. The counts are computed locally either way.
+   */
+  let ids: string[];
+  try {
+    ids = (await teeClient.providers()).providers.flatMap((p) => p.models);
+  } catch {
+    ids = [...available.keys()].sort();
+  }
+
   return {
     object: "list",
-    data: MODELS.map((m) => ({
-      id: m.id,
+    data: ids.map((id) => ({
+      id,
       object: "model",
-      label: m.label,
-      tier: m.tier,
+      label: MODEL_META[id]?.label ?? id,
+      tier: MODEL_META[id]?.tier ?? "standard",
       // A count, deliberately — not an enumeration of whose capacity it is.
-      providers_available: available.get(m.id) ?? 0,
+      providers_available: available.get(id) ?? 0,
       trust_policy: "safety-v1",
     })),
   };
+});
+
+/**
+ * §5.1 — the provider catalog, relayed from the enclave.
+ *
+ * This is what the contribute page offers and what the playground selects from.
+ * It comes from the enclave's registry because the enclave is what enforces it:
+ * a sealed intent naming a provider or a model that is not in this list is
+ * refused at ingest, so publishing anything else here would only invite
+ * contributors to mint capabilities that cannot be honoured.
+ */
+app.get("/v1/providers", async (_request, reply) => {
+  try {
+    return await teeClient.providers();
+  } catch {
+    return reply.code(503).send({
+      error: { code: "CTN_ENCLAVE_UNAVAILABLE", message: "The confidential service is unavailable." },
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -139,11 +185,9 @@ app.post("/v1/credentials", async (request, reply) => {
   const body = request.body as {
     contributorId: string;
     label: string;
-    provider: string;
-    allowedModels: string[];
-    allowedPolicies: string[];
     weight?: number;
     operationalLimits?: { dailyUsd?: number; dailyRequests?: number };
+    credentialId: string;
     enclaveKeyId: string;
     enc: string;
     encryptedSecret: string;
@@ -154,7 +198,21 @@ app.post("/v1/credentials", async (request, reply) => {
     return reply.code(404).send({ error: { code: "CTN_INTERNAL", message: "unknown contributor" } });
   }
 
-  const credentialId = `cred_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+  // The id is the contributor's, not ours: it is sealed inside the intent, so
+  // minting one here would only produce a mismatch the enclave then refuses.
+  const credentialId = body.credentialId;
+  if (!/^cred_[0-9a-f]{12}$/.test(credentialId)) {
+    return reply.code(400).send({
+      error: { code: "CTN_INVALID_ENVELOPE", message: "credentialId must be cred_ + 12 hex chars" },
+    });
+  }
+  // The enclave enforces the real invariant (one capability per sealed intent);
+  // this keeps coordinator state coherent rather than half-writing a duplicate.
+  if (db.prepare(`SELECT id FROM credentials WHERE id = ?`).get(credentialId)) {
+    return reply.code(409).send({
+      error: { code: "CTN_INTENT_REPLAY", message: "this credential id has already been contributed" },
+    });
+  }
 
   // The coordinator forwards ciphertext it cannot read and receives back a
   // vault-encrypted blob plus an enclave-signed capability. At no point does a
@@ -166,21 +224,28 @@ app.post("/v1/credentials", async (request, reply) => {
       enc: body.enc,
       encryptedSecret: body.encryptedSecret,
       credentialId,
-      contributorId: body.contributorId,
-      capability: {
-        provider: body.provider,
-        allowedModels: body.allowedModels,
-        allowedPolicies: body.allowedPolicies,
-      },
     });
   } catch (err) {
     if (err instanceof EnclaveRejectionError) {
       safeLog("warn", "credential.ingest_rejected", { credential_id: credentialId, code: err.code });
-      return reply.code(400).send({ error: { code: err.code, message: err.message } });
+      // A consumed intent is a conflict, not a malformed envelope: collapsing
+      // the enclave's 409 into a 400 would misdescribe why it was refused.
+      return reply
+        .code(err.httpStatus === 409 ? 409 : 400)
+        .send({ error: { code: err.code, message: err.message } });
     }
     safeLog("error", "credential.ingest_failed", { credential_id: credentialId });
     return reply.code(503).send({
       error: { code: "CTN_ENCLAVE_UNAVAILABLE", message: "The confidential service is unavailable." },
+    });
+  }
+
+  // The sealed intent is the authority on whose credential this is; the HTTP
+  // body is only a hint. If they disagree, the relay altered something.
+  if (ingested.capability.contributorId !== body.contributorId) {
+    safeLog("warn", "credential.intent_mismatch", { credential_id: body.credentialId });
+    return reply.code(400).send({
+      error: { code: "CTN_INTENT_MISMATCH", message: "sealed intent names a different contributor" },
     });
   }
 
@@ -193,7 +258,7 @@ app.post("/v1/credentials", async (request, reply) => {
   ).run(
     credentialId,
     body.contributorId,
-    body.provider,
+    ingested.capability.provider,
     body.label,
     ingested.encryptedBlob,
     JSON.stringify(ingested.capability),
@@ -209,7 +274,7 @@ app.post("/v1/credentials", async (request, reply) => {
   emitEvent("credential.created", credentialId, {
     credential_id: credentialId,
     contributor_id: body.contributorId,
-    provider: body.provider,
+    provider: ingested.capability.provider,
     label: body.label,
     allowed_models: ingested.capability.allowedModels,
     policy_id: ingested.policyId,
@@ -218,7 +283,7 @@ app.post("/v1/credentials", async (request, reply) => {
   safeLog("info", "credential.created", {
     credential_id: credentialId,
     contributor_id: body.contributorId,
-    provider: body.provider,
+    provider: ingested.capability.provider,
   });
 
   return {
@@ -289,16 +354,57 @@ app.patch("/v1/credentials/:id", async (request, reply) => {
   const { id } = request.params as { id: string };
   const body = request.body as {
     status?: "ACTIVE" | "DISABLED";
-    allowedModels?: string[];
     weight?: number;
     operationalLimits?: { dailyUsd?: number | null; dailyRequests?: number | null };
   };
+
+  // §50 — the capability is derived once, inside the enclave, from the sealed
+  // intent. Nothing downstream can widen it, so nothing downstream may edit it.
+  if ((request.body as Record<string, unknown>).allowedModels !== undefined) {
+    return reply.code(400).send({
+      error: {
+        code: "CTN_CAPABILITY_IMMUTABLE",
+        message: "Capabilities are immutable. Revoke this credential and contribute a new one.",
+      },
+    });
+  }
+
   const row = db.prepare(`SELECT * FROM credentials WHERE id = ?`).get(id) as
     | Record<string, unknown>
     | undefined;
   if (!row) return reply.code(404).send({ error: { code: "CTN_INTERNAL", message: "unknown credential" } });
 
-  if (body.status) {
+  if (body.status !== undefined) {
+    /**
+     * The TypeScript annotation on `body` is a description of what callers are
+     * supposed to send, not a check — this handler previously wrote whatever
+     * string arrived straight into the status column. Two rules, both of which
+     * something else in this system already claims to be true:
+     *
+     * 1. Only ACTIVE and DISABLED are settable. DELETED is reached through
+     *    DELETE, and an unrecognised status would silently make a credential
+     *    unroutable (routing tests `status !== 'ACTIVE'`) under a name nothing
+     *    else understands.
+     * 2. Revocation is terminal. The e2e smoke tests revoke a REAL provider key
+     *    by DELETE and the docs say it is "never routable again"; without this,
+     *    one PATCH {status:"ACTIVE"} put that key back in the pool.
+     */
+    if (body.status !== "ACTIVE" && body.status !== "DISABLED") {
+      return reply.code(400).send({
+        error: {
+          code: "CTN_INVALID_STATUS",
+          message: "status must be ACTIVE or DISABLED; use DELETE to revoke a credential",
+        },
+      });
+    }
+    if (row.status === "DELETED") {
+      return reply.code(409).send({
+        error: {
+          code: "CTN_CREDENTIAL_DELETED",
+          message: "This credential was revoked. Revocation is terminal — contribute a new credential.",
+        },
+      });
+    }
     db.prepare(`UPDATE credentials SET status = ?, cooldown_until = NULL WHERE id = ?`).run(body.status, id);
   }
   if (body.weight !== undefined) {
@@ -310,18 +416,6 @@ app.patch("/v1/credentials/:id", async (request, reply) => {
     ).run(
       body.operationalLimits.dailyUsd ?? null,
       body.operationalLimits.dailyRequests ?? null,
-      id
-    );
-  }
-
-  // §50 — changing a cryptographically bound property mints a NEW capability
-  // version with a fresh enclave signature. The coordinator cannot do this itself.
-  if (body.allowedModels) {
-    const capability = JSON.parse(row.capability_json as string) as Record<string, unknown>;
-    const resigned = await teeClient.recapability({ ...capability, allowedModels: body.allowedModels });
-    db.prepare(`UPDATE credentials SET capability_json = ?, capability_signature = ? WHERE id = ?`).run(
-      JSON.stringify(resigned.capability),
-      resigned.capabilitySignature,
       id
     );
   }
@@ -385,6 +479,12 @@ async function runSecureRequest(
   if (discovery.candidates.length === 0) {
     db.prepare(`UPDATE requests SET status = 'FAILED', error_code = 'CTN_NO_CAPACITY', completed_at = ? WHERE id = ?`)
       .run(nowIso(), requestId);
+    emitEvent("request.failed", requestId, {
+      request_id: requestId,
+      error_code: "CTN_NO_CAPACITY",
+      attempts: 0,
+      total_ms: Math.round(performance.now() - startedAt),
+    });
     return {
       code: 503,
       body: {
@@ -409,6 +509,12 @@ async function runSecureRequest(
       db.prepare(
         `UPDATE requests SET status = 'FAILED', error_code = ?, completed_at = ?, total_ms = ? WHERE id = ?`
       ).run(err.code, nowIso(), Math.round(performance.now() - startedAt), requestId);
+      emitEvent("request.failed", requestId, {
+        request_id: requestId,
+        error_code: err.code,
+        attempts: 0,
+        total_ms: Math.round(performance.now() - startedAt),
+      });
       safeLog("warn", "envelope.rejected", {
         request_id: requestId,
         code: err.code,
@@ -423,6 +529,12 @@ async function runSecureRequest(
     db.prepare(
       `UPDATE requests SET status = 'FAILED', error_code = 'CTN_ENCLAVE_UNAVAILABLE', completed_at = ? WHERE id = ?`
     ).run(nowIso(), requestId);
+    emitEvent("request.failed", requestId, {
+      request_id: requestId,
+      error_code: "CTN_ENCLAVE_UNAVAILABLE",
+      attempts: 0,
+      total_ms: Math.round(performance.now() - startedAt),
+    });
     safeLog("error", "enclave.unavailable", { request_id: requestId });
     return {
       code: 503,
@@ -443,6 +555,12 @@ async function runSecureRequest(
     db.prepare(
       `UPDATE requests SET status = 'FAILED', error_code = 'CTN_INTERNAL', completed_at = ? WHERE id = ?`
     ).run(nowIso(), requestId);
+    emitEvent("request.failed", requestId, {
+      request_id: requestId,
+      error_code: "CTN_INTERNAL",
+      attempts: 0,
+      total_ms: Math.round(performance.now() - startedAt),
+    });
     safeLog("error", "enclave.malformed_result", { request_id: requestId });
     return {
       code: 502,
@@ -533,8 +651,8 @@ async function runSecureRequest(
   for (const attempt of result.attempts) {
     const outcome = applyAttemptOutcome(attempt.credentialId, attempt.status, attempt.classification);
     db.prepare(
-      `INSERT INTO provider_attempts (id, request_id, credential_id, contributor_id, attempt_number, status, http_status, classification, latency_ms, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO provider_attempts (id, request_id, credential_id, contributor_id, attempt_number, status, http_status, classification, latency_ms, created_at, upstream_outcome_unknown, assumed_spend_micro_usd)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       `att_${requestId}_${attempt.attemptNumber}`,
       requestId,
@@ -545,8 +663,56 @@ async function runSecureRequest(
       attempt.httpStatus,
       attempt.classification ?? null,
       attempt.latencyMs,
-      nowIso()
+      nowIso(),
+      attempt.upstreamOutcomeUnknown ? 1 : 0,
+      attempt.assumedSpendMicroUsd ?? null
     );
+
+    /**
+     * §5.1 — the enclave dispatched and never learned the outcome. Nothing
+     * downstream will ever tell us what this cost, and `recordUsage` only runs
+     * for a success, so without this the request is free: no spend, no request
+     * slot, and a wedged provider becomes an unmetered way to drain a
+     * contributor's cap. Book the enclave's conservative upper bound instead.
+     *
+     * The flag alone is the trigger, not the flag AND a number: an unknown
+     * outcome that arrived without a bound still consumed a request slot, and
+     * skipping it because the dollar figure is missing is exactly the
+     * under-counting this guard exists to prevent.
+     */
+    if (attempt.upstreamOutcomeUnknown) {
+      /**
+       * Accounting is allowed to fail; it is not allowed to decide the request's
+       * outcome. `recordAssumedUsage` throws on a primary-key collision (the same
+       * requestId booked twice — the check that makes double-booking impossible),
+       * and an escaping throw here would abandon the FAILED path mid-loop: the
+       * row stays at RECEIVED, no `request.failed` is emitted, and the caller
+       * gets a generic 500 instead of the classification the enclave worked out.
+       * Log it and carry on — the request's own failure is the news.
+       */
+      try {
+        recordAssumedUsage({
+          requestId,
+          credentialId: attempt.credentialId,
+          contributorId: attempt.contributorId,
+          assumedSpendMicroUsd: attempt.assumedSpendMicroUsd ?? 0,
+        });
+        safeLog("warn", "provider.assumed_spend", {
+          request_id: requestId,
+          credential_id: attempt.credentialId,
+          classification: attempt.classification,
+          assumed_spend_micro_usd: attempt.assumedSpendMicroUsd,
+        });
+      } catch (err) {
+        safeLog("error", "provider.assumed_spend_failed", {
+          request_id: requestId,
+          credential_id: attempt.credentialId,
+          classification: attempt.classification,
+          assumed_spend_micro_usd: attempt.assumedSpendMicroUsd,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
 
     if (attempt.status === "FAILED") {
       emitEvent("provider.failed", requestId, {
@@ -569,22 +735,32 @@ async function runSecureRequest(
   }
 
   if (result.status === "FAILED" || !result.selected || !result.receipt) {
+    const errorCode = result.error?.code ?? "CTN_PROVIDER_ERROR";
+    const totalMs = Math.round(performance.now() - startedAt);
     db.prepare(
       `UPDATE requests SET status = 'FAILED', request_commitment = ?, policy_result = 'ALLOW',
               policy_ms = ?, error_code = ?, completed_at = ?, total_ms = ? WHERE id = ?`
-    ).run(
-      result.commitment,
-      result.policyMs,
-      result.error?.code ?? "CTN_PROVIDER_ERROR",
-      nowIso(),
-      Math.round(performance.now() - startedAt),
-      requestId
-    );
+    ).run(result.commitment, result.policyMs, errorCode, nowIso(), totalMs, requestId);
+    /**
+     * The DB row is now FAILED, and until this event existed the graph was not
+     * told. `policy.allowed` was the last projection to touch the node, so a
+     * failed request rendered AUTHORIZED forever — in-flight in the UI, dead in
+     * the database. The event carries the code and the attempt count only: the
+     * enclave's `message` is caller-facing prose and has no business in a
+     * projection that anyone can read.
+     */
+    emitEvent("request.failed", requestId, {
+      request_id: requestId,
+      commitment: result.commitment,
+      error_code: errorCode,
+      attempts: result.attempts.length,
+      total_ms: totalMs,
+    });
     return {
       code: 502,
       body: {
         error: {
-          code: result.error?.code ?? "CTN_PROVIDER_ERROR",
+          code: errorCode,
           message: result.error?.message ?? "The request could not be completed.",
           request_id: requestId,
         },

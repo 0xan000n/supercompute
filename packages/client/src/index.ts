@@ -18,6 +18,7 @@ import {
   toCanonicalRequest,
   verifyCanonical,
   type AttestationBundle,
+  type CredentialIntentV1,
   type SecurePayload,
   type SecureRequestEnvelope,
   type SignedComputeReceipt,
@@ -302,11 +303,24 @@ export class ComputeTrustClient {
       );
     }
 
-    // The raw key is sealed here, in the contributor's own browser. Only
-    // ciphertext is posted to the coordinator (§12).
+    // The key AND its constraints are sealed together, in the contributor's
+    // own browser, to the attested key — including a client-chosen credential
+    // id and a fresh nonce, so the envelope can neither be altered nor
+    // re-minted by the relay (§5.1).
+    const credentialId = `cred_${randomHex(6)}`;
+    const intent: CredentialIntentV1 = {
+      version: 1,
+      credentialId,
+      secret: input.apiKey,
+      provider: input.provider as CredentialIntentV1["provider"],
+      allowedModels: input.allowedModels,
+      allowedPolicies: ["safety-v1"],
+      contributorId: input.contributorId,
+      intentNonce: randomHex(32),
+    };
     const sealed = await hpkeSeal(
       attestation.bundle.ingressPublicKey,
-      new TextEncoder().encode(input.apiKey)
+      new TextEncoder().encode(canonicalJson(intent))
     );
 
     const res = await fetch(`${this.baseUrl}/v1/credentials`, {
@@ -315,11 +329,9 @@ export class ComputeTrustClient {
       body: JSON.stringify({
         contributorId: input.contributorId,
         label: input.label,
-        provider: input.provider,
-        allowedModels: input.allowedModels,
-        allowedPolicies: ["safety-v1"],
         weight: input.weight ?? 1,
         operationalLimits: input.operationalLimits,
+        credentialId,
         enclaveKeyId: attestation.bundle.enclaveKeyId,
         enc: sealed.enc,
         encryptedSecret: sealed.ciphertext,

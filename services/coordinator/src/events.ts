@@ -278,6 +278,26 @@ function project(eventType: CtnEventType, payload: Record<string, unknown>): voi
       });
       break;
 
+    /**
+     * The request's terminal state when it did not succeed. This has to overwrite
+     * whatever `policy.allowed` or `route.selected` last wrote, because those are
+     * mid-flight statuses and the graph would otherwise keep showing a dead
+     * request as still running.
+     */
+    case "request.failed":
+      upsertNode({
+        id: `req:${s("request_id")}`,
+        type: "Request",
+        label: `Request ${shortHash(s("commitment") ?? s("request_id")!)}`,
+        status: "FAILED",
+        meta: {
+          errorCode: s("error_code") ?? "",
+          attempts: n("attempts") ?? 0,
+          totalLatencyMs: n("total_ms") ?? 0,
+        },
+      });
+      break;
+
     case "proof.started":
       upsertNode({
         id: `proof:${s("request_id")}`,

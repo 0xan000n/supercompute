@@ -157,11 +157,18 @@ export default function NetworkPage() {
                   }`}
                 >
                   <span className="mono truncate text-[11px] text-ink-2">{node.label}</span>
+                  {/*
+                    FAILED is terminal, so it must not pulse: the pulse is what
+                    says "still working", and a dead request wearing it is the UI
+                    telling the room something the database disagrees with. Rose
+                    for both terminal-bad states, matching statusColor() in
+                    lib/theme.ts so the list dot and the graph node agree.
+                  */}
                   <span
                     className={`size-1.5 shrink-0 rounded-full ${
                       node.status === "COMPLETE"
                         ? "bg-verified"
-                        : node.status === "DENIED"
+                        : node.status === "DENIED" || node.status === "FAILED"
                           ? "bg-denied"
                           : "bg-pending animate-pulse-soft"
                     }`}

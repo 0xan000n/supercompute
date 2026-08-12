@@ -57,9 +57,33 @@ export default function PlaygroundPage() {
     "/v1/models",
     8000
   );
+  // §5.1 — the selectable models are the enclave's catalog, grouped by the
+  // provider that serves them. `/v1/models` still supplies the contributor
+  // counts, which is a different fact about the same ids.
+  // 30s rather than 0: a one-off failure at interval 0 leaves the model picker
+  // empty until reload, which on a demo machine is indistinguishable from "the
+  // network has no capacity".
+  const { data: catalog } = usePolled<{ providers: Array<{ provider: string; models: string[] }> }>(
+    "/v1/providers",
+    30_000
+  );
+  const available = useMemo(
+    () => new Map((models?.data ?? []).map((m) => [m.id, m.providers_available])),
+    [models]
+  );
+  const providers = useMemo(() => catalog?.providers ?? [], [catalog]);
 
   const [prompt, setPrompt] = useState(PRESETS[0].prompt);
-  const [model, setModel] = useState("ctn/demo-model-a");
+  // Null until the catalog lands: the default is then the first model somebody
+  // has actually contributed capacity for, so the demo's first click does not
+  // land on a model with no credentials behind it.
+  const [chosenModel, setChosenModel] = useState<string | null>(null);
+  const catalogModels = useMemo(() => providers.flatMap((p) => p.models), [providers]);
+  const model =
+    chosenModel ??
+    catalogModels.find((id) => (available.get(id) ?? 0) > 0) ??
+    catalogModels[0] ??
+    "";
   const [privacyMode, setPrivacyMode] = useState<"secure" | "compatibility">("secure");
   const [stage, setStage] = useState<Stage>("idle");
   const [attestation, setAttestation] = useState<AttestationEnvelope | null>(null);
@@ -318,22 +342,33 @@ export default function PlaygroundPage() {
                 <div>
                   <SectionLabel>Model</SectionLabel>
                   <div className="mt-1.5 grid gap-1.5">
-                    {(models?.data ?? []).map((m) => (
-                      <button
-                        key={m.id}
-                        onClick={() => setModel(m.id)}
-                        className={`flex items-center justify-between rounded-[9px] border px-2.5 py-2 text-left transition ${
-                          model === m.id
-                            ? "border-private/45 bg-private/[0.08]"
-                            : "border-hairline hover:border-ink-4"
-                        }`}
-                      >
-                        <span className="mono text-[11.5px] text-ink-2">{m.id}</span>
-                        <span className="text-[10.5px] text-ink-4">
-                          {m.providers_available} contributor
-                          {m.providers_available === 1 ? "" : "s"}
-                        </span>
-                      </button>
+                    {providers.map((p) => (
+                      <div key={p.provider} className="grid gap-1.5">
+                        <div className="mono text-[10px] uppercase tracking-[0.08em] text-ink-4">
+                          {p.provider}
+                        </div>
+                        {p.models.map((id) => {
+                          const count = available.get(id);
+                          return (
+                            <button
+                              key={id}
+                              onClick={() => setChosenModel(id)}
+                              className={`flex items-center justify-between rounded-[9px] border px-2.5 py-2 text-left transition ${
+                                model === id
+                                  ? "border-private/45 bg-private/[0.08]"
+                                  : "border-hairline hover:border-ink-4"
+                              }`}
+                            >
+                              <span className="mono text-[11.5px] text-ink-2">{id}</span>
+                              <span className="text-[10.5px] text-ink-4">
+                                {count === undefined
+                                  ? "—"
+                                  : `${count} contributor${count === 1 ? "" : "s"}`}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
                     ))}
                   </div>
                 </div>
@@ -359,7 +394,12 @@ export default function PlaygroundPage() {
                 </div>
               </div>
 
-              <Button onClick={send} busy={busy} disabled={prompt.trim().length === 0} className="mt-3.5 w-full">
+              <Button
+                onClick={send}
+                busy={busy}
+                disabled={prompt.trim().length === 0 || model.length === 0}
+                className="mt-3.5 w-full"
+              >
                 {busy ? "Sending…" : "Send private request"}
               </Button>
             </Panel>

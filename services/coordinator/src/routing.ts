@@ -174,8 +174,18 @@ export function applyAttemptOutcome(
   if (classification === "auth_failed") {
     // A credential the provider rejects is useless and possibly revoked: disable
     // it rather than retrying it on every subsequent request.
+    //
+    // The CASE guard is not decoration. A dispatch already in flight when the
+    // credential is DELETED lands here afterwards, and a plain write to
+    // 'DISABLED' would move a revoked row back into a status that PATCH is
+    // allowed to flip to ACTIVE — resurrecting, by way of a failure handler,
+    // exactly the key the owner revoked.
     db.prepare(
-      `UPDATE credentials SET status = 'DISABLED', failure_count = failure_count + 1, last_used_at = ? WHERE id = ?`
+      `UPDATE credentials
+          SET status = CASE WHEN status = 'DELETED' THEN 'DELETED' ELSE 'DISABLED' END,
+              failure_count = failure_count + 1,
+              last_used_at = ?
+        WHERE id = ?`
     ).run(nowIso(), credentialId);
     return { action: "disabled" };
   }
@@ -219,4 +229,68 @@ export function recordUsage(args: {
             usage_day = ?
       WHERE id = ?`
   ).run(args.estimatedCostUsd, today(), args.credentialId);
+}
+
+/**
+ * §5.1 — book the conservative upper bound for a dispatch whose outcome we never
+ * learned (timeout, mid-flight transport failure, a 200 we could not parse).
+ *
+ * The provider may have run the completion and billed for it. Recording nothing
+ * would make a wedged provider the cheapest capacity on the network: every such
+ * request would be free of both cost and request-slot, and a credential could be
+ * drained past its cap without a single counter moving. So an unknown outcome
+ * consumes exactly what a known one does — a request slot plus a cost estimate —
+ * with tokens recorded as 0 because no token count was ever reported.
+ *
+ * Both writes go in one transaction. Half of this pair is worse than neither:
+ * a ledger row without the counter bump silently under-enforces the cap, and a
+ * counter bump without the ledger row makes the dashboard's totals unexplainable.
+ * (node:sqlite has no `db.transaction()` wrapper, hence the explicit BEGIN.)
+ *
+ * The counter bump goes FIRST and the ledger insert LAST, because the insert is
+ * the statement that can fail: its primary key is what makes double-booking a
+ * request impossible. Running it last means a duplicate is caught with a counter
+ * already incremented, so the rollback has something real to undo — the ordering
+ * is what gives the transaction a job, rather than merely a wrapper around a
+ * statement that never got that far.
+ */
+export function recordAssumedUsage(args: {
+  requestId: string;
+  credentialId: string;
+  contributorId: string;
+  assumedSpendMicroUsd: number;
+}): void {
+  const estimatedCostUsd = args.assumedSpendMicroUsd / 1_000_000;
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.prepare(
+      `UPDATE credentials
+          SET requests_today = requests_today + 1,
+              estimated_cost_today_usd = estimated_cost_today_usd + ?,
+              usage_day = ?
+        WHERE id = ?`
+    ).run(estimatedCostUsd, today(), args.credentialId);
+    db.prepare(
+      `INSERT INTO usage (id, request_id, credential_id, contributor_id, input_tokens, output_tokens, estimated_cost_usd, created_at)
+       VALUES (?, ?, ?, ?, 0, 0, ?, ?)`
+    ).run(
+      `use_${args.requestId}`,
+      args.requestId,
+      args.credentialId,
+      args.contributorId,
+      estimatedCostUsd,
+      nowIso()
+    );
+    db.exec("COMMIT");
+  } catch (err) {
+    // SQLite auto-rolls-back some errors (BUSY, IOERR, full-disk), which makes
+    // this ROLLBACK a "no transaction is active" throw that would replace the
+    // error the caller actually needs to see.
+    try {
+      db.exec("ROLLBACK");
+    } catch {
+      /* already rolled back */
+    }
+    throw err;
+  }
 }

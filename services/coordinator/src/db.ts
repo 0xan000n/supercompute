@@ -86,7 +86,12 @@ export function migrate(): void {
       http_status    INTEGER,
       classification TEXT,
       latency_ms     INTEGER,
-      created_at     TEXT NOT NULL
+      created_at     TEXT NOT NULL,
+      -- §5.1 — the request was dispatched and no definitive answer came back.
+      -- The provider may have processed AND billed it, so the attempt carries
+      -- the conservative upper bound the cap accounting was charged.
+      upstream_outcome_unknown INTEGER NOT NULL DEFAULT 0,
+      assumed_spend_micro_usd  INTEGER
     );
 
     CREATE TABLE IF NOT EXISTS proofs (
@@ -160,6 +165,23 @@ export function migrate(): void {
     CREATE INDEX IF NOT EXISTS idx_credentials_contributor ON credentials(contributor_id);
     CREATE INDEX IF NOT EXISTS idx_requests_created ON requests(created_at DESC);
   `);
+
+  /**
+   * Additive migrations for databases created before the column existed.
+   * SQLite has no `ADD COLUMN IF NOT EXISTS`, and the alternative — reading
+   * `PRAGMA table_info` first — is the same check written longer. A throw here
+   * means the column is already there, which is the desired end state.
+   */
+  for (const ddl of [
+    `ALTER TABLE provider_attempts ADD COLUMN upstream_outcome_unknown INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE provider_attempts ADD COLUMN assumed_spend_micro_usd INTEGER`,
+  ]) {
+    try {
+      db.exec(ddl);
+    } catch {
+      /* column already exists */
+    }
+  }
 }
 
 export function nowIso(): string {

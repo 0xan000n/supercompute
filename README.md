@@ -81,10 +81,26 @@ afterwards so the enclave re-provisions its vault, then `pnpm seed` again.
 
 ```bash
 pnpm test                                  # policy fixtures, canonicalisation, crypto, invariants
-pnpm test:e2e                              # 21 security, routing and privacy cases (§53–56, §36)
+pnpm test:e2e                              # 28 security, routing and privacy cases (§53–56, §36, §5.1)
 pnpm privacy-test                          # canary sweep across every persisted surface
 pnpm verify-receipt <requestId>            # independent receipt + proof + binding check
 ```
+
+`pnpm test:e2e` runs entirely against the local mock upstream and costs nothing. Two
+further cases talk to a **real provider on a real account** and are therefore skipped
+unless you opt in by supplying a key:
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-… OPENAI_API_KEY=sk-… pnpm test:e2e   # adds cases 70 and 71
+```
+
+Each contributes the key as a capped credential, sends one 16-token prompt (well
+under a cent), asserts the receipt carries real provider-reported token counts and
+the pinned price table's digest, and then revokes the credential — whether the case
+passed or failed. Revocation is terminal: the coordinator refuses to write any status
+over `DELETED`, so a revoked key cannot be re-enabled. It does not erase the sealed
+ciphertext from the enclave vault, so rotate any key you smoke-test with, or
+`pnpm reset` afterwards.
 
 `verify-receipt` recomputes every signature and hash locally against the attested
 public keys. It does not ask the network whether its own artifacts are valid.
@@ -143,6 +159,24 @@ scripts/              dev launcher, seed, e2e suite, privacy sweep, receipt veri
 
 ---
 
+## What is real here, and what is simulated
+
+Read the two labels as one table. A prototype that leaves this implicit is asking to
+be quoted on the half that flatters it.
+
+| Piece | Real or simulated | What that actually means |
+|---|---|---|
+| Provider calls | **Real** | Anthropic and OpenAI adapters call the live APIs with contributed keys, pinned to dated snapshot model IDs. Costs are estimates from a pinned price table over provider-reported token counts; a timeout or unparseable response leaves upstream spend unknown and is booked conservatively. One dispatch per request — never retried. |
+| Prompt and credential sealing | **Real** | HPKE to the attested ingress key, performed in the caller's or contributor's own browser. The coordinator relays ciphertext it has no key for; the canary sweep is what checks that, not the claim. |
+| Capability signing and enforcement | **Real** | Ed25519 over the capability, verified inside the enclave before any blob is decrypted. Capabilities are immutable — widening one means contributing a new credential. |
+| Egress control | **Real** | Hostname allowlist checked inside the trust boundary before any bytes leave, redirects refused rather than followed. A refused redirect is classified as a *dispatched* failure, because the prompt and key already went out on the first hop. |
+| Intent replay protection | **Real, but in-memory** | The enclave refuses a sealed intent digest it has already consumed. That set does not survive a restart; what does is structural — the credential id is sealed inside the intent, so a replay can only re-mint the same capability for the same contributor. |
+| Spend caps | **Real counters, operational enforcement** | Daily dollar and request limits are counted and enforced, including for dispatches whose outcome was never learned. They live in ordinary application state, so a malicious host could roll them back. |
+| Hardware confidentiality | **Simulated** | `SimulatedTEE`: identical protocol, policy, credential handling, routing checks and receipt generation to the Nitro target, in an ordinary process whose memory the host can read. |
+| Attestation document | **Simulated platform, real signatures** | The document is genuinely signed by the enclave key and genuinely verified by the client, including nonce freshness — but no PCR measures a real host, so it attests code identity only by convention. |
+| Policy proof | **Simulated** (`simulated-reexec`) | The policy is genuinely re-executed from the witness and the journal is signed by an attested key, but there is no succinct argument. |
+| Demo traffic and dashboards | **Simulated** (mock upstream) | `pnpm seed` contributes five mock keys against `ctn/demo-model-*`. Every number on the graph, contributor and trust pages comes from that stand-in unless you ran the real-provider smoke tests above. |
+
 ## What this establishes
 
 - **Prompt confidentiality from network infrastructure.** On the secure endpoint the
@@ -161,7 +195,9 @@ scripts/              dev launcher, seed, e2e suite, privacy sweep, receipt veri
   matching a commitment was evaluated by an exact named policy version and
   allowed — without receiving the request.
 - **Constrained delegation.** Allowed models and required policy are bound into an
-  enclave-signed capability the untrusted coordinator cannot widen.
+  enclave-signed capability the untrusted coordinator cannot widen. Models are named
+  as dated snapshots (`claude-haiku-4-5-20251001`), never as movable aliases, so
+  consent cannot be re-pointed at a different model by someone else's release.
 
 ## What this does not establish
 
@@ -180,6 +216,13 @@ Read this as carefully as the list above.
 - **Spend caps are operational, not cryptographic.** Daily dollar and request limits
   live in application state; a malicious host could roll the counters back.
   Everything that surfaces a limit labels it `operationally enforced`.
+- **A dispatch whose outcome was never learned has no receipt.** A timeout, a
+  mid-flight transport failure or a 200 the adapter cannot parse means the provider
+  may have run the completion and billed for it. The cap is charged a conservative
+  upper bound so wedged capacity is not the cheapest capacity on the network — but
+  there is nothing to sign a receipt over, so in Phase 1 such a request appears only
+  as a provider attempt and a usage row. Representing assumed spend properly needs
+  the Phase 2 receipt split.
 - **This build has no hardware confidentiality.** The confidential service runs in
   simulation: identical protocol, policy, credential handling, routing checks and
   receipt generation to the Nitro target, but in an ordinary process whose memory

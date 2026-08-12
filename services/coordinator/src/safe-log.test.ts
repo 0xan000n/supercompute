@@ -77,6 +77,34 @@ test("non-forbidden identifiers survive, so logs stay useful", () => {
   });
 });
 
+/**
+ * Real Anthropic and OpenAI credentials now flow through the enclave, so the two
+ * layers are pinned against the exact shapes they arrive in. The header values
+ * here are deliberately NOT key-shaped: if they were, the value-pattern layer
+ * would redact them and the test would pass without the key-name layer existing.
+ */
+test("real provider auth header names are redacted by name alone", () => {
+  const out = redact({
+    "x-api-key": "opaque-provider-token-value",
+    Authorization: "opaque-provider-token-value",
+    "anthropic-version": "2023-06-01",
+  }) as Record<string, unknown>;
+  assert.equal(out["x-api-key"], REDACTED);
+  assert.equal(out["Authorization"], REDACTED);
+  assert.equal(out["anthropic-version"], "2023-06-01");
+});
+
+test("key-shaped VALUES are redacted even under innocent keys", () => {
+  const out = redact({
+    note: "sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAAAA",
+    detail: "upstream rejected Bearer sk-proj-BBBBBBBBBBBBBBBBBBBB",
+    model: "claude-sonnet-4-5",
+  }) as Record<string, unknown>;
+  assert.equal(out.note, REDACTED);
+  assert.equal(out.detail, REDACTED);
+  assert.equal(out.model, "claude-sonnet-4-5");
+});
+
 test("deeply nested structures terminate instead of recursing forever", () => {
   // Build a chain deeper than the depth limit and confirm it is truncated, not thrown.
   let deep: Record<string, unknown> = { prompt: "CANARY" };

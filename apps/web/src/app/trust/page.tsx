@@ -91,7 +91,15 @@ export default function TrustPage() {
               />
               <Claim
                 title="Constrained delegation"
-                body="A contributor's allowed models and required policy are bound into an enclave-signed capability. The untrusted coordinator cannot widen them, reassign ownership, or swap the provider without detection."
+                body="A contributor's allowed models and required policy are bound into an enclave-signed capability. The untrusted coordinator cannot widen them, reassign ownership, or swap the provider without detection. Models are named as dated snapshots, never as movable aliases, so consent to claude-haiku-4-5-20251001 cannot be re-pointed at whatever that name means next month."
+              />
+              <Claim
+                title="Real provider calls, conservatively accounted"
+                body="Anthropic and OpenAI adapters call the live APIs with contributed keys, pinned to dated snapshot model IDs. Costs are estimates from a pinned price table over provider-reported token counts; a timeout or unparseable response leaves upstream spend unknown and is booked conservatively. One dispatch per request — never retried."
+              />
+              <Claim
+                title="A contributed key leaves the enclave only to an allowlisted host"
+                body="Egress is checked inside the trust boundary before any bytes leave, and redirects are not followed — a 3xx from an allowlisted host is refused rather than chased to wherever it points. Because the prompt and the key already went out on the first hop, that refusal is recorded as a dispatched failure, not as a call that never happened."
               />
             </div>
           </Panel>
@@ -108,6 +116,11 @@ export default function TrustPage() {
                 negative
                 title="The upstream provider still sees the prompt"
                 body="With a contributed OpenAI or Anthropic key, the enclave necessarily sends the prompt to that provider. The privacy claim is “private from contributors and network operators”, never “private from the inference provider”. Closing that gap needs confidential GPUs running open models."
+              />
+              <Claim
+                negative
+                title="The numbers on this build came from a mock upstream"
+                body="pnpm seed contributes five mock provider keys against ctn/demo-model-*, so every count, latency and dollar figure on the graph, contributor and trust pages — including the measurement below — is stand-in traffic. The Anthropic and OpenAI adapters are real and are exercised by two opt-in smoke cases; unless those were run with a key, nothing on this build is paid inference."
               />
               <Claim
                 negative
@@ -130,6 +143,16 @@ export default function TrustPage() {
                 negative
                 title="The proof is not yet a zero-knowledge proof"
                 body="Proof artifacts are labeled simulated-reexec: the policy is genuinely re-executed from the witness and the journal is signed by a key bound into the attestation, but there is no succinct argument, so a verifier who distrusts the enclave learns nothing. RISC Zero removes that assumption; this build does not."
+              />
+              <Claim
+                negative
+                title="Intent replay protection is in-memory"
+                body="An enclave restart forgets consumed nonces (the sealed credentialId still prevents duplicate minting). A replayed contribution envelope can therefore be ingested once more after a restart — but only ever as the same capability for the same contributor, and the coordinator's unique-id check refuses the duplicate row. Making the refusal survive a restart needs monotonic enclave state, the same systems problem the spend counters have."
+              />
+              <Claim
+                negative
+                title="A dispatch with an unknown outcome has no receipt"
+                body="A timeout, a mid-flight transport failure or a 200 the adapter cannot parse means the provider may have run and billed the request. The cap is charged a conservative upper bound rather than nothing, so wedged capacity is not free capacity — but there is no answer to sign, so such a request appears only as a provider attempt and a usage row. Representing assumed spend inside a receipt is Phase 2 work."
               />
               <Claim
                 negative
@@ -271,8 +294,19 @@ export default function TrustPage() {
 {`pnpm test                 # policy fixtures, canonicalization, crypto, invariants
 npx tsx scripts/test-e2e.mts        # security, routing and privacy canary suite
 npx tsx scripts/verify-receipt.ts <requestId>   # independent receipt + proof check
-npx tsx scripts/privacy-test.ts     # canary sweep across every stored surface`}
+npx tsx scripts/privacy-test.ts     # canary sweep across every stored surface
+
+ANTHROPIC_API_KEY=sk-ant-… OPENAI_API_KEY=sk-… npx tsx scripts/test-e2e.mts   # adds the two real-provider smoke cases`}
             </pre>
+            <p>
+              Unless that last line was run, every number on this build came from the local mock
+              upstream: the adapters that call Anthropic and OpenAI are real and are exercised by
+              those two cases, but the seeded demo traffic is not paid inference. Each case
+              contributes its key, spends well under a cent, and revokes the credential afterwards
+              whether it passed or failed. Revocation takes the credential out of routing for good
+              — it does not erase the sealed ciphertext from the enclave vault, so rotate any key
+              you smoke-test with, or run <span className="mono">pnpm reset</span> afterwards.
+            </p>
             <p>
               The privacy sweep submits a unique canary prompt and a unique credential secret, then
               searches the coordinator database, the outbox, the graph, every API response and the

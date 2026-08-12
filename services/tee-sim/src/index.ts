@@ -14,10 +14,11 @@ import Fastify from "fastify";
 import {
   canonicalHash,
   canonicalJson,
+  intentDigest,
   sha256Hex,
   toCanonicalRequest,
   type ComputeReceipt,
-  type CredentialCapability,
+  type CredentialIntentV1,
   type SecurePayload,
   type SecureRequestEnvelope,
   type SignedComputeReceipt,
@@ -26,6 +27,8 @@ import {
 import { hpkeSeal } from "@ctn/protocol";
 import { loadPolicyPackage } from "@ctn/policy";
 import { SimulatedTEE, SIMULATION_WARNING, vaultDecrypt, vaultEncrypt } from "./tee.js";
+import { MODEL_CATALOG } from "./catalog.js";
+import { deriveCapability, InvalidIntentError, parseIntent } from "./intent.js";
 import { AuthorizedRequest, authorizeCandidate, type CandidateRecord } from "./authorize.js";
 import { buildRegistry, type ProviderOutcome } from "./providers.js";
 import { Prover } from "./prover.js";
@@ -50,6 +53,24 @@ console.log(`  enclave key id: ${tee.enclaveKeyId}`);
 console.log(`  policy id     : ${pkg.policyId}`);
 console.log(`  guest image id: ${pkg.guestImageId}`);
 console.log("");
+
+/**
+ * §5.1 — the failure classifications the enclave decides BEFORE anything leaves
+ * it. They are the only ones a second candidate may follow: no bytes were sent,
+ * so nothing was spent and nothing was exposed. Every other classification —
+ * including the ones where we never learned what the provider did — means the
+ * prompt has been dispatched, and a dispatched prompt is the request.
+ *
+ * The contract this relies on is a property of the adapters: these two are
+ * returned before `fetch` is called and carry `httpStatus: 0`, and no post-
+ * dispatch path may reuse either name. A refused redirect is the case that
+ * makes the distinction load-bearing — the allowlist blocks the second hop, but
+ * the first hop already carried the prompt and the key — so it classifies as
+ * `redirect_refused`. `providers.test.ts` asserts both halves of that contract.
+ */
+const PRE_DISPATCH_CLASSIFICATIONS: ReadonlySet<
+  Extract<ProviderOutcome, { ok: false }>["classification"]
+> = new Set(["egress_denied", "unpriced_model"]);
 
 /**
  * §56 — replay protection.
@@ -120,6 +141,21 @@ app.get("/attestation", async (request) => {
   };
 });
 
+/**
+ * §5.1 — the provider catalog, as the enclave actually holds it.
+ *
+ * Served from the live registry rather than from `MODEL_CATALOG` directly, so
+ * the list a contributor picks from is exactly the list of adapters that can be
+ * dispatched to: a catalog entry with no adapter would be an offer the enclave
+ * cannot honour, and a model the adapter will not serve is a capability the
+ * router would refuse later. The UI has no model constants of its own.
+ */
+app.get("/providers", async () => ({
+  providers: [...registry.entries()]
+    .map(([provider, adapter]) => ({ provider, models: [...adapter.models] }))
+    .sort((a, b) => a.provider.localeCompare(b.provider)),
+}));
+
 /** Public build manifest (§63) — what a contributor inspects before trusting. */
 app.get("/build-manifest", async () => ({
   enclaveMode: tee.mode,
@@ -141,13 +177,15 @@ interface IngestBody {
   enc: string;
   encryptedSecret: string;
   credentialId: string;
-  contributorId: string;
-  capability: {
-    provider: string;
-    allowedModels: string[];
-    allowedPolicies: string[];
-  };
 }
+
+/**
+ * §5.1 replay guard. In-memory: a restarted enclave forgets — LABELLED as such
+ * in VALIDATION.md. The client-generated credentialId sealed inside the intent
+ * is the structural half of the defence (a replayed envelope can only ever
+ * mint the SAME capability, never a second one under a new id).
+ */
+const consumedIntentDigests = new Set<string>();
 
 app.post("/credentials/ingest", async (request, reply) => {
   const body = request.body as IngestBody;
@@ -155,64 +193,56 @@ app.post("/credentials/ingest", async (request, reply) => {
     return reply.code(400).send({ error: { code: "CTN_INVALID_ENVELOPE", message: "unknown enclave key id" } });
   }
 
-  let secret: string;
+  let intent: CredentialIntentV1;
   try {
     const opened = await tee.openIngress({ enc: body.enc, ciphertext: body.encryptedSecret });
-    secret = new TextDecoder().decode(opened).trim();
-  } catch {
-    return reply
-      .code(400)
-      .send({ error: { code: "CTN_INVALID_ENVELOPE", message: "credential ciphertext failed to decrypt" } });
+    intent = parseIntent(opened, MODEL_CATALOG);
+  } catch (err) {
+    const message = err instanceof InvalidIntentError ? err.message : "credential ciphertext failed to decrypt";
+    return reply.code(400).send({ error: { code: "CTN_INVALID_ENVELOPE", message } });
   }
 
-  // Basic format validation only — never echo the secret, not even a prefix
-  // long enough to matter.
-  if (secret.length < 8 || /\s/.test(secret)) {
-    return reply
-      .code(400)
-      .send({ error: { code: "CTN_INVALID_ENVELOPE", message: "credential does not look like an API key" } });
+  if (intent.credentialId !== body.credentialId) {
+    return reply.code(400).send({
+      error: { code: "CTN_INTENT_MISMATCH", message: "sealed intent names a different credential id" },
+    });
+  }
+  const digest = intentDigest(intent);
+  if (consumedIntentDigests.has(digest)) {
+    return reply.code(409).send({
+      error: { code: "CTN_INTENT_REPLAY", message: "this sealed intent has already been consumed" },
+    });
   }
 
   // §13 — only ciphertext leaves the enclave; the DB never sees raw material.
-  const encryptedBlob = vaultEncrypt(vaultKey, secret);
+  const encryptedBlob = vaultEncrypt(vaultKey, intent.secret);
 
-  const capability: CredentialCapability = {
-    credentialId: body.credentialId,
-    provider: body.capability.provider as CredentialCapability["provider"],
-    allowedModels: [...body.capability.allowedModels].sort(),
-    // Contributors opt into an exact policy version, not a mutable label (§24).
-    allowedPolicyIds: body.capability.allowedPolicies.map((p) =>
-      p === "safety-v1" ? pkg.policyId : p
-    ),
-    contributorId: body.contributorId,
-    createdAt: Date.now(),
-    version: 1,
+  // §5.1 — derived from the DECRYPTED INTENT alone. Anything else in the HTTP
+  // body is ignored by construction.
+  const capability = deriveCapability({
+    intent,
     blobDigest: "0x" + sha256Hex(encryptedBlob),
-  };
+    resolvePolicyId: (p) => (p === "safety-v1" ? pkg.policyId : p),
+    now: Date.now(),
+  });
+  consumedIntentDigests.add(digest);
 
   return {
-    credentialId: body.credentialId,
+    credentialId: intent.credentialId,
     encryptedBlob,
     capability,
     // §15 — enclave signs the capability so the coordinator cannot widen it.
     capabilitySignature: tee.signReceipt(capability),
     // Keyed to the enclave's private signing key AND bound to this credential
     // id, so ingestion cannot be used as a guess-checking oracle. See tee.ts.
-    keyFingerprint: "0x" + tee.fingerprint(body.credentialId, secret),
+    keyFingerprint: "0x" + tee.fingerprint(intent.credentialId, intent.secret),
     policyId: pkg.policyId,
   };
 });
 
-/** Re-sign a capability after a contributor edits it (§50). */
-app.post("/credentials/recapability", async (request) => {
-  const body = request.body as { capability: CredentialCapability };
-  const capability: CredentialCapability = {
-    ...body.capability,
-    allowedModels: [...body.capability.allowedModels].sort(),
-    version: body.capability.version + 1,
-  };
-  return { capability, capabilitySignature: tee.signReceipt(capability) };
-});
+// §50 — there is deliberately no re-signing endpoint. A capability is derived
+// once, from one sealed intent, and never again: editing one means revoking the
+// credential and contributing a new sealed intent.
 
 // ---------------------------------------------------------------------------
 // The secure path
@@ -232,6 +262,13 @@ export interface AttemptRecord {
   httpStatus: number;
   latencyMs: number;
   classification?: string;
+  /**
+   * §5.1 — dispatched, outcome never learned. These two travel to the
+   * coordinator because the cap accounting lives there: dropping them here
+   * would turn "the provider may have billed us" into "the request was free".
+   */
+  upstreamOutcomeUnknown?: true;
+  assumedSpendMicroUsd?: number;
 }
 
 app.post("/execute", async (request, reply) => {
@@ -374,6 +411,8 @@ app.post("/execute", async (request, reply) => {
       httpStatus: outcome.ok ? outcome.response.httpStatus : outcome.httpStatus,
       latencyMs: outcome.ok ? outcome.response.latencyMs : outcome.latencyMs,
       classification: outcome.ok ? undefined : outcome.classification,
+      upstreamOutcomeUnknown: outcome.ok ? undefined : outcome.upstreamOutcomeUnknown,
+      assumedSpendMicroUsd: outcome.ok ? undefined : outcome.assumedSpendMicroUsd,
     });
 
     if (outcome.ok) {
@@ -387,9 +426,14 @@ app.post("/execute", async (request, reply) => {
       break;
     }
     lastFailure = outcome;
-    // §18 — before first output token every failure class falls through to the
-    // next credential. The coordinator applies disable/cooldown from the
-    // classification we report.
+    // §5.1 single dispatch — the prompt has now been sent upstream once.
+    // Sending it again (to another credential, another provider) would double
+    // both the spend risk and the exposure surface, and an outcome we could not
+    // classify is not evidence that nothing happened. Only provably
+    // pre-dispatch failures may try the next candidate; the coordinator still
+    // applies disable/cooldown from the classification we report, so the
+    // fallback story survives at request granularity (§18).
+    if (!PRE_DISPATCH_CLASSIFICATIONS.has(outcome.classification)) break;
   }
 
   if (!success) {
@@ -454,6 +498,7 @@ app.post("/execute", async (request, reply) => {
       inputTokens: outcome.response.inputTokens,
       outputTokens: outcome.response.outputTokens,
       estimatedCostMicroUsd: outcome.response.estimatedCostMicroUsd,
+      pricingTableDigest: outcome.response.pricingTableDigest,
     },
     timing: {
       receivedAt,

@@ -31,6 +31,7 @@ function capability(overrides: Partial<CredentialCapability> = {}): CredentialCa
     createdAt: 1,
     version: 1,
     blobDigest: "0x" + sha256Hex(BLOB),
+    intentDigest: "0x" + "0".repeat(64),
     ...overrides,
   };
 }

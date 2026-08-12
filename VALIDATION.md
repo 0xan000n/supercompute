@@ -13,7 +13,10 @@ Ten things were underspecified or wrong in ways that only surface once you write
 code, and adversarial review of the running system found five more in the
 implementation. Each is described below with what was done instead. One significant
 gap — the coordinator has no authentication at all — is documented rather than fixed,
-and §2a says so plainly.
+and §2a says so plainly. §2b records what Phase 1 changed once the prototype started
+calling real providers with real keys, including the two places where the honest
+answer costs something: an unknown upstream outcome is charged without a receipt, and
+intent replay protection is forgotten across an enclave restart.
 
 ---
 
@@ -152,6 +155,14 @@ window is replayable in principle, which is a bounded weakness, whereas an unbou
 map is a denial-of-service. A production design needs monotonic enclave state, which
 is the same systems problem §4 already flags for usage counters.
 
+The same limitation applies to the contribution path (§5.1). The enclave refuses a
+sealed `CredentialIntentV1` whose digest it has already consumed, but that set is
+in memory: **a restarted enclave forgets, and a previously-consumed envelope could be
+ingested once more.** What survives a restart is structural rather than remembered —
+the credential id is sealed inside the intent, so a replayed envelope can only ever
+re-mint the *same* capability for the *same* contributor, never a second credential
+under a new id, and the coordinator's own unique-id check refuses the duplicate row.
+
 ### 2.7 The egress allowlist has bypasses the spec does not mention
 
 §20 requires a hostname allowlist. Two bypasses are easy to miss:
@@ -260,6 +271,168 @@ system prevents this" and "nobody has done it yet" is the whole point of §69.
 
 ---
 
+## 2b. Phase 1 addendum — intent-bound contribution and real providers
+
+Phase 1 replaced the mock-only inference path with live provider adapters, and doing
+that turned several things the spec left as prose into mechanisms — a rule about
+somebody else's money has to be enforced somewhere. Each is recorded here with what
+it replaced, because in every case the previous version *looked* correct.
+
+### Contribution is bound to a sealed intent, not to request metadata
+
+Previously the contributor sealed a *secret* and the coordinator supplied everything
+that gave it meaning — provider, allowed models, owning contributor — as ordinary
+JSON fields alongside the ciphertext. The relay therefore chose the constraints on a
+key it could not read, which is the wrong half of the pair to trust. Worse, the
+enclave exposed a `recapability` endpoint that would re-sign a capability presented
+to it: a widening oracle sitting behind the very check §15 exists to make impossible.
+
+Now the contributor seals a `CredentialIntentV1` — `{version, credentialId, secret,
+provider, allowedModels, allowedPolicies, contributorId, intentNonce}` — as one
+canonical unit. The enclave derives the capability from the *sealed* fields and
+ignores the body's, rejecting an envelope whose `credentialId` disagrees with the one
+the coordinator posted. `recapability` is gone (the endpoint returns 404, asserted in
+e2e case 60), and `PATCH /v1/credentials/:id` refuses `allowedModels` with
+`CTN_CAPABILITY_IMMUTABLE`. Changing a capability now means contributing a new
+credential, which is a contributor action by construction.
+
+### Replay protection, and the restart caveat
+
+The enclave keeps the digest of every consumed intent in memory and refuses a second
+ingest of the same envelope (`CTN_INTENT_REPLAY`, relayed unflattened through the
+coordinator — e2e cases 59 and 59.5). As §2.6 above records for request nonces, that
+set does not survive a restart: **a restarted enclave forgets, and a previously
+consumed envelope could be ingested once more.** What survives is structural rather
+than remembered — the credential id is sealed inside the intent, so a replay can only
+re-mint the *same* capability for the *same* contributor, never a second credential
+under a new id, and the coordinator's unique-id check refuses the duplicate row.
+
+It is also **unbounded by design**, and that is the deliberate half of the asymmetry
+with `seenNonces` ten lines above it, which has a TTL, a cap, and oldest-first
+eviction. Evicting a consumed intent digest would not trim memory so much as reopen
+the replay window this set exists to close — the whole point is that the digest is
+remembered *forever*, so an expiry is a scheduled vulnerability. The cost of not
+bounding it is roughly 100 bytes per successful ingest, which at demo scale (tens of
+contributions) is nothing, and the sealed `credentialId` means the worst case if it
+ever did evict is re-minting the *same* capability, not a new one. The fix is not a
+bigger `Set`: a durable answer needs monotonic enclave state, which is the same
+systems problem §4 already flags for usage counters.
+
+### One dispatch per request
+
+§18's failure policy reads naturally as "try the next credential", and the
+implementation did exactly that. With a real provider on the other end, that is a
+rule about *someone else's* prompt and *someone else's* money: a 500 after the bytes
+have left means the upstream may already have run the completion, and falling through
+sends the same plaintext to a second contributor's account to be billed again.
+
+The enclave now dispatches at most once. Only classifications decided *before*
+anything leaves — `egress_denied` and `unpriced_model` — may be followed by another
+candidate; everything else terminates the request and is reported to the caller, who
+is free to retry (and pay for) it. A refused redirect is deliberately
+`redirect_refused` rather than `egress_denied` for exactly this reason: the allowlist
+stopped the second hop, but the prompt and the key already went out on the first.
+E2E case 63 asserts the loop stops with an eligible credential left unused, which is
+the only way to test a rule whose whole content is an action *not* taken.
+
+### `UPSTREAM_OUTCOME_UNKNOWN`, and what it costs
+
+A timeout, a mid-flight transport failure, or a 200 the adapter cannot parse leaves a
+question the enclave cannot answer: did the provider run and bill this? The previous
+code answered "no" by default (`?? 0`, `?? ""`), which made a wedged provider the
+cheapest capacity on the network — every such request free of both cost and request
+slot, and a credential drainable past its cap without a single counter moving.
+
+Such an attempt is now flagged unknown and carries an assumed spend: a UTF-8-byte
+upper bound on prompt tokens plus the full `max_tokens` at the pinned price. The
+coordinator books it exactly like real usage — one request slot and one cost entry,
+both writes in one transaction — with tokens recorded as 0, because no token count
+was ever reported. E2E case 64 forces the timeout and asserts the booked dollars
+equal the enclave's own bound rather than a number the coordinator invented.
+
+The honest consequence: **an unknown-outcome request has no receipt in Phase 1.**
+There is no answer to sign, so the request is visible as a provider attempt and a
+usage row and nowhere else. A receipt that distinguishes measured spend from assumed
+spend is Phase 2 work; until it exists, the usage ledger and the receipt corpus
+disagree by design, and this paragraph is the reconciliation.
+
+### Model consent names dated snapshots
+
+Capabilities and the provider catalog name `claude-haiku-4-5-20251001`, never
+`claude-haiku-4-5`. Consent to a movable alias is consent to whatever the vendor
+points it at next month, which is not consent a contributor can reason about. E2E
+case 65 fails if any published model id matches the alias shape.
+
+### Real-provider smoke tests are opt-in, and cost money
+
+Two e2e cases (70, 71) contribute a real key, send one 16-token prompt, assert the
+receipt carries provider-reported token counts and the pinned price table's digest,
+and revoke the credential in a `finally` so a failed assertion cannot leave a live
+key routable — by label rather than by id, because the case worth designing for is a
+contribution that persisted a row and then threw. They are skipped — with a printed
+reason, and counted as skipped in the summary — unless the key is present:
+
+```bash
+ANTHROPIC_API_KEY=sk-ant-… OPENAI_API_KEY=sk-… pnpm test:e2e
+```
+
+They deliberately do not use the suite's rate-limit retry helper: a real 429 is the
+result, not something to spend past.
+
+### Revocation had to be made terminal before it could be described as terminal
+
+Revocation is a `DELETE` (status `DELETED`) rather than a `DISABLED` that a later
+`PATCH` could undo. That sentence was written first and was not true: the PATCH
+handler took the caller's `status` string on trust — its TypeScript annotation was a
+description, not a check — so `PATCH {status:"ACTIVE"}` revived a revoked credential,
+and any unrecognised string could be written straight into the column routing reads.
+A failure handler could do it accidentally too: an `auth_failed` dispatch already in
+flight when the DELETE landed wrote `DISABLED` over `DELETED`, which is a status PATCH
+*is* allowed to flip back to ACTIVE.
+
+Now the coordinator refuses a status outside `{ACTIVE, DISABLED}` with 400
+`CTN_INVALID_STATUS`, refuses any status write on a `DELETED` row with 409
+`CTN_CREDENTIAL_DELETED`, and the failure handler's disable is written so it can never
+resurrect a revoked row. The two rules are tested where each can actually be reached:
+**e2e case 66** covers the API surface — both refusals, that they leave the row
+untouched, and that no traffic reaches the credential afterwards — while the race is a
+**coordinator unit test** (`routing.test.ts`, *"an auth_failed outcome cannot resurrect
+a revoked credential"*), because no sequence of HTTP requests can schedule a dispatch to
+land after a DELETE on purpose. A second unit test asserts a live credential is still
+disabled by the same path, so the guard cannot pass by never disabling anything; both
+were checked against the unguarded statement and the first one fails without it. The
+dashboard drops the enable/disable control on a revoked row rather than offering a
+button that can only error.
+
+Still open, and listed rather than implied: `weight` and `operationalLimits` writes are
+accepted on a `DELETED` row. They are inert — routing never reaches a non-ACTIVE
+credential — but "deletion is terminal" would read better as a property of the whole
+handler than of one field in it.
+
+What revocation still does **not** do is erase the sealed ciphertext from the enclave
+vault, so a key smoke-tested here should be rotated, or `pnpm reset` run afterwards.
+
+### `max_tokens` defaults rather than being required
+
+§5.1 lists `max_tokens` as required in the canonical request. It is not:
+`toCanonicalRequest` supplies `1024` when the caller omits one, and 35 of the
+prototype's call sites — the playground, the seed script, most of the e2e suite —
+rely on that default rather than passing a number.
+
+Recorded as a deviation rather than fixed, because the safety property the
+requirement protects still holds. `max_tokens` is load-bearing for exactly one thing:
+it is the ceiling in the assumed-spend bound above, so an absent one would make an
+unknown outcome unboundable. A default of 1024 is finite, so the bound is finite, and
+a contributor's cap still cannot be drained by a wedged provider. What is lost is
+whose ceiling it is — the protocol's, chosen once for every caller who did not think
+about it, rather than the contributor's or the caller's. `/v1/chat/completions` is
+also the reason the default cannot simply be deleted: OpenAI's own schema makes
+`max_tokens` optional, so the compatibility endpoint has to answer the question for
+SDKs that never ask it. Making it required means choosing a default *there* instead,
+which relocates this paragraph rather than retiring it.
+
+---
+
 ## 3. Where the spec over-scopes for a prototype
 
 **§35's fixture minimums are right; the policy design in §23 makes them hard to
@@ -319,7 +492,7 @@ Worth calling out because they are easy to dismiss as ceremony:
 
 | Milestone | State |
 |---|---|
-| 1 · Router: credential CRUD, mock provider, weighted routing, usage, fallback | complete |
+| 1 · Router: credential CRUD, mock provider, weighted routing, usage | complete |
 | 2 · Graph: outbox, projector, live UI, SSE | complete (SQLite projection, not Neo4j) |
 | 3 · Policy v1: shared implementation, fixtures, stable policy id, DENY blocks provider | complete — 125/125 fixtures |
 | 4 · ZK policy proof | **substituted** — `simulated-reexec`, honestly labelled; verifier expects the risc0 shape |
@@ -328,7 +501,7 @@ Worth calling out because they are easy to dismiss as ceremony:
 | 7 · AWS Nitro Enclave | not attempted — no AWS in this environment |
 | 8 · Secure prompt endpoint | complete |
 | 9 · Parallel proof/inference | complete and measured |
-| 10 · Real contributor demo | ready — five seeded contributors, onboarding flow works end to end |
+| 10 · Real contributor demo | ready — five seeded contributors, onboarding flow works end to end; live Anthropic/OpenAI adapters behind two opt-in smoke tests (§2b), with the seeded demo traffic still served by the mock upstream |
 
 ### Definition of done (§75)
 
@@ -349,11 +522,11 @@ reproducible with `pnpm test`, `pnpm test:e2e`, `pnpm privacy-test` and
 
 | Suite | Cases |
 |---|---|
-| `packages/protocol` | 16 — canonicalisation, commitments, HPKE seal/open/AAD, Ed25519, tamper detection, attestation nonce binding |
+| `packages/protocol` | 19 — canonicalisation, commitments, HPKE seal/open/AAD, Ed25519, tamper detection, attestation nonce binding |
 | `packages/policy` | 7 — 125 fixtures, determinism, normalisation, policy-id stability, hard blocks |
-| `services/tee-sim` | 20 — type-state gate, capability substitution, blob binding, attribution binding, decrypt ordering, egress bypasses |
-| `services/coordinator` | 7 — `safeLog` redaction incl. nesting, arrays, case, depth |
-| `scripts/test-e2e.mts` | 21 — §56 security, §55 routing, §53/§54 canaries, §36 invariants |
+| `services/tee-sim` | 48 — type-state gate, capability substitution, blob binding, attribution binding, decrypt ordering, egress bypasses, pricing, adapter response validation, sealed-intent parsing |
+| `services/coordinator` | 14 — `safeLog` redaction incl. nesting, arrays, case, depth, key names and `sk-` values; assumed-spend cap accounting and its rollback; the failure handler's inability to resurrect a revoked credential |
+| `scripts/test-e2e.mts` | 28 — §56 security, §55 routing, §53/§54 canaries, §36 invariants, §5.1 sealed intent, single dispatch, unknown outcomes, the provider catalog and terminal revocation — plus 2 env-gated real-provider cases, counted as skipped in the summary rather than silently absent |
 | `scripts/privacy-test.ts` | 16 surfaces swept for two independent canaries |
 
 Every finding in §2.4, §2.7, §2.8, §2.9 and §2.10 has a regression test, because each
@@ -386,3 +559,11 @@ was a bug that looked like working code.
     is bound to something request-specific. §2.8.
 12. **Promote §5's "auth" from a bullet to a milestone.** It is listed as a
     coordinator responsibility and is the easiest thing to leave out.
+13. **Seal the capability's terms, not just the secret** (§12/§15). Constraints
+    supplied by the relay are constraints chosen by the party they constrain. §2b.
+14. **State the dispatch bound in §18.** "Try the next credential" is written as a
+    resilience policy and reads, against a real provider, as permission to send the
+    same prompt to a second contributor's account. §2b.
+15. **Give §30 a place to put spend that was assumed rather than measured.** The
+    receipt as specified can only describe requests that returned an answer, which is
+    why an unknown outcome currently has none. §2b.

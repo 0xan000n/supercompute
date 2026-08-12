@@ -86,7 +86,25 @@ export const teeClient = {
 
   buildManifest: () => call<Record<string, unknown>>("/build-manifest"),
 
-  ingestCredential: (body: unknown) =>
+  /**
+   * §5.1 — which providers the enclave has an adapter for, and the pinned
+   * snapshot ids each will serve. Relayed rather than mirrored here: a second
+   * copy of the catalog in this process is a copy that can drift from the one
+   * that actually validates sealed intents.
+   */
+  providers: () => call<ProviderCatalog>("/providers"),
+
+  /**
+   * Relays the contributor's sealed intent verbatim. There is deliberately no
+   * capability block here: everything the enclave will sign comes out of the
+   * ciphertext, so this process has nothing to widen (§5.1).
+   */
+  ingestCredential: (body: {
+    enclaveKeyId: string;
+    enc: string;
+    encryptedSecret: string;
+    credentialId: string;
+  }) =>
     call<{
       credentialId: string;
       encryptedBlob: string;
@@ -95,12 +113,6 @@ export const teeClient = {
       keyFingerprint: string;
       policyId: string;
     }>("/credentials/ingest", { method: "POST", body: JSON.stringify(body) }),
-
-  recapability: (capability: unknown) =>
-    call<{ capability: import("@ctn/protocol").CredentialCapability; capabilitySignature: string }>(
-      "/credentials/recapability",
-      { method: "POST", body: JSON.stringify({ capability }) }
-    ),
 
   execute: (envelope: SecureRequestEnvelope, candidates: Candidate[]) =>
     call<ExecuteResult>("/execute", {
@@ -133,6 +145,10 @@ export const teeClient = {
     }>("/verify", { method: "POST", body: JSON.stringify(body) }),
 };
 
+export interface ProviderCatalog {
+  providers: Array<{ provider: string; models: string[] }>;
+}
+
 export interface VerificationReport {
   valid: boolean;
   checks: Array<{ name: string; pass: boolean; detail?: string }>;
@@ -146,6 +162,14 @@ export interface AttemptResult {
   httpStatus: number;
   latencyMs: number;
   classification?: string;
+  /**
+   * §5.1 — the enclave dispatched this attempt and never learned the outcome.
+   * The provider may have processed and billed it, so `assumedSpendMicroUsd`
+   * is the conservative upper bound this coordinator must charge against the
+   * credential's cap. Mirrors AttemptRecord in services/tee-sim/src/index.ts.
+   */
+  upstreamOutcomeUnknown?: boolean;
+  assumedSpendMicroUsd?: number;
 }
 
 export interface ExecuteResult {

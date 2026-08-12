@@ -3,7 +3,13 @@
  * Spec: Compute Trust Network Prototype, Implementation Specification v0.1.
  */
 
-export type Provider = "openai" | "anthropic" | "google" | "mock";
+/**
+ * Exactly the providers an adapter exists for. Google was listed here before any
+ * Google adapter, price row, or egress entry existed, so the type advertised a
+ * capability the runtime refuses — the kind of gap a caller only finds by hitting
+ * it. The enclave's registry is the authority; this union now agrees with it.
+ */
+export type Provider = "openai" | "anthropic" | "mock";
 
 export interface CanonicalMessage {
   role: "system" | "user" | "assistant";
@@ -97,21 +103,25 @@ export interface SimulatedAttestationDocument {
   warning: "SIMULATED TEE — NO HARDWARE CONFIDENTIALITY";
 }
 
-/** §13 — credential submission; encryptedSecret is HPKE-sealed to the enclave ingress key. */
-export interface CredentialSubmission {
-  enclaveKeyId: string;
-  enc: string;
-  encryptedSecret: string;
-  capability: {
-    provider: Provider;
-    allowedModels: string[];
-    allowedPolicies: string[];
-    operationalLimits?: {
-      dailyUsd?: number;
-      dailyRequests?: number;
-    };
-  };
-  contributorDisplayId: string;
+/**
+ * The contributor's sealed intent — the ONLY authority on what a credential
+ * may do. HPKE-sealed in the contributor's browser to the attested ingress
+ * key; the enclave derives the signed capability exclusively from this.
+ * The coordinator relays an opaque envelope: there is no plaintext metadata
+ * left for it to alter, and the credentialId inside forecloses minting the
+ * same envelope under a different id.
+ */
+export interface CredentialIntentV1 {
+  version: 1;
+  /** client-generated, "cred_" + 12 hex; the capability's id comes from HERE */
+  credentialId: string;
+  secret: string;
+  provider: Provider;
+  allowedModels: string[];
+  allowedPolicies: string[];
+  contributorId: string;
+  /** 32-byte hex, fresh per contribution; the enclave rejects repeats */
+  intentNonce: string;
 }
 
 /** §15 — capability object signed by the enclave at storage time. */
@@ -135,6 +145,12 @@ export interface CredentialCapability {
    * closes that substitution.
    */
   blobDigest: string;
+  /**
+   * SHA-256 over the canonical intent minus the secret. Ties this capability
+   * to exactly what the contributor sealed — including the credentialId and
+   * a fresh nonce, so a relayed envelope cannot be re-minted.
+   */
+  intentDigest: string;
 }
 
 export type PolicyDecision = "ALLOW" | "DENY";
@@ -220,6 +236,12 @@ export interface ComputeReceipt {
      * verifier in another runtime must recompute byte-identical bytes.
      */
     estimatedCostMicroUsd?: number;
+    /**
+     * Digest of the pinned price table the estimate was computed from. Costs are
+     * estimates, not measurements: without knowing WHICH prices produced the
+     * number, a verifier can check the arithmetic of nothing.
+     */
+    pricingTableDigest?: string;
   };
   timing: {
     receivedAt: string;
@@ -272,6 +294,15 @@ export type CtnEventType =
   | "policy.started"
   | "policy.allowed"
   | "policy.denied"
+  /**
+   * The request is over and it did not succeed. Distinct from `provider.failed`,
+   * which is about ONE attempt: a request can survive an attempt failing, and an
+   * attempt is not the only way a request dies (no capacity, an enclave refusal
+   * after policy allowed). Without this event the projection's last word on an
+   * allowed-then-failed request is `policy.allowed`, which leaves it rendering
+   * as permanently in-flight — a UI that quietly disagrees with the DB row.
+   */
+  | "request.failed"
   | "proof.started"
   | "proof.completed"
   | "proof.failed"
@@ -334,8 +365,16 @@ export type CtnErrorCode =
   | "CTN_PROVIDER_AUTH_FAILED"
   | "CTN_PROVIDER_ERROR"
   | "CTN_INVALID_ENVELOPE"
+  | "CTN_INTENT_MISMATCH"
+  | "CTN_INTENT_REPLAY"
   | "CTN_ATTESTATION_REQUIRED"
   | "CTN_ENCLAVE_UNAVAILABLE"
+  /** §50 — a capability is derived once from the sealed intent and never edited. */
+  | "CTN_CAPABILITY_IMMUTABLE"
+  /** A credential status write that is not one of the two states a caller may set. */
+  | "CTN_INVALID_STATUS"
+  /** Revocation is terminal: a DELETED credential cannot be brought back. */
+  | "CTN_CREDENTIAL_DELETED"
   | "CTN_INTERNAL";
 
 export interface CtnError {

@@ -15,7 +15,7 @@ import { readFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
-import { ComputeTrustClient } from "@ctn/client";
+import { ComputeTrustClient, CtnApiError, type CompletionResult } from "@ctn/client";
 
 const BASE = process.env.CTN_COORDINATOR_URL ?? "http://127.0.0.1:4200";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -66,6 +66,35 @@ async function countInApi(path: string, needle: string): Promise<number> {
   return text.split(needle).length - 1;
 }
 
+/**
+ * §5.1 — the enclave dispatches a request exactly once and reports the outcome;
+ * it never retries on the caller's behalf. The seeded network deliberately
+ * contains a rate-limited credential, so a sweep that called completion() once
+ * would abort before printing a single row whenever routing picked it.
+ *
+ * Retrying here does not weaken the sweep. Each try is a fresh sealed request
+ * with its own canary-bearing prompt, and every surface is scanned afterwards —
+ * including whatever the rate-limited attempt left behind. Only a rate limit is
+ * absorbed; any other failure still aborts, because it would mean the sweep did
+ * not prove what it claims to prove.
+ */
+async function completionRetryingRateLimits(
+  input: { model: string; messages: Array<{ role: string; content: string }> },
+  tries = 3
+): Promise<CompletionResult> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await client.completion(input);
+    } catch (err) {
+      const rateLimited = err instanceof CtnApiError && err.code === "CTN_PROVIDER_RATE_LIMITED";
+      if (!rateLimited || attempt >= tries) throw err;
+      console.log(
+        `  ${DIM}rate-limited credential drew this request; retrying (${attempt}/${tries - 1}) — single dispatch means the caller retries${RESET}`
+      );
+    }
+  }
+}
+
 async function main(): Promise<void> {
   console.log("");
   console.log("Privacy canary sweep");
@@ -76,7 +105,7 @@ async function main(): Promise<void> {
   console.log("");
   console.log(`§54 Prompt privacy  ${DIM}${canary.slice(0, 34)}…${RESET}`);
 
-  const completion = await client.completion({
+  const completion = await completionRetryingRateLimits({
     model: "ctn/demo-model-a",
     messages: [{ role: "user", content: `Summarize this token verbatim: ${canary}` }],
   });
