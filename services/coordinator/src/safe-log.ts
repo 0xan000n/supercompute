@@ -22,7 +22,11 @@ const FORBIDDEN_KEYS = new Set([
   "response",
   "responsebody",
   "body",
+  // The two header names real provider credentials actually travel under:
+  // `authorization: Bearer …` (OpenAI-compatible) and `x-api-key` (Anthropic).
+  // Normalisation collapses `X-Api-Key` and `xApiKey` onto the same entry.
   "authorization",
+  "xapikey",
   "apikey",
   "key",
   "secret",
@@ -45,6 +49,10 @@ const TRUNCATED = "[truncated-by-safeLog]";
  * a false negative costs a secret.
  */
 const SECRET_VALUE_PATTERNS = [
+  // Covers real key material as issued: `sk-ant-api03-…` (Anthropic) and
+  // `sk-…` / `sk-proj-…` (OpenAI). The `\b` matters — without it the pattern
+  // also fires on ordinary prose like "risk-assessment-framework", and a
+  // redaction that eats useful log lines gets loosened by the next person.
   /\bsk-[A-Za-z0-9_-]{8,}/,
   /\bBearer\s+\S+/i,
   /\bmock-provider-key-\S+/,
