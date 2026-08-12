@@ -920,6 +920,91 @@ async function run59(): Promise<void> {
   });
 }
 
+async function run59_5(): Promise<void> {
+  await test("59.5", "the enclave's OWN replay guard refuses a second ingest, and the coordinator relays its 409", async () => {
+    // Test 59 exercises the coordinator's row-existence check, which answers
+    // before the enclave is ever consulted. This one goes straight at the
+    // enclave — the guard that still holds when the relay IS the adversary.
+    const att = await client.attestation();
+    const credentialId = `cred_${randomHex(6)}`;
+    const intent: CredentialIntentV1 = {
+      version: 1,
+      credentialId,
+      secret: `mock-provider-key-enclave-replay-${randomHex(4)}`,
+      provider: "mock",
+      allowedModels: [MODEL_A],
+      allowedPolicies: ["safety-v1"],
+      contributorId: `contrib_enclavereplay${randomHex(4)}`,
+      intentNonce: randomHex(32),
+    };
+    const sealed = await hpkeSeal(
+      att.bundle.ingressPublicKey,
+      new TextEncoder().encode(canonicalJson(intent))
+    );
+    // Same body both times, credentialId matching the sealed intent, so the
+    // id-mismatch check passes and the digest set is what decides.
+    const ingestBody = {
+      enclaveKeyId: att.bundle.enclaveKeyId,
+      enc: sealed.enc,
+      encryptedSecret: sealed.ciphertext,
+      credentialId,
+    };
+    const ingest = () =>
+      fetch(`${TEE}/credentials/ingest`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(ingestBody),
+      });
+
+    const first = await ingest();
+    const firstJson = await first.json();
+    assert(first.status === 200, `expected the first ingest to succeed, got ${first.status}`);
+    assert(
+      firstJson.capability?.credentialId === credentialId,
+      `capability should carry the sealed id, got ${firstJson.capability?.credentialId}`
+    );
+
+    const second = await ingest();
+    const secondJson = await second.json();
+    assert(second.status === 409, `expected 409 from the enclave replay guard, got ${second.status}`);
+    assert(secondJson.error?.code === "CTN_INTENT_REPLAY", `got ${secondJson.error?.code}`);
+
+    // Now the same consumed envelope through the coordinator. Its id was never
+    // written to `credentials`, so the local dedupe cannot answer: the 409 has
+    // to come back from the enclave and survive the relay unflattened.
+    const creds = await getCredentials();
+    const knownContributor = creds.find((c) => c.status === "ACTIVE")?.contributorId;
+    assert(knownContributor, "no seeded contributor available to post under");
+
+    const relayed = await fetch(`${COORD}/v1/credentials`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        contributorId: knownContributor,
+        label: "Relayed replay probe",
+        credentialId,
+        enclaveKeyId: att.bundle.enclaveKeyId,
+        enc: sealed.enc,
+        encryptedSecret: sealed.ciphertext,
+      }),
+    });
+    const relayedJson = await relayed.json();
+    assert(relayed.status === 409, `expected the coordinator to relay 409, got ${relayed.status}`);
+    assert(relayedJson.error?.code === "CTN_INTENT_REPLAY", `got ${relayedJson.error?.code}`);
+    // The wording proves provenance: this is the enclave's refusal, not the
+    // coordinator's own "already contributed" row check.
+    assert(
+      String(relayedJson.error?.message).includes("sealed intent"),
+      `expected the enclave's message, got "${relayedJson.error?.message}"`
+    );
+    assert(
+      !(await getCredentials()).some((c) => c.id === credentialId),
+      "a refused replay must not leave a credential row behind"
+    );
+    return `enclave ingest replay=409 ${secondJson.error?.code}; relayed through coordinator=409 (enclave message preserved)`;
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -977,6 +1062,7 @@ async function main(): Promise<void> {
 
   console.log("\n=== §5.1 SEALED INTENT ===");
   await run59();
+  await run59_5();
 
   // ---- Summary ----
   console.log("\n\n=========================== SUMMARY ===========================");

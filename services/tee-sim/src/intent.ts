@@ -47,7 +47,9 @@ export function parseIntent(
     throw new InvalidIntentError("credentialId must be cred_ + 12 hex chars");
   if (typeof i.secret !== "string" || i.secret.trim().length < 8 || /\s/.test(i.secret.trim()))
     throw new InvalidIntentError("credential does not look like an API key");
-  if (typeof i.provider !== "string" || !(i.provider in catalog))
+  // hasOwnProperty, not `in`: `in` reaches Object.prototype, so "constructor"
+  // and friends would pass as providers and hand the model check a function.
+  if (typeof i.provider !== "string" || !Object.prototype.hasOwnProperty.call(catalog, i.provider))
     throw new InvalidIntentError("provider is not implemented");
   const models = catalog[i.provider as keyof typeof catalog] as readonly string[];
   if (

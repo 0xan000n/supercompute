@@ -49,6 +49,20 @@ test("strict catalog: provider membership, no cross-provider models, no dupes, c
   }
 });
 
+test("inherited object keys are not providers: the catalog lookup must not walk the prototype chain", () => {
+  // "constructor" in MODEL_CATALOG is true, and MODEL_CATALOG["constructor"] is a
+  // function — so a membership test that reaches the prototype chain hands the
+  // model check a non-array and throws TypeError, which the enclave then reports
+  // as a decryption failure instead of an invalid intent.
+  for (const bad of [
+    { ...intent, provider: "constructor" },
+    { ...intent, provider: "toString" },
+    { ...intent, provider: "__proto__" },
+  ]) {
+    assert.throws(() => parseIntent(bytes(bad), MODEL_CATALOG), InvalidIntentError);
+  }
+});
+
 test("non-JSON plaintext is rejected without echoing content", () => {
   assert.throws(() => parseIntent(new TextEncoder().encode("sk-live-notjson"), MODEL_CATALOG), (err: Error) => {
     assert.ok(!err.message.includes("sk-live"));
