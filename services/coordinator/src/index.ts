@@ -42,11 +42,20 @@ app.setErrorHandler((err: Error, request, reply) => {
   reply.code(500).send({ error: { code: "CTN_INTERNAL", message: err.message } });
 });
 
-const MODELS = [
-  { id: "ctn/demo-model-a", label: "Demo Model A", tier: "standard" },
-  { id: "ctn/demo-model-b", label: "Demo Model B", tier: "frontier" },
-  { id: "ctn/demo-model-fast", label: "Demo Model Fast", tier: "fast" },
-];
+/**
+ * Presentation only — labels and tiers for ids the enclave's catalog publishes.
+ * The catalog decides WHICH models exist; this decides what they are called in a
+ * picker. An id missing from here still lists, under its own name.
+ */
+const MODEL_META: Record<string, { label: string; tier: string }> = {
+  "ctn/demo-model-a": { label: "Demo Model A", tier: "standard" },
+  "ctn/demo-model-b": { label: "Demo Model B", tier: "frontier" },
+  "ctn/demo-model-fast": { label: "Demo Model Fast", tier: "fast" },
+  "claude-haiku-4-5-20251001": { label: "Claude Haiku 4.5", tier: "fast" },
+  "claude-sonnet-4-5-20250929": { label: "Claude Sonnet 4.5", tier: "frontier" },
+  "gpt-4o-mini-2024-07-18": { label: "GPT-4o mini", tier: "fast" },
+  "gpt-4o-2024-08-06": { label: "GPT-4o", tier: "frontier" },
+};
 
 app.get("/health", async () => ({ ok: true, service: "coordinator", env: CTN_ENV }));
 
@@ -69,15 +78,33 @@ app.get("/v1/models", async () => {
     }
   }
 
+  /**
+   * The id list comes from the enclave's catalog, not a literal here. It used to
+   * be three hardcoded demo ids, which meant a contributor could seal a
+   * capability for `claude-haiku-4-5-20251001` and the playground would show it
+   * with no contributor count at all — the two endpoints describing the same
+   * network disagreed about what was on it.
+   *
+   * If the enclave is unreachable, fall back to the ids we can still see capacity
+   * for rather than 503-ing: this endpoint's job is "what can I ask for", and a
+   * partial honest answer beats none. The counts are computed locally either way.
+   */
+  let ids: string[];
+  try {
+    ids = (await teeClient.providers()).providers.flatMap((p) => p.models);
+  } catch {
+    ids = [...available.keys()].sort();
+  }
+
   return {
     object: "list",
-    data: MODELS.map((m) => ({
-      id: m.id,
+    data: ids.map((id) => ({
+      id,
       object: "model",
-      label: m.label,
-      tier: m.tier,
+      label: MODEL_META[id]?.label ?? id,
+      tier: MODEL_META[id]?.tier ?? "standard",
       // A count, deliberately — not an enumeration of whose capacity it is.
-      providers_available: available.get(m.id) ?? 0,
+      providers_available: available.get(id) ?? 0,
       trust_policy: "safety-v1",
     })),
   };
