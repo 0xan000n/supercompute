@@ -1,0 +1,22 @@
+[package]
+name = "host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+methods = { path = "../methods" }
+# `prove` is NOT a default feature of risc0-zkvm: without it `default_prover`
+# and `default_executor` shell out to an `r0vm` subprocess over IPC, which adds
+# a fixed ~28 ms to every call and swamps the executor-only measurement. The
+# Phase 2b daemon will prove in-process, so measure in-process. `metal` implies
+# `prove` and turns on GPU acceleration on Apple Silicon.
+risc0-zkvm = { version = "^3.0.6", features = ["prove", "metal"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = "1.0"
+anyhow = "1.0"
+# 1.3 is the version risc0 itself serialises receipts with; keeping it aligned
+# means the measured receipt size is the one downstream tooling will see.
+bincode = "1.3"
+# Same crate and version as the guest, so a host/guest digest disagreement is a
+# real bug rather than a library difference.
+sha2 = "0.10"

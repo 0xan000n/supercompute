@@ -49,6 +49,25 @@ Then open **http://localhost:3000**.
 `pnpm reset` wipes local state (database, vault, provider log). Restart `pnpm dev`
 afterwards so the enclave re-provisions its vault, then `pnpm seed` again.
 
+### Building the prover
+
+`prover/` holds the real RISC Zero prover, which is being built in Phase 2a and is
+not yet wired into `pnpm dev` — the running demo still uses the simulated prover.
+Nothing above requires Rust. Building `prover/` does, and it is a separate
+toolchain:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+source "$HOME/.cargo/env"
+curl -L https://risczero.com/install | bash
+export PATH="$HOME/.risc0/bin:$PATH"
+rzup install        # fetches a Rust toolchain for the zkVM target; takes a few minutes
+```
+
+Then `cd prover && cargo run -rp host -- --bench`. See
+[prover/README.md](prover/README.md) for versions, measured timings and the
+dev-mode policy.
+
 ---
 
 ## The five-minute demo
@@ -155,6 +174,7 @@ services/mock-provider/ OpenAI-shaped upstream stand-in
 apps/web/             Next.js app: graph, playground, onboarding, dashboards
 policy/v1/            manifest, rules, 125 fixtures (50 allow / 50 deny / 25 adversarial)
 scripts/              dev launcher, seed, e2e suite, privacy sweep, receipt verifier
+prover/               the real RISC Zero prover — Rust workspace, Phase 2a, not yet wired in
 ```
 
 ---
@@ -286,6 +306,12 @@ build, with proving running concurrently with inference:
 Live numbers are on the Trust Model page and `GET /v1/stats`. The proof cost is
 modelled (`CTN_SIMULATED_PROVING_MS`, default 2400 ms) and labelled as such —
 everything else is measured.
+
+The model is optimistic. A real RISC Zero proof of a guest that merely hashes 4 KB
+takes **49.7 s** on an M1 Pro, not 2.9 s (`prover/`, VALIDATION.md §2c). The
+architecture survives that — the proof is an audit artifact, not a gate, so the
+caller still waits ~490 ms — but "concurrent with the request" is the wrong mental
+picture. Receipts land seconds to minutes after the answer does.
 
 ---
 

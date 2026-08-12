@@ -43,7 +43,9 @@ between a demo that survives a dependency hiccup and one that doesn't.
 contributor trusts the *attested code* to enforce the policy, and that the proof is
 an audit artifact rather than a gate, is what makes the latency story work at all.
 The spec is right to insist on measuring it rather than assuming. Measured here:
-proving takes ~2.9 s at p50 while the caller waits ~390 ms.
+proving takes ~2.9 s at p50 while the caller waits ~390 ms — but the ~2.9 s is a
+*modelled* proof cost, and §2c reports what a real one costs once measured. The
+insight holds; the number was optimistic by roughly 20×.
 
 **Policy id over policy label (§24).** Hashing manifest + rules + guest image so
 that changing one weight changes the identifier is the mechanism that makes
@@ -430,6 +432,85 @@ also the reason the default cannot simply be deleted: OpenAI's own schema makes
 `max_tokens` optional, so the compatibility endpoint has to answer the question for
 SDKs that never ask it. Making it required means choosing a default *there* instead,
 which relocates this paragraph rather than retiring it.
+
+---
+
+## 2c. Phase 2a addendum — what proving actually costs (§66)
+
+§66 is the section this prototype has been answering on credit. Phase 1 measured
+everything on the request path and *modelled* the proof —
+`CTN_SIMULATED_PROVING_MS`, default 2400 ms, labelled as modelled everywhere it
+surfaced. Phase 2a Task 1 installs a real RISC Zero toolchain and replaces the
+model with measurements. The guest here is a spike, not the policy engine: it reads
+one length-prefixed frame and commits its sha256. The policy guest is Task 4. What
+follows is therefore a floor for the real thing, and is written down as a floor.
+
+Apple M1 Pro, 10 cores, 32 GB, macOS 26.0.1. risc0 3.0.6 (`cargo-risczero` 3.0.6,
+`r0vm` 3.0.6, `risc0-zkvm` 3.0.6), host rustc 1.97.1, guest toolchain 1.97.0.
+Release build, in-process prover, dev mode off, three runs per measurement, median
+reported.
+
+| Input | Executor only | Composite prove | Receipt (bincode) | Verify |
+|---|---|---|---|---|
+| 256 B | 23 ms | 5.73 s | 216.1 KB | 12 ms |
+| 4096 B | 18 ms | 49.66 s | 262.0 KB | 15 ms |
+
+**The model was optimistic by roughly 20×.** Phase 1 assumed 2.4 s of proving and
+observed ~2.9 s at p50. Real composite proving of a program that only hashes 4 KB
+takes 49.7 s. §66's architectural claim survives this — proving runs parallel to
+inference and the caller does not wait for it — but the claim that survives is
+narrower than the one the README currently implies. At ~450 ms of inference and
+~50 s of proving, the proof is no longer "concurrent with the request"; it finishes
+long after the response has been returned and the connection closed. That is still
+a coherent design, because §25–26 make the proof an audit artifact rather than a
+gate. It is not the design the p50 table describes. The honest framing is that
+receipts become available seconds to minutes after the answer, and anything that
+waits on a receipt — the verifier UI, the graph projection — has to be built for
+that. Phase 1's numbers are not being restated here as wrong; they were correctly
+labelled as modelled, and this is what the measurement turned out to be.
+
+**Executor latency is a fixed ~20 ms floor.** This is the number that would gate a
+live request, and it is nearly independent of input: 23 ms at 256 B, 18 ms at
+4096 B, with the *smaller* input measuring slower and a 10× cycle difference
+between them. It is session setup, not computation. Two consequences. Running the
+policy in the zkVM on the request path would add ~20 ms whatever the prompt, which
+is affordable against a ~450 ms provider call. And it cannot be optimised by
+trimming input, so the Phase 2b design should treat it as a constant.
+
+**Proving cost tracks padded rows, not cycles.** 8× the rows cost 8.7× the time
+(po2 16 → 19). Cost is therefore a step function with cliffs at each po2 boundary,
+which means the policy guest's cost is set by which boundary it lands on rather
+than by how much work it does within one. Extrapolating: ~100 s at po2 20, ~200 s
+at po2 21.
+
+**A composite receipt is ~250 KB.** The spec treats the proof as an artifact to be
+stored and independently verified; at a quarter of a megabyte each, growing with
+execution length, that is a real storage decision rather than a detail. Groth16
+compression would make it constant-size and small, at the cost of extra proving
+time. Neither was measured. Task 6 should measure both before the release manifest
+fixes a receipt format, because that choice is hard to reverse afterwards.
+
+### Two things the plan assumed that turned out to be false
+
+The plan's API sketch was drawn from risc0 2.x. Both anchors it named still exist
+in 3.0.6, and both needed adjusting anyway.
+
+`env::read_frame` — the guest's input path — is marked `#[stability::unstable]`
+and does not compile without opting the guest into the `unstable` feature. Its
+host-side counterpart, `write_frame`, is stable. Rather than put the policy
+guest's only input path behind an unstable flag, the guest reproduces `read_frame`
+on the stable `read_slice`: the same two reads, the same wire format, so it stays
+compatible with the stable writer.
+
+`prove` is not a default feature of `risc0-zkvm`. Without it, `default_prover` and
+`default_executor` fall back to an `r0vm` subprocess over IPC — silently, with no
+error and no warning. The first run of this benchmark was taken that way and
+reported a fixed ~28 ms of executor latency at both input sizes. The IPC overhead
+was most of it. For a measurement whose entire purpose is establishing a ~20 ms
+request-path budget, a silent default that inflates it by half is exactly the kind
+of thing that gets quoted for a year. `--bench` now prints which backend it used,
+and refuses to run at all under `RISC0_DEV_MODE`, where proving is a stub that
+returns instantly and verification accepts anything.
 
 ---
 
