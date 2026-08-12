@@ -80,6 +80,13 @@ export type ProviderOutcome =
        * folded into `server_error`: the fault is ours, not the credential's, and
        * a class that reads as an upstream failure would blame a contributor for
        * a missing row in our own price table.
+       *
+       * §5.1 — `egress_denied` and `unpriced_model` are the ONLY classifications
+       * decided before any bytes leave, and both carry `httpStatus: 0`. The
+       * routing loop reads that distinction to decide whether another candidate
+       * may be tried, which is why a refused REDIRECT is `redirect_refused` and
+       * not `egress_denied`: the allowlist stopped the second hop, but the
+       * prompt and the key already went out on the first one.
        */
       classification:
         | "auth_failed"
@@ -87,6 +94,7 @@ export type ProviderOutcome =
         | "server_error"
         | "timeout"
         | "egress_denied"
+        | "redirect_refused"
         | "malformed_response"
         | "unpriced_model";
       /**
@@ -266,11 +274,15 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       const latencyMs = Math.round(performance.now() - started);
 
       if (res.status >= 300 && res.status < 400) {
+        // Dispatched, then refused: the request reached the allowlisted host
+        // and it answered with a redirect. Classifying this as `egress_denied`
+        // read as "nothing was sent" and let the routing loop send the prompt
+        // to a second credential (§5.1).
         return {
           ok: false,
           httpStatus: res.status,
           latencyMs,
-          classification: "egress_denied",
+          classification: "redirect_refused",
         };
       }
 
@@ -478,7 +490,9 @@ export class AnthropicAdapter implements ProviderAdapter {
       const latencyMs = Math.round(performance.now() - started);
 
       if (res.status >= 300 && res.status < 400) {
-        return { ok: false, httpStatus: res.status, latencyMs, classification: "egress_denied" };
+        // Dispatched, then refused — see the same branch in
+        // OpenAICompatibleAdapter. NOT `egress_denied`: the bytes are already out.
+        return { ok: false, httpStatus: res.status, latencyMs, classification: "redirect_refused" };
       }
       if (!res.ok) {
         // A definitive HTTP error is a KNOWN outcome. Do not read the body (§58).

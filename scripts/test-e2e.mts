@@ -31,6 +31,9 @@ import {
   type AttestationEnvelope,
   type CompletionResult,
 } from "@ctn/client";
+// Type-only: erased at runtime, so the suite still talks to the enclave over
+// HTTP and never imports its module graph.
+import type { ProviderOutcome } from "../services/tee-sim/src/providers.js";
 import {
   canonicalJson,
   generateHpkeKeyPair,
@@ -145,9 +148,16 @@ function discoverCoordinatorLogFile(): string | null {
 /**
  * §5.1 — classifications the enclave decides BEFORE anything leaves it. Only
  * these may be followed by another candidate; everything else means the prompt
- * has already been sent upstream once.
+ * has already been sent upstream once. Mirrors PRE_DISPATCH_CLASSIFICATIONS in
+ * services/tee-sim/src/index.ts, and is typed against the same union so that
+ * renaming or removing a classification breaks this file too — a copy of a
+ * safety rule that can drift out of date is worse than no copy.
  */
-const PRE_DISPATCH_CLASSIFICATIONS = new Set(["egress_denied", "unpriced_model"]);
+type FailureClassification = Extract<ProviderOutcome, { ok: false }>["classification"];
+const PRE_DISPATCH_CLASSIFICATIONS: ReadonlySet<FailureClassification> = new Set([
+  "egress_denied",
+  "unpriced_model",
+]);
 
 /**
  * §5.1 — the enclave dispatches once and reports what happened; it never
@@ -174,7 +184,7 @@ async function completionRetryingRateLimits(
 
 /** The attempts on a request that actually put bytes on the wire. */
 function dispatchedAttempts(attempts: any[]): any[] {
-  return attempts.filter((a) => !PRE_DISPATCH_CLASSIFICATIONS.has(String(a.classification)));
+  return attempts.filter((a) => !PRE_DISPATCH_CLASSIFICATIONS.has(a.classification as FailureClassification));
 }
 function describeAttempts(attempts: any[]): string {
   return `[${attempts
@@ -716,9 +726,12 @@ async function run55_15(): Promise<void> {
       return `429 → FAILED ${code} after 1 dispatch; Erin cooldownUntil=${erinAfter.cooldownUntil}; follow-up → ${followUp.route.credential_id}`;
     } finally {
       for (const o of others) await patchCredential(o.id, { status: "ACTIVE" });
-      // Erin is deliberately left cooling down: under single dispatch a request
-      // that lands on her FAILS instead of falling back, and the tests after
-      // this one are about other things. Test 63 re-arms her when it needs her.
+      // Erin's cooldown is left in place rather than cleared here — but 55.16
+      // re-enables every credential straight after, which clears it as a side
+      // effect, so she IS back in the pool for the tests that follow. That is
+      // why the tests downstream that need a completion use
+      // completionRetryingRateLimits: under single dispatch, landing on her is
+      // a failed request, not a fallback.
     }
   });
 }

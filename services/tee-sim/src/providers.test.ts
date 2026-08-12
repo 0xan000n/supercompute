@@ -28,7 +28,7 @@ function fakeAuthorized(
 let server: Server | undefined;
 let lastReq: { url?: string; headers: Record<string, string | string[] | undefined>; body: string };
 
-function start(status: number, payload: unknown): Promise<number> {
+function start(status: number, payload: unknown, headers: Record<string, string> = {}): Promise<number> {
   // Each test stands up a fresh stub; a still-listening previous one is an open
   // handle that keeps the runner's child process alive after the last assertion.
   server?.close();
@@ -38,7 +38,7 @@ function start(status: number, payload: unknown): Promise<number> {
       req.on("data", (c) => (body += c));
       req.on("end", () => {
         lastReq = { url: req.url, headers: req.headers, body };
-        res.writeHead(status, { "content-type": "application/json" });
+        res.writeHead(status, { "content-type": "application/json", ...headers });
         res.end(JSON.stringify(payload));
       });
     });
@@ -231,6 +231,55 @@ test("negative or non-integer usage counts are malformed", async () => {
   const outcome = await adapter.complete(request, credential);
   assert.ok(!outcome.ok);
   assert.equal(outcome.classification, "malformed_response");
+});
+
+/**
+ * §5.1 — the routing loop in index.ts continues to the next credential only for
+ * classifications it believes are pre-dispatch. These two tests pin the contract
+ * that belief rests on; break either and single dispatch breaks silently.
+ */
+test("a refused redirect is a DISPATCHED failure, not a pre-dispatch egress denial", async () => {
+  for (const make of [
+    (port: number) => new AnthropicAdapter("anthropic", `http://127.0.0.1:${port}`, ["claude-haiku-4-5-20251001"]),
+    (port: number) => new OpenAICompatibleAdapter("openai", `http://127.0.0.1:${port}`, ["claude-haiku-4-5-20251001"]),
+  ]) {
+    // An allowlisted host answering 301: the prompt and the key were already on
+    // the wire when this arrived. `redirect: "manual"` stops the second hop.
+    const port = await start(301, {}, { location: "https://evil.example.com/v1/messages" });
+    process.env.CTN_EGRESS_ALLOWLIST = `127.0.0.1:${port}`;
+    const adapter = make(port);
+    const { request, credential } = fakeAuthorized("claude-haiku-4-5-20251001", [{ role: "user", content: "hi" }]);
+    const outcome = await adapter.complete(request, credential);
+
+    assert.ok(!outcome.ok, `${adapter.name}: a redirect is never a success`);
+    assert.equal(
+      outcome.classification,
+      "redirect_refused",
+      `${adapter.name}: classifying this as egress_denied would tell the routing loop nothing was sent`
+    );
+    assert.equal(outcome.httpStatus, 301, `${adapter.name}: the dispatched response's status is reported`);
+    server!.close();
+  }
+});
+
+test("every pre-dispatch classification carries httpStatus 0 — nothing was sent", async () => {
+  // Unpriced: refused before the egress check and before fetch.
+  process.env.CTN_EGRESS_ALLOWLIST = "127.0.0.1:1";
+  const unpriced = new OpenAICompatibleAdapter("openai", "http://127.0.0.1:1", ["ctn/model-with-no-price"]);
+  const unpricedCall = fakeAuthorized("ctn/model-with-no-price", [{ role: "user", content: "hi" }]);
+  const a = await unpriced.complete(unpricedCall.request, unpricedCall.credential);
+  assert.ok(!a.ok);
+  assert.equal(a.classification, "unpriced_model");
+  assert.equal(a.httpStatus, 0, "an unpriced model is refused before any dispatch");
+
+  // Egress-denied: the URL is not on the allowlist, so fetch is never called.
+  process.env.CTN_EGRESS_ALLOWLIST = "127.0.0.1:4300";
+  const offAllowlist = new AnthropicAdapter("anthropic", "http://127.0.0.1:9", ["claude-haiku-4-5-20251001"]);
+  const { request, credential } = fakeAuthorized("claude-haiku-4-5-20251001", [{ role: "user", content: "hi" }]);
+  const b = await offAllowlist.complete(request, credential);
+  assert.ok(!b.ok);
+  assert.equal(b.classification, "egress_denied");
+  assert.equal(b.httpStatus, 0, "a refused host means no request was made");
 });
 
 test("egress allowlist is exactly the implemented providers", () => {

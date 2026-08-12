@@ -50,8 +50,11 @@ const CONTRIBUTORS = [
     weight: 1,
   },
   {
-    // Deliberately rate-limited so §55 fallback is demonstrable on demand:
-    // the mock provider returns 429 for any key ending in RATE.
+    // Deliberately rate-limited: the mock provider returns 429 for any key
+    // ending in RATE. Under §5.1 single dispatch a request that draws this
+    // credential FAILS rather than falling through to another one — the 429
+    // sets a cooldown, so the demonstrable behaviour is the NEXT request
+    // routing around it.
     name: "Erin",
     label: "Erin's rate-limited key",
     key: "mock-provider-key-erin-RATE",

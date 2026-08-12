@@ -60,6 +60,13 @@ console.log("");
  * so nothing was spent and nothing was exposed. Every other classification —
  * including the ones where we never learned what the provider did — means the
  * prompt has been dispatched, and a dispatched prompt is the request.
+ *
+ * The contract this relies on is a property of the adapters: these two are
+ * returned before `fetch` is called and carry `httpStatus: 0`, and no post-
+ * dispatch path may reuse either name. A refused redirect is the case that
+ * makes the distinction load-bearing — the allowlist blocks the second hop, but
+ * the first hop already carried the prompt and the key — so it classifies as
+ * `redirect_refused`. `providers.test.ts` asserts both halves of that contract.
  */
 const PRE_DISPATCH_CLASSIFICATIONS: ReadonlySet<
   Extract<ProviderOutcome, { ok: false }>["classification"]

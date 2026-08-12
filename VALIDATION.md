@@ -327,7 +327,7 @@ Worth calling out because they are easy to dismiss as ceremony:
 
 | Milestone | State |
 |---|---|
-| 1 · Router: credential CRUD, mock provider, weighted routing, usage, fallback | complete |
+| 1 · Router: credential CRUD, mock provider, weighted routing, usage | complete |
 | 2 · Graph: outbox, projector, live UI, SSE | complete (SQLite projection, not Neo4j) |
 | 3 · Policy v1: shared implementation, fixtures, stable policy id, DENY blocks provider | complete — 125/125 fixtures |
 | 4 · ZK policy proof | **substituted** — `simulated-reexec`, honestly labelled; verifier expects the risc0 shape |
