@@ -5,12 +5,24 @@ edition = "2021"
 
 [dependencies]
 methods = { path = "../methods" }
-# `prove` is NOT a default feature of risc0-zkvm: without it `default_prover`
-# and `default_executor` shell out to an `r0vm` subprocess over IPC, which adds
-# a fixed ~28 ms to every call and swamps the executor-only measurement. The
-# Phase 2b daemon will prove in-process, so measure in-process. `metal` implies
-# `prove` and turns on GPU acceleration on Apple Silicon.
-risc0-zkvm = { version = "^3.0.6", features = ["prove", "metal"] }
+# Two deliberate departures from risc0-zkvm's defaults, both about making the
+# prover that runs be the prover we think is running:
+#
+# * `prove` is NOT a default feature. Without it, `default_prover` and
+#   `default_executor` silently shell out to an `r0vm` subprocess over IPC,
+#   which added a fixed ~10 ms to every executor call and swamped the
+#   executor-only measurement. The Phase 2b daemon will prove in-process.
+# * `default-features = false` drops `bonsai`, which IS a default. With it
+#   compiled in, `default_prover` returns a *remote* Bonsai prover whenever
+#   BONSAI_API_URL and BONSAI_API_KEY are set in the environment — and it
+#   checks that branch before the local one. Removing the feature removes the
+#   branch; `--bench` additionally refuses to run unless the backend is
+#   "local", so neither the compile-time nor the runtime path can go remote
+#   without saying so.
+#
+# `metal` is deliberately absent: in 3.0.6 it is a pure alias for `prove`, and
+# Metal kernels are built by risc0-sys on any macOS target regardless.
+risc0-zkvm = { version = "^3.0.6", default-features = false, features = ["prove"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = "1.0"
 anyhow = "1.0"

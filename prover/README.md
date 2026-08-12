@@ -111,40 +111,71 @@ The rule for this directory:
 
 ## Measured on this machine
 
-Three runs per measurement, median reported, `--release`, dev mode off,
-in-process prover (backend `local`). Reproduce with
+Three timed runs per measurement after one discarded warmup, `--release`, dev
+mode off, in-process prover (backend `local`, enforced). Reproduce with
 `cargo run -rp host -- --bench`.
+
+Medians:
 
 | Input | Executor only | Composite prove | Receipt (bincode) | Verify |
 |---|---|---|---|---|
-| 256 B | 23 ms | 5.73 s | 216.1 KB (221,274 B) | 12 ms |
-| 4096 B | 18 ms | 49.66 s | 262.0 KB (268,250 B) | 15 ms |
+| 256 B | 16.9 ms | 5.70 s | 216.1 KB (221,274 B) | 12.2 ms |
+| 4096 B | 18.3 ms | 50.49 s | 262.0 KB (268,250 B) | 14.9 ms |
+
+Spread (min / median / max), because the median alone hid a cold-start artifact
+in the first version of this file:
+
+| Input | Executor ms | Prove ms | Verify ms |
+|---|---|---|---|
+| 256 B | 15.5 / 16.9 / 22.4 | 5606.9 / 5701.9 / 5807.4 | 12.2 / 12.2 / 12.3 |
+| 4096 B | 18.1 / 18.3 / 18.5 | 49070.7 / 50490.1 / 50662.9 | 14.8 / 14.9 / 15.0 |
+
+Verify runs immediately after proving on a receipt still in memory, so it is a
+cache-hot number. A verifier reading a receipt off disk would pay more.
 
 Guest image id `d094ec7bbac59857234c8c316573b591e5830ed9656fec4cf332440a0e19ff50`
 — it changes whenever the guest or its dependency graph does, which is the point.
 
-| Input | User cycles | Segments | Segment po2 |
-|---|---|---|---|
-| 256 B | 24,927 | 1 | 16 |
-| 4096 B | 265,498 | 1 | 19 |
+| Input | Segments | po2 | User cyc | Total cyc | Paging cyc | Reserved cyc |
+|---|---|---|---|---|---|---|
+| 256 B | 1 | 16 | 24,927 | 65,536 | 24,870 | 15,739 |
+| 4096 B | 1 | 19 | 265,498 | 524,288 | 26,854 | 231,936 |
 
-Three things in that table matter more than the headline numbers.
+Three things in those tables matter more than the headline numbers.
 
-**Executor latency is a floor, not a function of input size.** 23 ms at 256 B and
-18 ms at 4096 B — the smaller input measured *slower*, and across all runs both
-sizes landed in 17–23 ms while the cycle count grew 10×. Nearly all of it is
-fixed setup (ELF load, page-in, session start); the marginal cost of 240,000
-extra cycles is around 1 ms. Phase 2b should budget roughly 20 ms per execution
-regardless of prompt size, and should not expect to optimise that by shrinking
-the input.
+**Executor latency is a fixed floor of roughly 17–18 ms.** 16.9 ms at 256 B and
+18.3 ms at 4096 B, across a 10.6× difference in user cycles. The 1.4 ms gap
+between the medians is smaller than the run-to-run spread at 256 B, which alone
+covers 15.5–22.4 ms — so the marginal cost of 240,000 extra user cycles is real
+but sits below this sample's noise floor rather than being separable from it.
+What the number is made of is fixed setup: ELF load, page-in, session start.
+Phase 2b should budget ~20 ms per execution regardless of prompt size, and should
+not expect to recover it by shrinking the input.
 
-**Proving cost tracks the padded power of two, not the cycle count.** 8× the
-rows (po2 16 → 19) cost 8.7× the time. So proving is near-linear in padded rows,
-and the cliff is at each po2 boundary: 24,927 cycles and 65,535 cycles both cost
-po2 16. The useful extrapolation for Tasks 4 and 7 is ~100 s at po2 20 and
-~200 s at po2 21. The policy guest will do more per byte than sha256 does, so it
-will land a po2 or two higher than this spike at the same input size — which is
-affordable off the request path, and nowhere near affordable on it.
+An earlier version of this file reported 23 ms at 256 B and called the resulting
+*inversion* — the small input measuring slower than the large one — evidence for
+that same conclusion. It was not evidence; it was the harness. Sizes ran in a
+fixed order with no warmup, so first-call cost landed entirely on the 256 B row.
+The conclusion survived the fix, but it had been argued from an artifact, which
+is why `--bench` now warms up and prints spread.
+
+**Proving cost tracks the padded total, and user cycles are a minority of it.**
+`total_cycles` comes out to exactly 2^po2 — 65,536 and 524,288 — with user,
+paging and reserved cycles summing to it precisely. User cycles are only 38% of
+the padded total at 256 B and 51% at 4096 B; the rest is paging and reserved
+overhead that does not shrink proportionally. **You therefore cannot predict po2
+from user cycles**, which is what an earlier version of this file tried to do
+when it claimed 24,927 and 65,535 cycles would both fit po2 16. They would not:
+at 256 B, 24,927 user cycles already pull in 40,609 cycles of paging and reserved
+overhead to reach 2^16, so a guest with 65,535 *user* cycles would spill well
+into po2 17.
+
+Time scales near-linearly with padded rows: 8× the rows cost 8.85× the time
+(po2 16 → 19), or roughly 0.087–0.096 ms per row. Extrapolating for Tasks 4 and
+7: **~105 s at po2 20, ~210 s at po2 21.** The policy guest will do more per byte
+than sha256 does *and* carry more paging overhead, so expect it a po2 or two above
+this spike at equal input size — affordable off the request path, nowhere near
+affordable on it.
 
 **Composite receipts are ~250 KB and grow with execution length.** That is a
 storage and transport cost per receipt, not per policy. Compressing to Groth16
@@ -155,20 +186,36 @@ commits to a receipt format.
 
 ### What is not established
 
-Metal is compiled in (`metal` feature, which implies `prove`), but no
-CPU-versus-GPU comparison was run, so nothing here quantifies what the GPU
-contributes. Notably, proving times were within noise of the earlier run against
-the external `r0vm` subprocess — that binary is GPU-enabled too, so the two
-configurations differ in IPC overhead rather than in acceleration.
+**No CPU-versus-GPU comparison was run**, so nothing here quantifies what the GPU
+contributes. Metal acceleration is active, but not because of the `metal` cargo
+feature — in 3.0.6 that feature is a pure alias for `prove` and adds nothing else.
+`risc0-sys/build.rs` builds the Metal kernels for any `macos` or `ios` target
+unconditionally, with no feature gate, which is also why enabling `prove` is what
+made the Metal Toolchain a hard build requirement. The build therefore does not
+name `metal` at all. A suggestive but non-decisive data point: proving times were
+within noise of the earlier run against the external `r0vm` subprocess, and that
+binary is GPU-enabled too, so those two configurations differed in IPC overhead
+rather than in acceleration.
 
-That IPC overhead is the one number the first run did get wrong, and it is worth
-recording why. `prove` is **not** a default feature of `risc0-zkvm`. Without it,
-`default_prover` and `default_executor` silently shell out to an `r0vm`
-subprocess, which added a fixed ~28 ms to every executor call — for a
-measurement whose whole purpose is a ~20 ms budget, that is the difference
-between a usable number and a misleading one. `host/Cargo.toml` therefore
-enables `prove` explicitly, and `--bench` prints the backend name so a stray
-measurement cannot be mistaken for the other configuration.
+Two silent defaults in `risc0-zkvm` are worth recording, because both would have
+produced numbers describing something other than this machine.
+
+`prove` is **not** a default feature. Without it, `default_prover` and
+`default_executor` shell out to an `r0vm` subprocess over IPC. That cost roughly
+10 ms per executor call on top of the ~17 ms in-process figure — for a
+measurement whose whole purpose is a ~20 ms budget, the difference between a
+usable number and a misleading one. (That comparison was taken with the
+pre-warmup harness, so treat it as indicative rather than precise.)
+
+`bonsai` **is** a default feature, and `default_prover` checks for
+`BONSAI_API_URL` / `BONSAI_API_KEY` *before* it checks the local branch. With
+those two variables set in the environment, proving would have silently gone to
+remote hardware over a network — the same class of failure, with a worse outcome,
+since the resulting timings would describe somebody else's machine. Two things
+close it: `default-features = false` removes the branch at compile time, and
+`--bench` refuses to run unless the backend reports `local`, mirroring how it
+refuses to run under `RISC0_DEV_MODE`. `RISC0_EXECUTOR` is checked too, since the
+`Executor` trait exposes no name to enforce against.
 
 ---
 

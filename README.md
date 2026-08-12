@@ -308,7 +308,7 @@ modelled (`CTN_SIMULATED_PROVING_MS`, default 2400 ms) and labelled as such —
 everything else is measured.
 
 The model is optimistic. A real RISC Zero proof of a guest that merely hashes 4 KB
-takes **49.7 s** on an M1 Pro, not 2.9 s (`prover/`, VALIDATION.md §2c). The
+takes **50.5 s** on an M1 Pro, not 2.9 s (`prover/`, VALIDATION.md §2c). The
 architecture survives that — the proof is an audit artifact, not a gate, so the
 caller still waits ~490 ms — but "concurrent with the request" is the wrong mental
 picture. Receipts land seconds to minutes after the answer does.

@@ -43,9 +43,15 @@ between a demo that survives a dependency hiccup and one that doesn't.
 contributor trusts the *attested code* to enforce the policy, and that the proof is
 an audit artifact rather than a gate, is what makes the latency story work at all.
 The spec is right to insist on measuring it rather than assuming. Measured here:
-proving takes ~2.9 s at p50 while the caller waits ~390 ms — but the ~2.9 s is a
+proving takes ~2.9 s at p50 while the caller waits ~490 ms — but the ~2.9 s is a
 *modelled* proof cost, and §2c reports what a real one costs once measured. The
 insight holds; the number was optimistic by roughly 20×.
+
+(This clause previously said ~390 ms, disagreeing with the ~490 ms in README's
+"Measured, not assumed" table. Both are snapshots of a live `GET /v1/stats` p50
+rather than fixed constants, so neither is reproducible from the repo — but the
+caller cannot wait less time than the provider call it is waiting on, and that is
+~450 ms. ~490 ms is the internally consistent figure; ~390 ms was not.)
 
 **Policy id over policy label (§24).** Hashing manifest + rules + guest image so
 that changing one weight changes the identifier is the mechanism that makes
@@ -447,17 +453,22 @@ follows is therefore a floor for the real thing, and is written down as a floor.
 
 Apple M1 Pro, 10 cores, 32 GB, macOS 26.0.1. risc0 3.0.6 (`cargo-risczero` 3.0.6,
 `r0vm` 3.0.6, `risc0-zkvm` 3.0.6), host rustc 1.97.1, guest toolchain 1.97.0.
-Release build, in-process prover, dev mode off, three runs per measurement, median
-reported.
+Release build, in-process prover (enforced), dev mode off, three timed runs per
+measurement after one discarded warmup, median reported with min/max alongside.
 
-| Input | Executor only | Composite prove | Receipt (bincode) | Verify |
+| Input | Executor only | Composite prove | Receipt (bincode) | Verify (cache-hot) |
 |---|---|---|---|---|
-| 256 B | 23 ms | 5.73 s | 216.1 KB | 12 ms |
-| 4096 B | 18 ms | 49.66 s | 262.0 KB | 15 ms |
+| 256 B | 16.9 ms (15.5–22.4) | 5.70 s (5.61–5.81) | 216.1 KB | 12.2 ms |
+| 4096 B | 18.3 ms (18.1–18.5) | 50.49 s (49.07–50.66) | 262.0 KB | 14.9 ms |
+
+| Input | Segments | po2 | User cyc | Total cyc | Paging cyc | Reserved cyc |
+|---|---|---|---|---|---|---|
+| 256 B | 1 | 16 | 24,927 | 65,536 | 24,870 | 15,739 |
+| 4096 B | 1 | 19 | 265,498 | 524,288 | 26,854 | 231,936 |
 
 **The model was optimistic by roughly 20×.** Phase 1 assumed 2.4 s of proving and
 observed ~2.9 s at p50. Real composite proving of a program that only hashes 4 KB
-takes 49.7 s. §66's architectural claim survives this — proving runs parallel to
+takes 50.5 s. §66's architectural claim survives this — proving runs parallel to
 inference and the caller does not wait for it — but the claim that survives is
 narrower than the one the README currently implies. At ~450 ms of inference and
 ~50 s of proving, the proof is no longer "concurrent with the request"; it finishes
@@ -469,19 +480,38 @@ waits on a receipt — the verifier UI, the graph projection — has to be built
 that. Phase 1's numbers are not being restated here as wrong; they were correctly
 labelled as modelled, and this is what the measurement turned out to be.
 
-**Executor latency is a fixed ~20 ms floor.** This is the number that would gate a
-live request, and it is nearly independent of input: 23 ms at 256 B, 18 ms at
-4096 B, with the *smaller* input measuring slower and a 10× cycle difference
-between them. It is session setup, not computation. Two consequences. Running the
-policy in the zkVM on the request path would add ~20 ms whatever the prompt, which
-is affordable against a ~450 ms provider call. And it cannot be optimised by
-trimming input, so the Phase 2b design should treat it as a constant.
+**Executor latency is a fixed ~17–18 ms floor.** This is the number that would gate
+a live request, and it barely moves with input: 16.9 ms at 256 B, 18.3 ms at
+4096 B, across a 10.6× difference in user cycles. The 1.4 ms between those medians
+is smaller than the run-to-run spread at 256 B, which by itself covers
+15.5–22.4 ms, so the marginal cost of the extra cycles is real but below this
+sample's noise floor rather than separable from it. The bulk is session setup.
+Two consequences. Running the policy in the zkVM on the request path would add
+~20 ms whatever the prompt, which is affordable against a ~450 ms provider call.
+And it cannot be optimised by trimming input, so Phase 2b should treat it as a
+constant.
 
-**Proving cost tracks padded rows, not cycles.** 8× the rows cost 8.7× the time
-(po2 16 → 19). Cost is therefore a step function with cliffs at each po2 boundary,
-which means the policy guest's cost is set by which boundary it lands on rather
-than by how much work it does within one. Extrapolating: ~100 s at po2 20, ~200 s
-at po2 21.
+This paragraph originally said 23 ms at 256 B and pointed at the *inversion* —
+the small input measuring slower than the large — as the evidence. That was an
+artifact of the harness, not a property of the zkVM: sizes ran in a fixed order
+with no warmup, so first-call cost landed entirely on the first row. The
+conclusion happened to survive re-measurement, but it had been argued from a
+number whose sign was wrong, which is precisely the failure this document exists
+to catch. `--bench` now discards a warmup iteration per size and prints
+min/median/max.
+
+**Proving cost tracks the padded total, and user cycles are a minority of it.**
+`total_cycles` lands on exactly 2^po2 — 65,536 and 524,288 — with user, paging and
+reserved cycles summing to it exactly. User cycles are 38% of that total at 256 B
+and 51% at 4096 B; the remainder is paging and reserved overhead that does not
+shrink proportionally. So po2 cannot be predicted from user cycles: at 256 B,
+24,927 user cycles already drag in 40,609 cycles of overhead to fill 2^16, and a
+guest with 65,535 *user* cycles would spill into po2 17 rather than fitting po2 16
+as an earlier draft of this section asserted. Time then scales near-linearly with
+padded rows — 8× the rows cost 8.85× the time, about 0.09 ms per row —
+so the extrapolation for Tasks 4 and 7 is ~105 s at po2 20 and ~210 s at po2 21.
+The practical consequence is that the policy guest's proving cost will be set by
+its paging behaviour as much as by its arithmetic.
 
 **A composite receipt is ~250 KB.** The spec treats the proof as an artifact to be
 stored and independently verified; at a quarter of a megabyte each, growing with
@@ -490,10 +520,10 @@ compression would make it constant-size and small, at the cost of extra proving
 time. Neither was measured. Task 6 should measure both before the release manifest
 fixes a receipt format, because that choice is hard to reverse afterwards.
 
-### Two things the plan assumed that turned out to be false
+### What the plan assumed that turned out to be false
 
-The plan's API sketch was drawn from risc0 2.x. Both anchors it named still exist
-in 3.0.6, and both needed adjusting anyway.
+The plan's API sketch was drawn from risc0 2.x. The anchors it named still exist
+in 3.0.6 and still needed adjusting.
 
 `env::read_frame` — the guest's input path — is marked `#[stability::unstable]`
 and does not compile without opting the guest into the `unstable` feature. Its
@@ -502,15 +532,36 @@ guest's only input path behind an unstable flag, the guest reproduces `read_fram
 on the stable `read_slice`: the same two reads, the same wire format, so it stays
 compatible with the stable writer.
 
-`prove` is not a default feature of `risc0-zkvm`. Without it, `default_prover` and
-`default_executor` fall back to an `r0vm` subprocess over IPC — silently, with no
-error and no warning. The first run of this benchmark was taken that way and
-reported a fixed ~28 ms of executor latency at both input sizes. The IPC overhead
-was most of it. For a measurement whose entire purpose is establishing a ~20 ms
-request-path budget, a silent default that inflates it by half is exactly the kind
-of thing that gets quoted for a year. `--bench` now prints which backend it used,
-and refuses to run at all under `RISC0_DEV_MODE`, where proving is a stub that
-returns instantly and verification accepts anything.
+### Three silent defaults, all pointing the same way
+
+The more useful finding is not any single number but a pattern: `risc0-zkvm`'s
+defaults will quietly measure something other than what you meant, and say
+nothing. Each of these was caught, but only one of them was caught before it had
+already been written down as a result.
+
+`prove` is not a default feature. Without it, `default_prover` and
+`default_executor` fall back to an `r0vm` subprocess over IPC — silently, no error,
+no warning. The first run of this benchmark was taken that way and reported ~28 ms
+of executor latency; in-process and warm it is ~17 ms. For a measurement whose
+entire purpose is establishing a ~20 ms request-path budget, a silent default
+inflating it by half is exactly the kind of thing that gets quoted for a year.
+
+`bonsai` **is** a default feature, and `default_prover` tests for `BONSAI_API_URL`
+and `BONSAI_API_KEY` *before* it reaches the local branch. Had those variables
+been present in the environment, proving would have gone to remote hardware over a
+network and the timings would have described someone else's machine. Nothing in
+the output would have said so. `default-features = false` now removes the branch
+at compile time, and `--bench` refuses to run unless the backend reports `local` —
+enforcement rather than reporting, because the first version of this harness
+printed the backend and would still have happily benchmarked the wrong one.
+
+`RISC0_DEV_MODE` makes proving a stub that returns instantly and verification
+accept anything. `--bench` refuses to run under it.
+
+The harness had one silent default of its own, and it is the one that got through:
+no warmup, fixed size order, median-only reporting. That is what produced the
+23 ms figure corrected above. Printing min/median/max would have exposed it
+immediately, which is why it now does.
 
 ---
 
