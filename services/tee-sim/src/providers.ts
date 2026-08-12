@@ -9,7 +9,13 @@
  */
 import type { AuthorizedRequest, AuthorizedCredential } from "./authorize.js";
 import { canonicalHash } from "@ctn/protocol";
-import { assertPriced, estimateCostMicroUsd, isPriced, PRICING_TABLE_DIGEST } from "./pricing.js";
+import {
+  assertPriced,
+  estimateCostMicroUsd,
+  estimateWorstCaseMicroUsd,
+  isPriced,
+  PRICING_TABLE_DIGEST,
+} from "./pricing.js";
 
 export class EgressDeniedError extends Error {
   constructor(host: string) {
@@ -77,7 +83,16 @@ export type ProviderOutcome =
         | "server_error"
         | "timeout"
         | "egress_denied"
+        | "malformed_response"
         | "unpriced_model";
+      /**
+       * §5.1 — the request was dispatched and no definitive answer exists
+       * (timeout, transport failure, or a 200 we could not parse). The
+       * provider may have processed AND billed it: cap accounting must
+       * assume the conservative estimate.
+       */
+      upstreamOutcomeUnknown?: true;
+      assumedSpendMicroUsd?: number;
     };
 
 export interface ProviderAdapter {
@@ -90,7 +105,50 @@ export interface ProviderAdapter {
   complete(request: AuthorizedRequest, credential: AuthorizedCredential): Promise<ProviderOutcome>;
 }
 
-const OPENAI_TIMEOUT_MS = Number(process.env.CTN_PROVIDER_TIMEOUT_MS ?? 20_000);
+/** Read per call, not once at import: tests and the dev stack set this after
+ *  the module graph is already loaded. */
+function providerTimeoutMs(): number {
+  return Number(process.env.CTN_PROVIDER_TIMEOUT_MS ?? 20_000);
+}
+
+/**
+ * A token count we are willing to bill against. A missing, negative, fractional
+ * or unsafe-magnitude count is not "zero tokens" — it is a response we cannot
+ * account for, and the difference decides whether someone gets charged for a
+ * number we made up.
+ */
+function validUsage(n: unknown): n is number {
+  return typeof n === "number" && Number.isSafeInteger(n) && n >= 0;
+}
+
+/**
+ * The failure shape for everything that happens AFTER the bytes left: an abort,
+ * a mid-flight transport error, or a 200 whose body we could not parse. In all
+ * three the provider may have run the completion and billed for it, so the
+ * outcome carries a conservative upper bound instead of the implicit zero a
+ * plain failure would hand the cap accounting.
+ *
+ * Shared by both adapters deliberately — "a malformed 200 is not a free
+ * success" has to hold identically no matter which wire format produced it.
+ */
+function unknownOutcome(
+  request: AuthorizedRequest,
+  latencyMs: number,
+  classification: "timeout" | "server_error" | "malformed_response"
+): Extract<ProviderOutcome, { ok: false }> {
+  return {
+    ok: false,
+    httpStatus: 0,
+    latencyMs,
+    classification,
+    upstreamOutcomeUnknown: true,
+    assumedSpendMicroUsd: estimateWorstCaseMicroUsd(
+      request.request.model,
+      request.request.messages,
+      request.request.max_tokens
+    ),
+  };
+}
 
 /**
  * OpenAI-compatible adapter. Also used for the local mock provider, which speaks
@@ -164,7 +222,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     const upstreamRequestHash = "0x" + canonicalHash(body);
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), OPENAI_TIMEOUT_MS);
+    const timer = setTimeout(() => controller.abort(), providerTimeoutMs());
     try {
       const res = await fetch(url, {
         method: "POST",
@@ -206,13 +264,28 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
         return { ok: false, httpStatus: res.status, latencyMs, classification };
       }
 
-      const json = (await res.json()) as {
-        choices?: Array<{ message?: { content?: string } }>;
-        usage?: { prompt_tokens?: number; completion_tokens?: number };
+      let json: {
+        choices?: Array<{ message?: { content?: unknown } }>;
+        usage?: { prompt_tokens?: unknown; completion_tokens?: unknown };
       };
-      const content = json.choices?.[0]?.message?.content ?? "";
-      const inputTokens = json.usage?.prompt_tokens ?? 0;
-      const outputTokens = json.usage?.completion_tokens ?? 0;
+      try {
+        json = (await res.json()) as typeof json;
+      } catch {
+        return unknownOutcome(request, Math.round(performance.now() - started), "malformed_response");
+      }
+      const content = json.choices?.[0]?.message?.content;
+      const inputTokens = json.usage?.prompt_tokens;
+      const outputTokens = json.usage?.completion_tokens;
+      if (typeof content !== "string" || !validUsage(inputTokens) || !validUsage(outputTokens)) {
+        /**
+         * The defaults this replaced (`?? ""`, `?? 0`) turned any unrecognised
+         * 200 into a free, empty success: zero cost billed, a receipt signed
+         * over nothing, and the routing loop satisfied. The provider processed
+         * the request; a response we cannot account for must be an unknown
+         * outcome, not a zero-spend one.
+         */
+        return unknownOutcome(request, latencyMs, "malformed_response");
+      }
 
       return {
         ok: true,
@@ -230,13 +303,161 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
       };
     } catch (err) {
       const latencyMs = Math.round(performance.now() - started);
+      // ANY exception after dispatch — abort, reset, DNS mid-flight — is an
+      // unknown upstream outcome. Only pre-dispatch failures are known.
       const aborted = err instanceof Error && err.name === "AbortError";
+      return unknownOutcome(request, latencyMs, aborted ? "timeout" : "server_error");
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/**
+ * Anthropic Messages API. Structurally a mirror of the adapter above — same
+ * egress gate, same manual redirect, same refusal to read error bodies — and
+ * deliberately a separate class rather than a wire-format flag: the two APIs
+ * disagree about where the system prompt lives, how the key is presented, and
+ * what a usage block is called, and a shared body with three conditionals is
+ * where those differences go to hide.
+ */
+export class AnthropicAdapter implements ProviderAdapter {
+  constructor(
+    readonly name: string,
+    private readonly baseUrl: string,
+    private readonly models: string[]
+  ) {}
+
+  /** See `OpenAICompatibleAdapter.supportsModel` — a model we cannot price is a
+   *  model this adapter does not offer. */
+  supportsModel(model: string): boolean {
+    return this.models.includes(model) && isPriced(model);
+  }
+
+  async complete(
+    request: AuthorizedRequest,
+    credential: AuthorizedCredential
+  ): Promise<ProviderOutcome> {
+    const started = performance.now();
+
+    // FIRST statement, before the egress check and before any dispatch — see
+    // the same guard in OpenAICompatibleAdapter for why the price lookup has to
+    // gate the call rather than follow it.
+    try {
+      assertPriced(request.request.model);
+    } catch {
       return {
         ok: false,
         httpStatus: 0,
-        latencyMs,
-        classification: aborted ? "timeout" : "server_error",
+        latencyMs: Math.round(performance.now() - started),
+        classification: "unpriced_model",
       };
+    }
+
+    const url = `${this.baseUrl}/v1/messages`;
+    try {
+      assertEgressAllowed(url);
+    } catch {
+      // Nothing was dispatched, so this is a KNOWN zero-spend failure: no
+      // unknown flag, no assumed spend.
+      return {
+        ok: false,
+        httpStatus: 0,
+        latencyMs: Math.round(performance.now() - started),
+        classification: "egress_denied",
+      };
+    }
+
+    // Anthropic takes the system prompt out of band; the canonical request
+    // keeps it inline, so lift it here rather than letting it become a `user`
+    // turn the model reads as untrusted input.
+    const system = request.request.messages
+      .filter((m) => m.role === "system")
+      .map((m) => m.content)
+      .join("\n");
+    const body = {
+      model: request.request.model,
+      max_tokens: request.request.max_tokens,
+      ...(system ? { system } : {}),
+      messages: request.request.messages
+        .filter((m) => m.role !== "system")
+        .map((m) => ({ role: m.role, content: m.content })),
+      temperature: request.request.temperature_millis / 1000,
+    };
+    const upstreamRequestHash = "0x" + canonicalHash(body);
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), providerTimeoutMs());
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          // The only place the contributed secret is ever used.
+          "x-api-key": credential.secret,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+        // Not followed: a redirect would carry the key and the prompt to a host
+        // the allowlist refused.
+        redirect: "manual",
+      });
+      const latencyMs = Math.round(performance.now() - started);
+
+      if (res.status >= 300 && res.status < 400) {
+        return { ok: false, httpStatus: res.status, latencyMs, classification: "egress_denied" };
+      }
+      if (!res.ok) {
+        // A definitive HTTP error is a KNOWN outcome. Do not read the body (§58).
+        const classification =
+          res.status === 401 || res.status === 403
+            ? ("auth_failed" as const)
+            : res.status === 429
+              ? ("rate_limited" as const)
+              : ("server_error" as const);
+        return { ok: false, httpStatus: res.status, latencyMs, classification };
+      }
+
+      let json: {
+        content?: Array<{ type?: string; text?: string }>;
+        usage?: { input_tokens?: unknown; output_tokens?: unknown };
+      };
+      try {
+        json = (await res.json()) as typeof json;
+      } catch {
+        return unknownOutcome(request, Math.round(performance.now() - started), "malformed_response");
+      }
+      const inputTokens = json.usage?.input_tokens;
+      const outputTokens = json.usage?.output_tokens;
+      const blocks = json.content;
+      if (!validUsage(inputTokens) || !validUsage(outputTokens) || !Array.isArray(blocks)) {
+        // The provider processed the request; a response we cannot account for
+        // must never become a zero-spend success.
+        return unknownOutcome(request, latencyMs, "malformed_response");
+      }
+      const content = blocks.filter((b) => b.type === "text").map((b) => b.text ?? "").join("");
+
+      return {
+        ok: true,
+        response: {
+          content,
+          inputTokens,
+          outputTokens,
+          estimatedCostMicroUsd: estimateCostMicroUsd(request.request.model, inputTokens, outputTokens),
+          pricingTableDigest: PRICING_TABLE_DIGEST,
+          upstreamRequestHash,
+          upstreamResponseHash: "0x" + canonicalHash({ content, inputTokens, outputTokens }),
+          httpStatus: res.status,
+          latencyMs,
+        },
+      };
+    } catch (err) {
+      const latencyMs = Math.round(performance.now() - started);
+      // ANY exception after dispatch — abort, reset, DNS mid-flight — is an
+      // unknown upstream outcome. Only pre-dispatch failures are known.
+      const aborted = err instanceof Error && err.name === "AbortError";
+      return unknownOutcome(request, latencyMs, aborted ? "timeout" : "server_error");
     } finally {
       clearTimeout(timer);
     }
