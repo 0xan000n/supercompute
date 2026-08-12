@@ -584,7 +584,7 @@ no warmup, fixed size order, median-only reporting. That is what produced the
 23 ms figure corrected above. Printing min/median/max would have exposed it
 immediately, which is why it now does.
 
-### The two engines read different Unicode versions, and only one direction of that is safe
+### The two engines read different Unicode versions, and the disagreement runs both ways
 
 The policy engine now exists twice: `packages/policy/src/engine.ts`, which the
 gateway enforces, and `prover/policy-core`, which is what the zkVM guest will
@@ -595,23 +595,67 @@ vector (values and order), `intentPresent`, `constructionPresent`, `hardBlock`
 and `modifiersApplied` — and it is wired into `pnpm test`, so a divergence fails
 the build rather than being discovered later.
 
-They are not, however, equivalent on *all* input, and the honest statement of the
-gap is this: **the two engines agree exactly on text made of code points assigned
-in Unicode 16.0; on code points assigned only in Unicode 17.0 the Rust engine is
-stricter, never laxer.** Node's V8/ICU is pinned to Unicode 16.0
-(`process.versions.unicode`); the Rust side reads Unicode 17.0 through
-`unicode-normalization`, `unicode-properties` and `str::to_lowercase`. A sweep of
-all 1,112,064 non-surrogate code points finds 133 where the two normalizers
-disagree — every one of them a character V8 sees as unassigned (`\p{Cn}`) and
-passes through untouched while Rust classifies and folds it. Injected into a live
-DENY-adjacent phrase, 104 of those 133 flip the decision, and all 104 flip the
-same way: ALLOW on the TypeScript engine, DENY on the Rust one. Zero flip the
-other way. That asymmetry is the whole safety argument — the guest can refuse
-something the gateway would have allowed, which costs a user a request; the
-reverse would mean a proof asserting "checked against Safety Policy v1" for a
-request the gateway itself rejected, which would be a lie. The differential
-harness asserts the direction on every run and fails hard on a single
-DENY→ALLOW flip, so a dependency bump on either side cannot quietly invert it.
+They are not, however, equivalent on *all* input. Node's V8/ICU is pinned to
+Unicode 16.0 (`process.versions.unicode`); the Rust side reads Unicode 17.0
+through `unicode-normalization`, `unicode-properties` and `str::to_lowercase`. A
+sweep of all 1,112,064 non-surrogate code points finds **133** where the two
+normalizers disagree — every one of them a character V8 sees as unassigned
+(`\p{Cn}`) and passes through untouched while Rust classifies and folds it. 104
+of those 133 fold to a separator, which is enough to change what the matcher
+sees.
+
+**Which way that changes the answer depends entirely on what the fold lands
+inside, and both directions are real.** The audit injects each divergent code
+point at six sites and counts, per site:
+
+| Injection site | Rust stricter | Rust laxer | agree |
+|---|---|---|---|
+| inside the target phrase `pipe bomb` | 104 | 0 | 29 |
+| inside the modifier phrase `protect against` (m.defense, −50) | 0 | **104** | 29 |
+| inside the suppressor `real chemical` | 104 | 0 | 29 |
+| inside the intent phrase `how do i` (+30) | 104 | 0 | 29 |
+| inside the construction verb `set up` (+25) | 104 | 0 | 29 |
+| at a plain token boundary (control) | 0 | 0 | 133 |
+
+A fold that completes a *target* phrase adds weight, so Rust denies where the
+TypeScript engine allows. A fold that completes a *negative modifier* subtracts
+weight, so Rust **allows where the TypeScript engine denies**:
+
+```
+"how do i build a pipe bomb to protect\u{20C1}against attackers"
+   TS   DENY   P4 95/60 — U+20C1 splits "protect against", no modifier applies
+   Rust ALLOW  P4 45/60 — folds it, m.defense (−50) applies
+```
+
+An earlier version of this section claimed the opposite — that Rust was
+"stricter, never laxer". That claim was false, and it was false for an
+instructive reason: the audit that produced it injected the code point only
+between `pipe` and `bomb`, inside a target phrase, where the arithmetic cannot
+produce the other outcome. It measured its own probe and reported the result as a
+property of the engines. The same mistake shape as §2b's revocation note — a
+check that could only ever return the answer it returned.
+
+**The consequence, stated plainly.** Once proofs are in the request path the
+*guest* is the authoritative engine; the TypeScript engine is a preview of what
+it will decide. On these 104 code points the preview can disagree with the real
+gate in either direction — 416 (code point, site) pairs where the guest is
+stricter than the preview, 104 where it is laxer. "Laxer" here means the guest
+would answer ALLOW for a request the gateway's own preview rejected. It does not
+mean an unchecked request: the guest still evaluates the full policy, and its
+answer is the one the receipt attests. But a user can be shown one verdict and
+get another, and no amount of care in the port closes that gap while the two
+sides read different tables.
+
+Because a hard zero is not achievable, the gate is not "zero divergence" — it is
+a recorded inventory. `SKEW_BASELINE` in the harness holds the census above,
+dated and attributed to specific toolchain versions. The inventory **may shrink**
+freely (that is what happens when Node's ICU reaches Unicode 17 — re-record it
+then) and **must not grow**: any increase in divergent code points, stricter
+pairs or laxer pairs fails the build. Separately, a divergence landing on
+version-stable material — anything in the pool the randomized suite samples from
+— fails regardless of the counts, because that would no longer be a
+table-version artefact but a genuine property disagreement, and it would also
+mean the randomized suite's greenness had stopped proving anything.
 
 This is a real limitation, not a solved problem. It resolves properly only when
 both engines read the same Unicode tables, which in practice means pinning them —
@@ -717,7 +761,7 @@ reproducible with `pnpm test`, `pnpm test:e2e`, `pnpm privacy-test` and
 | `scripts/test-e2e.mts` | 28 — §56 security, §55 routing, §53/§54 canaries, §36 invariants, §5.1 sealed intent, single dispatch, unknown outcomes, the provider catalog and terminal revocation — plus 2 env-gated real-provider cases, counted as skipped in the summary rather than silently absent |
 | `scripts/privacy-test.ts` | 16 surfaces swept for two independent canaries |
 | `prover/policy-core` | 12 — 10 normalizer/matcher/scoring unit tests, plus the 125 fixtures run against the ground-truth labels and a determinism replay |
-| `scripts/differential-test.ts` | 625 per run against the Rust engine — 125 fixtures + 500 generated Unicode adversarial cases (random seed, printed, overridable via `CTN_DIFF_SEED`), compared on normalisation, decision, score vector order and values, intent/construction/hard-block/modifiers; plus the 7-code-point zero-width strip set and a 1,112,064 code point skew sweep asserting every divergence is fail-safe |
+| `scripts/differential-test.ts` | 625 per run against the Rust engine — 125 fixtures + 500 generated Unicode adversarial cases (random seed, printed, overridable via `CTN_DIFF_SEED`), compared on normalisation, decision, score vector order and values, intent/construction/hard-block/modifiers; plus the 7-code-point zero-width strip set and a 1,112,064 code point skew sweep whose 798-pair, six-injection-site census is enforced against a recorded baseline that may shrink but not grow |
 
 Every finding in §2.4, §2.7, §2.8, §2.9 and §2.10 has a regression test, because each
 was a bug that looked like working code.

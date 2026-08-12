@@ -110,9 +110,17 @@ pnpm verify-receipt <requestId>            # independent receipt + proof + bindi
 rather than skip — it is the only thing keeping `prover/policy-core` (the engine a
 proof is about) identical to `packages/policy` (the engine the gateway enforces). Per
 run it compares 125 fixtures and 500 generated Unicode adversarial cases field for
-field, then sweeps all 1,112,064 Unicode code points to assert that the two engines'
-Unicode-version skew only ever makes the Rust side *stricter*. VALIDATION.md §2c has
-the full statement of what that skew is and is not.
+field, then sweeps all 1,112,064 Unicode code points for normalizer divergence.
+
+That sweep finds 133 code points where the two engines disagree, because Node's ICU
+is Unicode 16.0 and Rust's tables are 17.0. **The disagreement is bidirectional**: at
+104 of them the Rust engine is stricter than the TypeScript one, and at the same 104
+it is *laxer* when the folded character lands inside a negative context modifier
+instead of a target phrase. Since the guest is the authoritative engine once proofs
+are in the path, the TypeScript preview can disagree with the real gate in either
+direction on this input. The harness enforces a recorded inventory of that skew —
+it may shrink, it must not grow, and any divergence on long-stable characters fails
+the build. VALIDATION.md §2c has the census and the argument.
 
 `pnpm test:e2e` runs entirely against the local mock upstream and costs nothing. Two
 further cases talk to a **real provider on a real account** and are therefore skipped
