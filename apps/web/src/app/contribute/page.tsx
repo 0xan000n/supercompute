@@ -38,7 +38,10 @@ export default function ContributePage() {
     data: Array<{ id: string; display_name: string; credential_count: number }>;
   }>("/v1/contributors", 0);
 
-  const { data: catalog } = usePolled<ProviderCatalog>("/v1/providers", 0);
+  // Polled, not fetched once: the catalog is near-static, but at interval 0 a
+  // single transient failure pins this page on "Loading providers…" until the
+  // user reloads. 30s is slow enough to be free and fast enough to self-heal.
+  const { data: catalog } = usePolled<ProviderCatalog>("/v1/providers", 30_000);
   const providers = useMemo(() => catalog?.providers ?? [], [catalog]);
 
   const [step, setStep] = useState<Step>("capability");

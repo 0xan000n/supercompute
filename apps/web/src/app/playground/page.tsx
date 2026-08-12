@@ -60,9 +60,12 @@ export default function PlaygroundPage() {
   // §5.1 — the selectable models are the enclave's catalog, grouped by the
   // provider that serves them. `/v1/models` still supplies the contributor
   // counts, which is a different fact about the same ids.
+  // 30s rather than 0: a one-off failure at interval 0 leaves the model picker
+  // empty until reload, which on a demo machine is indistinguishable from "the
+  // network has no capacity".
   const { data: catalog } = usePolled<{ providers: Array<{ provider: string; models: string[] }> }>(
     "/v1/providers",
-    0
+    30_000
   );
   const available = useMemo(
     () => new Map((models?.data ?? []).map((m) => [m.id, m.providers_available])),
