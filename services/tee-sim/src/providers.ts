@@ -9,7 +9,7 @@
  */
 import type { AuthorizedRequest, AuthorizedCredential } from "./authorize.js";
 import { canonicalHash } from "@ctn/protocol";
-import { estimateCostMicroUsd, PRICING_TABLE_DIGEST } from "./pricing.js";
+import { assertPriced, estimateCostMicroUsd, isPriced, PRICING_TABLE_DIGEST } from "./pricing.js";
 
 export class EgressDeniedError extends Error {
   constructor(host: string) {
@@ -63,8 +63,21 @@ export type ProviderOutcome =
       ok: false;
       httpStatus: number;
       latencyMs: number;
-      /** §18 — drives credential disable / cooldown / retry-next. */
-      classification: "auth_failed" | "rate_limited" | "server_error" | "timeout" | "egress_denied";
+      /**
+       * §18 — drives credential disable / cooldown / retry-next.
+       *
+       * `unpriced_model` is a pre-dispatch refusal and is deliberately NOT
+       * folded into `server_error`: the fault is ours, not the credential's, and
+       * a class that reads as an upstream failure would blame a contributor for
+       * a missing row in our own price table.
+       */
+      classification:
+        | "auth_failed"
+        | "rate_limited"
+        | "server_error"
+        | "timeout"
+        | "egress_denied"
+        | "unpriced_model";
     };
 
 export interface ProviderAdapter {
@@ -91,16 +104,44 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
     private readonly models: string[]
   ) {}
 
+  /**
+   * A model this adapter cannot PRICE is a model it does not support. Keeping
+   * the price table inside the capability predicate means the routing loop
+   * skips such a candidate outright (`model_not_allowed`) instead of recording
+   * a failed attempt against a contributor's credential.
+   */
   supportsModel(model: string): boolean {
-    return this.models.includes(model);
+    return this.models.includes(model) && isPriced(model);
   }
 
   async complete(
     request: AuthorizedRequest,
     credential: AuthorizedCredential
   ): Promise<ProviderOutcome> {
-    const url = `${this.baseUrl}/v1/chat/completions`;
     const started = performance.now();
+
+    /**
+     * FIRST statement, before the egress check and before any dispatch. The
+     * cost estimate below runs only after a successful upstream call, so an
+     * unpriced model discovered there would mean tokens already burned — and,
+     * caught by the generic handler, misreported as an upstream `server_error`
+     * that sends the routing loop to the next credential to burn them again.
+     * Refusing here makes "we never spend what we cannot account for" a
+     * property of the call's structure rather than of the price table's
+     * contents.
+     */
+    try {
+      assertPriced(request.request.model);
+    } catch {
+      return {
+        ok: false,
+        httpStatus: 0,
+        latencyMs: Math.round(performance.now() - started),
+        classification: "unpriced_model",
+      };
+    }
+
+    const url = `${this.baseUrl}/v1/chat/completions`;
     try {
       assertEgressAllowed(url);
     } catch {

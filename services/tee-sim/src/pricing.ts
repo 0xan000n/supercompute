@@ -38,6 +38,22 @@ function price(model: string): ModelPrice {
   return p;
 }
 
+/** True when the pinned table can price this model. Capability predicate — an
+ *  adapter must not offer a model whose spend it cannot account for. */
+export function isPriced(model: string): boolean {
+  return PRICING_TABLE[model] !== undefined;
+}
+
+/**
+ * Refuse an unpriced model. Call this BEFORE dispatching anything upstream: a
+ * price lookup that happens after the call has already burned real tokens, and
+ * the only honest thing left to do at that point is charge someone for a number
+ * we cannot compute.
+ */
+export function assertPriced(model: string): void {
+  price(model);
+}
+
 export function estimateCostMicroUsd(model: string, inTok: number, outTok: number): number {
   const p = price(model);
   return Math.ceil((inTok * p.inMicroUsdPerMTok + outTok * p.outMicroUsdPerMTok) / 1_000_000);
