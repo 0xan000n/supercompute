@@ -384,10 +384,21 @@ flight when the DELETE landed wrote `DISABLED` over `DELETED`, which is a status
 Now the coordinator refuses a status outside `{ACTIVE, DISABLED}` with 400
 `CTN_INVALID_STATUS`, refuses any status write on a `DELETED` row with 409
 `CTN_CREDENTIAL_DELETED`, and the failure handler's disable is written so it can never
-resurrect a revoked row. E2E case 66 asserts all three, including that the refusals are
-inert and that no traffic reaches the credential afterwards. The dashboard drops the
-enable/disable control on a revoked row rather than offering a button that can only
-error.
+resurrect a revoked row. The two rules are tested where each can actually be reached:
+**e2e case 66** covers the API surface — both refusals, that they leave the row
+untouched, and that no traffic reaches the credential afterwards — while the race is a
+**coordinator unit test** (`routing.test.ts`, *"an auth_failed outcome cannot resurrect
+a revoked credential"*), because no sequence of HTTP requests can schedule a dispatch to
+land after a DELETE on purpose. A second unit test asserts a live credential is still
+disabled by the same path, so the guard cannot pass by never disabling anything; both
+were checked against the unguarded statement and the first one fails without it. The
+dashboard drops the enable/disable control on a revoked row rather than offering a
+button that can only error.
+
+Still open, and listed rather than implied: `weight` and `operationalLimits` writes are
+accepted on a `DELETED` row. They are inert — routing never reaches a non-ACTIVE
+credential — but "deletion is terminal" would read better as a property of the whole
+handler than of one field in it.
 
 What revocation still does **not** do is erase the sealed ciphertext from the enclave
 vault, so a key smoke-tested here should be rotated, or `pnpm reset` run afterwards.
@@ -486,7 +497,7 @@ reproducible with `pnpm test`, `pnpm test:e2e`, `pnpm privacy-test` and
 | `packages/protocol` | 19 — canonicalisation, commitments, HPKE seal/open/AAD, Ed25519, tamper detection, attestation nonce binding |
 | `packages/policy` | 7 — 125 fixtures, determinism, normalisation, policy-id stability, hard blocks |
 | `services/tee-sim` | 48 — type-state gate, capability substitution, blob binding, attribution binding, decrypt ordering, egress bypasses, pricing, adapter response validation, sealed-intent parsing |
-| `services/coordinator` | 12 — `safeLog` redaction incl. nesting, arrays, case, depth, key names and `sk-` values; assumed-spend cap accounting and its rollback |
+| `services/coordinator` | 14 — `safeLog` redaction incl. nesting, arrays, case, depth, key names and `sk-` values; assumed-spend cap accounting and its rollback; the failure handler's inability to resurrect a revoked credential |
 | `scripts/test-e2e.mts` | 28 — §56 security, §55 routing, §53/§54 canaries, §36 invariants, §5.1 sealed intent, single dispatch, unknown outcomes, the provider catalog and terminal revocation — plus 2 env-gated real-provider cases, counted as skipped in the summary rather than silently absent |
 | `scripts/privacy-test.ts` | 16 surfaces swept for two independent canaries |
 

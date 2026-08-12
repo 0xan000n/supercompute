@@ -1440,6 +1440,16 @@ async function revokeCredential(id: string): Promise<string> {
  * anyway. Cleaning up by the label the run chose means a live key cannot survive
  * the test just because the suite lost track of its id. Never throws: it runs
  * while an assertion failure may already be in flight.
+ *
+ * The label is FIXED (`smoke-<provider>`) rather than random, and that is a
+ * deliberate trade with a real cost on both sides. Fixed: a run killed midway —
+ * ^C, a crashed enclave — leaves a live key active, and the next run revokes it.
+ * Random: nothing ever cleans that up, but a human credential that happens to be
+ * labelled `smoke-anthropic` is safe from us. We chose fixed, because the
+ * failure it prevents is a real provider key left routable on an unauthenticated
+ * coordinator, and the failure it risks is terminally revoking a demo credential
+ * that a contributor named after our test — recoverable by contributing again,
+ * since the key itself is unharmed.
  */
 async function revokeSmokeCredentials(label: string): Promise<{ ok: boolean; detail: string }> {
   let targets: any[];
@@ -1495,6 +1505,7 @@ async function run66(): Promise<void> {
 
     // Status is the field routing reads, so unroutable follows from it — but the
     // point of the guard is traffic, so check traffic.
+    let inspected = 0;
     for (let i = 0; i < 3; i++) {
       let requestId: string | undefined;
       try {
@@ -1508,13 +1519,17 @@ async function run66(): Promise<void> {
         requestId = err instanceof CtnApiError ? err.requestId : undefined;
       }
       if (!requestId) continue;
+      inspected++;
       const detail = await (await fetch(`${COORD}/v1/requests/${requestId}`)).json();
       assert(
         !detail.attempts.some((a: any) => a.credential_id === cred.id),
         `a revoked credential was dispatched to on request ${requestId}`
       );
     }
-    return `undefined status=400 CTN_INVALID_STATUS (inert), re-activation=409 CTN_CREDENTIAL_DELETED, 0 attempts after revocation`;
+    // Without this, a stack that produced no requests at all would report "0
+    // attempts after revocation" — a true sentence about nothing.
+    assert(inspected > 0, "no request reached the coordinator, so the traffic check proved nothing");
+    return `undefined status=400 CTN_INVALID_STATUS (inert), re-activation=409 CTN_CREDENTIAL_DELETED, 0 attempts across ${inspected} request(s)`;
   });
 }
 

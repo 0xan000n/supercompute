@@ -16,7 +16,7 @@ const DB_FILE = join(tmpdir(), `ctn-routing-test-${randomUUID()}.sqlite`);
 process.env.CTN_DB_PATH = DB_FILE;
 
 const { db, migrate, nowIso } = await import("./db.js");
-const { recordAssumedUsage } = await import("./routing.js");
+const { applyAttemptOutcome, recordAssumedUsage } = await import("./routing.js");
 
 migrate();
 
@@ -121,6 +121,56 @@ test("a rejected assumed-usage write rolls back the cap counters", () => {
  * An unknown outcome with no priceable bound still consumed a request slot.
  * Pins the `?? 0` at the call site: zero dollars is not zero requests.
  */
+interface StatusRow {
+  status: string;
+  failure_count: number;
+}
+function credentialRow(id: string): StatusRow {
+  return db
+    .prepare(`SELECT status, failure_count FROM credentials WHERE id = ?`)
+    .get(id) as unknown as StatusRow;
+}
+
+/**
+ * §50 — revocation is terminal, including against our own failure handler.
+ *
+ * `auth_failed` disables the credential, and a dispatch already in flight when
+ * the owner revokes lands here afterwards. A plain `SET status = 'DISABLED'`
+ * would move a DELETED row into a status that PATCH is allowed to flip back to
+ * ACTIVE — resurrecting, by way of a failure handler, exactly the key the owner
+ * revoked. The e2e suite covers the API surface of that rule (case 66); this
+ * covers the race, which no request sequence can schedule on purpose.
+ */
+test("an auth_failed outcome cannot resurrect a revoked credential", () => {
+  seedCredential("cred_revoked", "contrib_revoked");
+  db.prepare(`UPDATE credentials SET status = 'DELETED' WHERE id = ?`).run("cred_revoked");
+
+  const action = applyAttemptOutcome("cred_revoked", "FAILED", "auth_failed");
+
+  const row = credentialRow("cred_revoked");
+  assert.equal(row.status, "DELETED", "a revoked credential must not come back as DISABLED");
+  // The bookkeeping still has to happen: the guard is about the status column,
+  // not about pretending the failed attempt did not occur.
+  assert.equal(row.failure_count, 1, "the failure is still counted");
+  assert.equal(action.action, "disabled", "the policy applied is still 'disable'");
+});
+
+/**
+ * The other half of the same guard: it must not blunt a legitimate disable. A
+ * CASE expression that got its condition backwards would pass the test above
+ * and leave every auth-failing credential ACTIVE, retried on every request.
+ */
+test("an auth_failed outcome still disables a live credential", () => {
+  seedCredential("cred_live", "contrib_live");
+  assert.equal(credentialRow("cred_live").status, "ACTIVE");
+
+  applyAttemptOutcome("cred_live", "FAILED", "auth_failed");
+
+  const row = credentialRow("cred_live");
+  assert.equal(row.status, "DISABLED", "a provider-rejected credential must leave the pool");
+  assert.equal(row.failure_count, 1);
+});
+
 test("a zero-dollar assumed spend still consumes a request slot", () => {
   seedCredential("cred_zero", "contrib_zero");
   seedRequest("req_zero");
