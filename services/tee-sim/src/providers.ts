@@ -9,6 +9,7 @@
  */
 import type { AuthorizedRequest, AuthorizedCredential } from "./authorize.js";
 import { canonicalHash, sha256Hex } from "@ctn/protocol";
+import { MODEL_CATALOG } from "./catalog.js";
 import {
   assertPriced,
   estimateCostMicroUsd,
@@ -29,12 +30,15 @@ function allowlist(): string[] {
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
-  return [
-    "api.openai.com:443",
-    "api.anthropic.com:443",
-    "generativelanguage.googleapis.com:443",
-    ...extra,
-  ];
+  /**
+   * Exactly the hosts we have an adapter for. Google was listed before any
+   * Google adapter existed: a standing hole in the only control that decides
+   * where a contributed key can be sent, kept open for a provider we do not
+   * call. The allowlist is the boundary, so it names implemented providers and
+   * nothing else; `CTN_EGRESS_ALLOWLIST` carries the local mock and any
+   * operator-declared extra.
+   */
+  return ["api.openai.com:443", "api.anthropic.com:443", ...extra];
 }
 
 export function assertEgressAllowed(url: string): void {
@@ -97,6 +101,12 @@ export type ProviderOutcome =
 
 export interface ProviderAdapter {
   readonly name: string;
+  /**
+   * The models this adapter offers. Readable, not just testable through
+   * `supportsModel`: the catalog endpoint (§5.1) has to publish what a provider
+   * can serve, and enumerating it by probing every string is not an enumeration.
+   */
+  readonly models: readonly string[];
   supportsModel(model: string): boolean;
   /**
    * Accepts ONLY an AuthorizedRequest and an AuthorizedCredential (§69) — there
@@ -159,7 +169,7 @@ export class OpenAICompatibleAdapter implements ProviderAdapter {
   constructor(
     readonly name: string,
     private readonly baseUrl: string,
-    private readonly models: string[]
+    readonly models: readonly string[]
   ) {}
 
   /**
@@ -382,7 +392,7 @@ export class AnthropicAdapter implements ProviderAdapter {
   constructor(
     readonly name: string,
     private readonly baseUrl: string,
-    private readonly models: string[]
+    readonly models: readonly string[]
   ) {}
 
   /** See `OpenAICompatibleAdapter.supportsModel` — a model we cannot price is a
@@ -525,11 +535,18 @@ export class AnthropicAdapter implements ProviderAdapter {
   }
 }
 
+/**
+ * §5.1 — the registry's models come FROM `MODEL_CATALOG`, never from a literal
+ * beside it. The old version handed all three demo model IDs to both adapters,
+ * so `openai` claimed to serve `ctn/demo-model-*` and the catalog a contributor
+ * seals an intent against and the list the router checks capability with were
+ * two different facts that happened to be maintained together.
+ */
 export function buildRegistry(): Map<string, ProviderAdapter> {
-  const models = ["ctn/demo-model-a", "ctn/demo-model-b", "ctn/demo-model-fast"];
   const registry = new Map<string, ProviderAdapter>();
   const mockUrl = process.env.MOCK_PROVIDER_URL ?? "http://127.0.0.1:4300";
-  registry.set("mock", new OpenAICompatibleAdapter("mock", mockUrl, models));
-  registry.set("openai", new OpenAICompatibleAdapter("openai", "https://api.openai.com", models));
+  registry.set("mock", new OpenAICompatibleAdapter("mock", mockUrl, [...MODEL_CATALOG.mock]));
+  registry.set("openai", new OpenAICompatibleAdapter("openai", "https://api.openai.com", [...MODEL_CATALOG.openai]));
+  registry.set("anthropic", new AnthropicAdapter("anthropic", "https://api.anthropic.com", [...MODEL_CATALOG.anthropic]));
   return registry;
 }

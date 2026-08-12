@@ -2,7 +2,14 @@ import { test, after } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import { sha256Hex } from "@ctn/protocol";
-import { AnthropicAdapter, OpenAICompatibleAdapter } from "./providers.js";
+import {
+  AnthropicAdapter,
+  OpenAICompatibleAdapter,
+  assertEgressAllowed,
+  buildRegistry,
+  EgressDeniedError,
+} from "./providers.js";
+import { MODEL_CATALOG } from "./catalog.js";
 
 // The §69 gate blocks direct construction of authorized values; adapter unit
 // tests only need the structural fields complete() reads.
@@ -224,4 +231,18 @@ test("negative or non-integer usage counts are malformed", async () => {
   const outcome = await adapter.complete(request, credential);
   assert.ok(!outcome.ok);
   assert.equal(outcome.classification, "malformed_response");
+});
+
+test("egress allowlist is exactly the implemented providers", () => {
+  delete process.env.CTN_EGRESS_ALLOWLIST;
+  assertEgressAllowed("https://api.anthropic.com/v1/messages");
+  assertEgressAllowed("https://api.openai.com/v1/chat/completions");
+  assert.throws(() => assertEgressAllowed("https://generativelanguage.googleapis.com/v1"), EgressDeniedError);
+});
+
+test("registry models come from the catalog — one source of truth", () => {
+  const r = buildRegistry();
+  for (const [provider, models] of Object.entries(MODEL_CATALOG)) {
+    assert.deepEqual([...r.get(provider)!.models], [...models], provider);
+  }
 });
