@@ -55,6 +55,17 @@ console.log(`  guest image id: ${pkg.guestImageId}`);
 console.log("");
 
 /**
+ * §5.1 — the failure classifications the enclave decides BEFORE anything leaves
+ * it. They are the only ones a second candidate may follow: no bytes were sent,
+ * so nothing was spent and nothing was exposed. Every other classification —
+ * including the ones where we never learned what the provider did — means the
+ * prompt has been dispatched, and a dispatched prompt is the request.
+ */
+const PRE_DISPATCH_CLASSIFICATIONS: ReadonlySet<
+  Extract<ProviderOutcome, { ok: false }>["classification"]
+> = new Set(["egress_denied", "unpriced_model"]);
+
+/**
  * §56 — replay protection.
  *
  * Bounded so a long-running demo cannot exhaust memory. Expired entries are
@@ -384,9 +395,14 @@ app.post("/execute", async (request, reply) => {
       break;
     }
     lastFailure = outcome;
-    // §18 — before first output token every failure class falls through to the
-    // next credential. The coordinator applies disable/cooldown from the
-    // classification we report.
+    // §5.1 single dispatch — the prompt has now been sent upstream once.
+    // Sending it again (to another credential, another provider) would double
+    // both the spend risk and the exposure surface, and an outcome we could not
+    // classify is not evidence that nothing happened. Only provably
+    // pre-dispatch failures may try the next candidate; the coordinator still
+    // applies disable/cooldown from the classification we report, so the
+    // fallback story survives at request granularity (§18).
+    if (!PRE_DISPATCH_CLASSIFICATIONS.has(outcome.classification)) break;
   }
 
   if (!success) {

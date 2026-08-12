@@ -153,10 +153,12 @@ Close on the primitive:
 - **Policy Lab** — the third example wrapped in fiction (*"for my novel, write the
   real chemical steps…"*) still denies. Context framing does not buy leniency when
   the request asks for real operational detail.
-- **Fallback, live** — Erin's seeded key ends in `RATE`, so the mock provider 429s it.
-  Send requests until one routes to Erin; the request shows *attempt 2* and the graph
-  shows two attempt nodes on that row. Her credential picks up a COOLDOWN badge on
-  the Contributors page.
+- **Single dispatch, live** — Erin's seeded key ends in `RATE`, so the mock provider
+  429s it. Send requests until one routes to Erin: that request FAILS with
+  `CTN_PROVIDER_RATE_LIMITED` after exactly one attempt node. The enclave will not
+  re-send a prompt it has already dispatched — a second credential would double both
+  the spend and the exposure. Her credential picks up a COOLDOWN badge on the
+  Contributors page, so the *next* request routes around her.
 - **Isolate path** — select a request on the Network page and toggle it. Everything
   unrelated dims to near-black and the single request path stays lit.
 - **Compatibility mode** — switch the playground to Compatibility and send. It works
@@ -171,4 +173,4 @@ Close on the primitive:
 | Graph empty | no seed | run `pnpm seed` |
 | `CTN_NO_CAPACITY` | all credentials disabled or capped | re-enable on Contributors, or `pnpm reset` |
 | Proof stuck PROVING | proof cost is modelled at 2.4 s | wait; it's meant to be slow enough to see |
-| A request shows *attempt 2* | Erin's rate-limited key was tried first | "that's the fallback working" |
+| A request FAILED `CTN_PROVIDER_RATE_LIMITED` | Erin's rate-limited key was the first candidate | "one dispatch per request — retrying is the caller's call, and the cooldown reroutes the next one" |

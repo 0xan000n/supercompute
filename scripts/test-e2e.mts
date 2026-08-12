@@ -24,7 +24,13 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 
-import { ComputeTrustClient, CtnApiError, PolicyDeniedError, type AttestationEnvelope } from "@ctn/client";
+import {
+  ComputeTrustClient,
+  CtnApiError,
+  PolicyDeniedError,
+  type AttestationEnvelope,
+  type CompletionResult,
+} from "@ctn/client";
 import {
   canonicalJson,
   generateHpkeKeyPair,
@@ -134,6 +140,46 @@ function discoverCoordinatorLogFile(): string | null {
     /* lsof unavailable or nothing listening */
   }
   return null;
+}
+
+/**
+ * §5.1 — classifications the enclave decides BEFORE anything leaves it. Only
+ * these may be followed by another candidate; everything else means the prompt
+ * has already been sent upstream once.
+ */
+const PRE_DISPATCH_CLASSIFICATIONS = new Set(["egress_denied", "unpriced_model"]);
+
+/**
+ * §5.1 — the enclave dispatches once and reports what happened; it never
+ * retries on the caller's behalf, so a caller who wants resilience retries
+ * itself. Erin's seeded key 429s by design, and every test below whose subject
+ * is something other than provider availability is such a caller: routing may
+ * hand it her credential, and that is a fact about the network, not a failure
+ * of the property under test. Only a rate limit is absorbed — anything else
+ * still fails loudly.
+ */
+async function completionRetryingRateLimits(
+  input: { model: string; messages: Array<{ role: string; content: string }> },
+  tries = 3
+): Promise<CompletionResult> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await client.completion(input);
+    } catch (err) {
+      const rateLimited = err instanceof CtnApiError && err.code === "CTN_PROVIDER_RATE_LIMITED";
+      if (!rateLimited || attempt >= tries) throw err;
+    }
+  }
+}
+
+/** The attempts on a request that actually put bytes on the wire. */
+function dispatchedAttempts(attempts: any[]): any[] {
+  return attempts.filter((a) => !PRE_DISPATCH_CLASSIFICATIONS.has(String(a.classification)));
+}
+function describeAttempts(attempts: any[]): string {
+  return `[${attempts
+    .map((a) => `#${a.attempt_number} ${a.credential_id} ${a.status}/${a.classification ?? "-"}`)
+    .join(", ")}]`;
 }
 
 async function getCredentials(): Promise<any[]> {
@@ -381,7 +427,7 @@ async function run56_6(): Promise<void> {
 
 /** Runs one legit ALLOW request through to a settled (non-PROVING) proof. */
 async function completeAndWaitForProof(tag: string): Promise<{ requestId: string; commitment: string }> {
-  const result = await client.completion({
+  const result = await completionRetryingRateLimits({
     model: MODEL_A,
     messages: [{ role: "user", content: `${tag} ${randomUUID()}` }],
   });
@@ -609,26 +655,44 @@ async function run55_14(): Promise<void> {
 }
 
 async function run55_15(): Promise<void> {
-  await test("55.15", "credential 429 -> cooldown set, fallback/capacity behavior", async () => {
+  await test("55.15", "credential 429 -> request fails after one dispatch, cooldown reroutes the NEXT request", async () => {
     const creds = await getCredentials();
     const erin = creds.find((c) => c.label.toLowerCase().includes("erin"));
     assert(erin, "Erin's credential not found");
     const others = creds.filter(
       (c) => c.status === "ACTIVE" && c.id !== erin.id && c.capability.allowedModels.includes(MODEL_FAST)
     );
+    assert(others.length > 0, "test setup assumption broken: no other credential serves demo-model-fast");
 
+    // Earlier routing tests may already have 429'd Erin and left her cooling
+    // down; this test needs her dispatchable. The status write clears
+    // cooldown_until as a side effect.
+    await patchCredential(erin.id, { status: "ACTIVE" });
     for (const o of others) await patchCredential(o.id, { status: "DISABLED" });
     try {
-      let outcome: "success" | "capacity_error";
+      // §5.1 single dispatch: the 429 IS this request's outcome. It is not a
+      // waypoint on the way to somebody else's key.
+      let code: string | undefined;
+      let failedRequestId: string | undefined;
       try {
         await client.completion({
           model: MODEL_FAST,
           messages: [{ role: "user", content: `route-erin-429 ${randomUUID()}` }],
         });
-        outcome = "success";
-      } catch {
-        outcome = "capacity_error";
+      } catch (err) {
+        code = err instanceof CtnApiError ? err.code : `non-CtnApiError: ${String(err)}`;
+        failedRequestId = err instanceof CtnApiError ? err.requestId : undefined;
       }
+      assert(code === "CTN_PROVIDER_RATE_LIMITED", `expected CTN_PROVIDER_RATE_LIMITED, got ${code}`);
+      assert(failedRequestId, "the client did not surface the failed request id");
+
+      const detail = await (await fetch(`${COORD}/v1/requests/${failedRequestId}`)).json();
+      const dispatched = dispatchedAttempts(detail.attempts);
+      assert(dispatched.length === 1, `expected exactly 1 dispatched attempt, got ${describeAttempts(dispatched)}`);
+      assert(
+        dispatched[0].credential_id === erin.id,
+        `the dispatched attempt should be Erin's ${erin.id}, got ${dispatched[0].credential_id}`
+      );
 
       const credsAfter = await getCredentials();
       const erinAfter = credsAfter.find((c) => c.id === erin.id);
@@ -636,11 +700,25 @@ async function run55_15(): Promise<void> {
         erinAfter?.cooldownUntil,
         `expected Erin's credential to have cooldownUntil set after a 429, got ${JSON.stringify(erinAfter?.cooldownUntil)}`
       );
-      return `outcome=${outcome}, Erin cooldownUntil=${erinAfter.cooldownUntil}`;
+
+      // The old fallback story, now told at REQUEST granularity: with the pool
+      // back and Erin cooling down, the next request routes around her.
+      for (const o of others) await patchCredential(o.id, { status: "ACTIVE" });
+      const followUp = await client.completion({
+        model: MODEL_FAST,
+        messages: [{ role: "user", content: `route-erin-429-followup ${randomUUID()}` }],
+      });
+      assert(followUp.route, "the follow-up request produced no route");
+      assert(
+        followUp.route.credential_id !== erin.id,
+        `the follow-up must not route back to the cooling-down credential ${erin.id}`
+      );
+      return `429 → FAILED ${code} after 1 dispatch; Erin cooldownUntil=${erinAfter.cooldownUntil}; follow-up → ${followUp.route.credential_id}`;
     } finally {
       for (const o of others) await patchCredential(o.id, { status: "ACTIVE" });
-      // Clears cooldown_until as a side effect of the status write.
-      await patchCredential(erin.id, { status: "ACTIVE" });
+      // Erin is deliberately left cooling down: under single dispatch a request
+      // that lands on her FAILS instead of falling back, and the tests after
+      // this one are about other things. Test 63 re-arms her when it needs her.
     }
   });
 }
@@ -677,7 +755,7 @@ async function run54_17(): Promise<void> {
     const uuid = randomUUID();
     const canary = `CANARY_PRIVATE_PROMPT_${uuid}`;
 
-    const result = await client.completion({
+    const result = await completionRetryingRateLimits({
       model: MODEL_A,
       messages: [{ role: "user", content: `Please just repeat this token back to me: ${canary}` }],
     });
@@ -770,7 +848,7 @@ async function run53_18(): Promise<void> {
 
 async function run36_19(): Promise<void> {
   await test("36.19", "ALLOW -> exactly one policy proof job created", async () => {
-    const result = await client.completion({
+    const result = await completionRetryingRateLimits({
       model: MODEL_A,
       messages: [{ role: "user", content: `invariant-36.19 ${randomUUID()}` }],
     });
@@ -795,7 +873,7 @@ async function run36_19(): Promise<void> {
 
 async function run36_20(): Promise<void> {
   await test("36.20", "proof journal commitment equals compute receipt commitment", async () => {
-    const result = await client.completion({
+    const result = await completionRetryingRateLimits({
       model: MODEL_A,
       messages: [{ role: "user", content: `invariant-36.20 ${randomUUID()}` }],
     });
@@ -813,7 +891,7 @@ async function run36_20(): Promise<void> {
 
 async function run36_21(): Promise<void> {
   await test("36.21", "proof journal contains no prompt-derived fields", async () => {
-    const result = await client.completion({
+    const result = await completionRetryingRateLimits({
       model: MODEL_A,
       messages: [{ role: "user", content: `invariant-36.21 ${randomUUID()}` }],
     });
@@ -1039,6 +1117,76 @@ async function run60(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// §5.1 SINGLE DISPATCH
+// ---------------------------------------------------------------------------
+
+async function run63(): Promise<void> {
+  await test("63", "single dispatch: a dispatched failure never falls through to a second credential", async () => {
+    const creds = await getCredentials();
+    const erin = creds.find((c) => c.label.toLowerCase().includes("erin"));
+    assert(erin, "Erin's rate-limited credential not found");
+    const alternatives = creds.filter(
+      (c) => c.status === "ACTIVE" && c.id !== erin.id && c.capability.allowedModels.includes(MODEL_FAST)
+    );
+    // The whole point is that a second eligible credential EXISTS and is still
+    // not used. Without one this test would pass vacuously.
+    assert(
+      alternatives.length >= 1,
+      "precondition: demo-model-fast needs a second eligible credential for the loop to fall through TO"
+    );
+
+    // Test 55.15 leaves her cooling down; this one needs her back in the pool.
+    await patchCredential(erin.id, { status: "ACTIVE" });
+
+    // Routing is least-recently-used, so Erin becomes the head candidate within
+    // one rotation of the pool — find the request that reached her rather than
+    // assuming an ordering. Her 429 puts her in cooldown, so there is exactly
+    // one such request per run.
+    let probe: { requestId: string; attempts: any[]; request: any } | null = null;
+    try {
+      for (let i = 0; i < alternatives.length + 4 && !probe; i++) {
+        let requestId: string;
+        try {
+          requestId = (
+            await client.completion({
+              model: MODEL_FAST,
+              messages: [{ role: "user", content: `single-dispatch-${i} ${randomUUID()}` }],
+            })
+          ).requestId;
+        } catch (err) {
+          if (!(err instanceof CtnApiError) || !err.requestId) throw err;
+          requestId = err.requestId;
+        }
+        const detail = await (await fetch(`${COORD}/v1/requests/${requestId}`)).json();
+        if (detail.attempts.some((a: any) => a.credential_id === erin.id)) {
+          probe = { requestId, attempts: detail.attempts, request: detail.request };
+        }
+      }
+      assert(probe, `Erin's credential was never dispatched to across ${alternatives.length + 4} requests`);
+
+      const dispatched = dispatchedAttempts(probe.attempts);
+      assert(
+        dispatched.length === 1,
+        `expected exactly 1 dispatched attempt, got ${dispatched.length}: ${describeAttempts(probe.attempts)}`
+      );
+      assert(
+        probe.request.status === "FAILED",
+        `expected FAILED, got ${probe.request.status} — the 429 fell through to another credential`
+      );
+      assert(
+        probe.request.errorCode === "CTN_PROVIDER_RATE_LIMITED",
+        `expected CTN_PROVIDER_RATE_LIMITED, got ${probe.request.errorCode}`
+      );
+      return `request ${probe.requestId} stopped at ${describeAttempts(probe.attempts)} with ${alternatives.length} eligible credential(s) left unused`;
+    } finally {
+      // Erin's 429 leaves a 60s cooldown behind, which would deny the next run
+      // of this suite the very dispatch it needs. The status write clears it.
+      await patchCredential(erin.id, { status: "ACTIVE" });
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -1099,6 +1247,9 @@ async function main(): Promise<void> {
 
   console.log("\n=== §50 CAPABILITY IMMUTABILITY ===");
   await run60();
+
+  console.log("\n=== §5.1 SINGLE DISPATCH ===");
+  await run63();
 
   // ---- Summary ----
   console.log("\n\n=========================== SUMMARY ===========================");
