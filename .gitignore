@@ -1,0 +1,8 @@
+node_modules/
+.next/
+.data/
+*.tsbuildinfo
+.DS_Store
+apps/web/AGENTS.md
+apps/web/CLAUDE.md
+.vercel

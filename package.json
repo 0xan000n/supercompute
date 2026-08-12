@@ -1,0 +1,27 @@
+{
+  "name": "compute-trust-network",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "seed": "tsx scripts/seed-demo.ts",
+    "reset": "node scripts/reset.mjs",
+    "test": "pnpm -r --if-present test",
+    "test:e2e": "tsx scripts/test-e2e.mts",
+    "privacy-test": "tsx scripts/privacy-test.ts",
+    "verify-receipt": "tsx scripts/verify-receipt.ts",
+    "write-fixtures": "tsx scripts/write-fixtures.ts",
+    "build": "pnpm --filter @ctn/web build"
+  },
+  "dependencies": {
+    "@ctn/client": "workspace:*",
+    "@ctn/policy": "workspace:*",
+    "@ctn/protocol": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

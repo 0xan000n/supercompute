@@ -1,0 +1,63 @@
+{
+  "version": "1.0.0",
+  "normalizer": "unicode-nfkc-fold-v1",
+  "intentBonus": 30,
+  "constructionBonus": 25,
+  "intentPhrases": [
+    "how do i", "how to", "how can i", "how could i", "steps to", "step by step",
+    "give me", "give me instructions", "instructions for", "instructions to", "guide me",
+    "walk me through", "teach me to", "teach me how", "show me how", "help me",
+    "tell me how", "write me", "provide detailed", "detailed steps",
+    "recipe for", "tutorial", "what is the best way to", "easiest way to",
+    "explain how to", "i want to", "i need to", "i am trying to"
+  ],
+  "constructionVerbs": [
+    "build", "make", "create", "construct", "assemble", "synthesize", "synthesise",
+    "produce", "manufacture", "cook", "brew", "compile", "write", "craft", "design",
+    "obtain", "acquire", "deploy", "execute", "launch", "carry out", "commit", "set up"
+  ],
+  "modifierSuppressors": [
+    "the real", "real chemical", "real instructions", "actual steps", "exact steps",
+    "exactly how", "really works", "actually works", "for real", "no rules"
+  ],
+  "categories": {
+    "P1": { "name": "Credential theft / phishing", "threshold": 60 },
+    "P2": { "name": "Destructive malware", "threshold": 60 },
+    "P3": { "name": "Actionable violent wrongdoing", "threshold": 60 },
+    "P4": { "name": "Weapons construction", "threshold": 60 },
+    "P5": { "name": "Sexual exploitation of minors", "threshold": 40 },
+    "P6": { "name": "Serious fraud facilitation", "threshold": 60 },
+    "P7": { "name": "Self-harm facilitation", "threshold": 45 }
+  },
+  "targets": [
+    { "id": "t.phish.kit", "category": "P1", "weight": 40, "phrases": ["phishing", "phishing page", "phishing email", "phishing kit", "fake login page", "clone a website to steal", "spoof the login", "spoofed bank"] },
+    { "id": "t.phish.creds", "category": "P1", "weight": 30, "phrases": ["credential harvest", "harvest credentials", "steal passwords", "steal credentials", "steal login", "capture their password", "impersonate the bank", "mimic paypal login"] },
+
+    { "id": "t.malware.generic", "category": "P2", "weight": 30, "phrases": ["malware", "malicious software"] },
+    { "id": "t.malware.ransom", "category": "P2", "weight": 40, "phrases": ["ransomware", "encrypt the victim", "encrypts a victim", "wiper malware", "destroys their files", "destroy their files", "keylogger", "rootkit", "botnet", "trojan that", "self replicating worm", "computer worm"] },
+    { "id": "t.malware.payload", "category": "P2", "weight": 30, "phrases": ["malicious payload", "reverse shell", "backdoor", "exfiltrate data", "exfiltrates data", "bypass antivirus", "bypasses antivirus", "disable the antivirus", "evade detection", "evades detection", "hides from edr", "hide from edr"] },
+
+    { "id": "t.violence.severe", "category": "P3", "weight": 40, "phrases": ["murder", "assassinate", "mass shooting", "school shooting", "mass stabbing", "mass casualties", "maximize casualties", "poison someone", "eliminate and murder"] },
+    { "id": "t.violence.kill", "category": "P3", "weight": 25, "phrases": ["kill", "shoot", "stab", "strangle", "attack"] },
+    { "id": "t.violence.person", "category": "P3", "weight": 20, "phrases": ["someone", "a person", "my coworker", "my neighbor", "my wife", "my husband", "my ex", "a specific person", "a crowd", "crowded place", "public event", "public place", "the most people", "as many people"] },
+
+    { "id": "t.weapons.explosive", "category": "P4", "weight": 40, "phrases": ["bomb", "explosive", "pipe bomb", "ied", "detonator", "grenade", "napalm", "thermite"] },
+    { "id": "t.weapons.cbrn", "category": "P4", "weight": 45, "phrases": ["nerve agent", "sarin", "vx gas", "mustard gas", "bioweapon", "biological weapon", "weaponize anthrax", "weaponize a virus", "dirty bomb", "enrich uranium", "chemical weapon"] },
+    { "id": "t.weapons.firearm", "category": "P4", "weight": 30, "phrases": ["untraceable gun", "ghost gun", "full auto conversion", "convert it to full auto", "convert to full auto", "auto sear", "3d printed firearm"] },
+
+    { "id": "t.fraud.instrument", "category": "P6", "weight": 40, "phrases": ["counterfeit money", "counterfeit currency", "clone credit cards", "credit card skimmer", "carding", "launder money", "money laundering", "fake passport", "forge a passport", "forge identity documents", "identity documents", "wire fraud", "ponzi scheme to defraud", "tax evasion scheme"] },
+    { "id": "t.fraud.identity", "category": "P6", "weight": 25, "phrases": ["steal someone identity", "open accounts in their name", "bypass kyc", "defraud"] },
+
+    { "id": "t.selfharm", "category": "P7", "weight": 45, "phrases": ["kill myself", "end my life", "commit suicide", "how to overdose", "lethal dose", "hang myself", "ways to die", "die painlessly", "help me die"] }
+  ],
+  "hardBlocks": [
+    { "id": "hb.csam", "category": "P5", "phrases": ["child sexual", "child porn", "csam", "sexualize a child", "sexualize a minor", "sexual content involving a minor", "sexual content involving children", "minor in a sexual", "underage sexual"] }
+  ],
+  "modifiers": [
+    { "id": "m.fiction", "weight": -25, "phrases": ["novel", "for my story", "in my story", "for my book", "in my book", "short story", "fictional", "for a screenplay", "for my screenplay", "for my thriller", "character in my", "in the movie", "science fiction", "write a scene"] },
+    { "id": "m.history", "weight": -30, "phrases": ["in history", "historically", "during world war", "world war", "19th century", "20th century", "ancient", "historical account", "documentary", "medieval"] },
+    { "id": "m.education", "weight": -35, "phrases": ["for my chemistry class", "for a research paper", "for a biology exam", "academic understanding", "to understand the science", "for educational purposes", "in general terms", "general principle", "at a conceptual level", "explain conceptually", "for a high school essay", "for an essay", "for a blog post", "for a documentary"] },
+    { "id": "m.defense", "weight": -50, "phrases": ["to protect against", "protect against", "to defend against", "defend against", "how to detect", "how do i detect", "how can i detect", "detect and prevent", "how to prevent", "how do i prevent", "how can i prevent", "as a security researcher defending", "defending our", "to secure my", "harden my system", "how to recognize", "recognize", "how to spot", "spot a phishing", "do not fall for", "avoid falling for", "warning signs", "how do i help", "find support", "identify a phishing", "and avoid one"] },
+    { "id": "m.technical", "weight": -25, "phrases": ["a process", "hung process", "on port", "the terminal", "linux", "docker", "container", "a thread", "a session", "this game", "strategy game", "the final boss", "turn based", "rpg", "weeds", "garden", "vegetable", "cron", "backup job", "sql query", "rest api"] }
+  ]
+}

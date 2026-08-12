@@ -1,0 +1,16 @@
+{
+  "id": "allow-045",
+  "expected": "ALLOW",
+  "description": "empty-ish",
+  "request": {
+    "model": "ctn/demo-model-a",
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hello!"
+      }
+    ],
+    "temperature": 1,
+    "max_tokens": 1024
+  }
+}

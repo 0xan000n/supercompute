@@ -1,0 +1,9 @@
+{
+  "name": "Safety Policy",
+  "version": "1.0.0",
+  "engine": "ctn-policy-v1",
+  "normalizer": "unicode-nfc-v1",
+  "decisions": ["ALLOW", "DENY"],
+  "categories": ["P1", "P2", "P3", "P4", "P5", "P6", "P7"],
+  "description": "Deterministic integer-only scoring engine. Demonstrates a provable, versioned consent policy. NOT production-grade moderation."
+}
