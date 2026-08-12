@@ -44,9 +44,9 @@ takes a while; several minutes is normal.
 | risc0 C++ toolchain | 2024.1.5 |
 | `risc0-zkvm` / `risc0-build` crates | 3.0.6 |
 
-Machine: Apple M1 Pro, 10 cores, 32 GB, macOS 26.0.1. Proving uses Metal
-acceleration, which risc0 selects automatically on Apple Silicon — no feature
-flag, no configuration.
+Machine: Apple M1 Pro, 10 cores, 32 GB, macOS 26.0.1. **Proving here is CPU-only.**
+Despite what the toolchain's shape suggests, risc0 3.0.6 does not use the GPU on
+Apple Silicon — see "Proving is CPU-only" below.
 
 ---
 
@@ -133,6 +133,12 @@ in the first version of this file:
 Verify runs immediately after proving on a receipt still in memory, so it is a
 cache-hot number. A verifier reading a receipt off disk would pay more.
 
+The table above is one run. A second full run of the same binary gave medians of
+17.3 / 18.9 ms (executor), 5.78 / 52.30 s (prove) and 12.9 / 14.9 ms (verify) —
+up to ~3.6% higher, which is *more* than the within-run spread at 4096 B. Treat
+these as ±5% figures on an otherwise-idle laptop, not as constants. Cycle counts,
+po2 and receipt sizes were byte-identical across both runs, as they should be.
+
 Guest image id `d094ec7bbac59857234c8c316573b591e5830ed9656fec4cf332440a0e19ff50`
 — it changes whenever the guest or its dependency graph does, which is the point.
 
@@ -159,23 +165,32 @@ fixed order with no warmup, so first-call cost landed entirely on the 256 B row.
 The conclusion survived the fix, but it had been argued from an artifact, which
 is why `--bench` now warms up and prints spread.
 
-**Proving cost tracks the padded total, and user cycles are a minority of it.**
-`total_cycles` comes out to exactly 2^po2 — 65,536 and 524,288 — with user,
-paging and reserved cycles summing to it precisely. User cycles are only 38% of
-the padded total at 256 B and 51% at 4096 B; the rest is paging and reserved
-overhead that does not shrink proportionally. **You therefore cannot predict po2
-from user cycles**, which is what an earlier version of this file tried to do
-when it claimed 24,927 and 65,535 cycles would both fit po2 16. They would not:
-at 256 B, 24,927 user cycles already pull in 40,609 cycles of paging and reserved
-overhead to reach 2^16, so a guest with 65,535 *user* cycles would spill well
-into po2 17.
+**Proving cost is set by paging as much as by arithmetic.** `reserved_cycles` is
+not overhead in the usual sense — risc0 documents it as "the number of cycles
+needed for the proof system which includes padding up to the nearest power of 2"
+(`session.rs`), and the arithmetic bears that out: `total_cycles` lands on exactly
+2^po2 in both rows, and `reserved` is whatever it takes to get there. The real
+work is **user + paging**, and reserved is the filler:
 
-Time scales near-linearly with padded rows: 8× the rows cost 8.85× the time
-(po2 16 → 19), or roughly 0.087–0.096 ms per row. Extrapolating for Tasks 4 and
-7: **~105 s at po2 20, ~210 s at po2 21.** The policy guest will do more per byte
-than sha256 does *and* carry more paging overhead, so expect it a po2 or two above
-this spike at equal input size — affordable off the request path, nowhere near
-affordable on it.
+| Input | User + paging | Rounds up to | Reserved (the filler) |
+|---|---|---|---|
+| 256 B | 49,797 | 65,536 = 2^16 | 15,739 |
+| 4096 B | 292,352 | 524,288 = 2^19 | 231,936 |
+
+That gives a usable predictive rule for Tasks 4 and 7:
+**po2 = ceil(log2(user_cycles + paging_cycles))**, and cost follows from po2.
+
+Two things fall out of it. Paging is half the real work at 256 B (24,870 against
+24,927 user cycles), so the policy guest's memory access pattern will move its po2
+as readily as its arithmetic will. And **po2 cannot be predicted from user cycles
+alone** — an earlier version of this file claimed 24,927 and 65,535 user cycles
+would both fit po2 16. They would not: 65,535 user cycles plus even this spike's
+modest ~25,000 paging cycles is ~90,000, which rounds to po2 17.
+
+Time then scales near-linearly with padded rows: 8× the rows cost 8.85× the time
+(po2 16 → 19), roughly 0.087–0.096 ms per row. Extrapolating: **~105 s at po2 20,
+~210 s at po2 21.** Expect the policy guest a po2 or two above this spike at equal
+input size — affordable off the request path, nowhere near affordable on it.
 
 **Composite receipts are ~250 KB and grow with execution length.** That is a
 storage and transport cost per receipt, not per policy. Compressing to Groth16
@@ -186,16 +201,36 @@ commits to a receipt format.
 
 ### What is not established
 
-**No CPU-versus-GPU comparison was run**, so nothing here quantifies what the GPU
-contributes. Metal acceleration is active, but not because of the `metal` cargo
-feature — in 3.0.6 that feature is a pure alias for `prove` and adds nothing else.
-`risc0-sys/build.rs` builds the Metal kernels for any `macos` or `ios` target
-unconditionally, with no feature gate, which is also why enabling `prove` is what
-made the Metal Toolchain a hard build requirement. The build therefore does not
-name `metal` at all. A suggestive but non-decisive data point: proving times were
-within noise of the earlier run against the external `r0vm` subprocess, and that
-binary is GPU-enabled too, so those two configurations differed in IPC overhead
-rather than in acceleration.
+### Proving is CPU-only
+
+The 50 s figure is a **CPU** number. Nothing here is GPU-accelerated, despite the
+Metal Toolchain being a hard build requirement and Metal kernels being compiled
+into the binary. In risc0 3.0.6 those kernels are dead code:
+
+- `risc0-circuit-rv32im-4.0.5/src/prove/mod.rs:46-54` — the Metal branch of
+  `segment_prover()` is **commented out**; the `cfg_if` falls through to
+  `hal::cpu::segment_prover()`.
+- `risc0-circuit-recursion-4.0.5/src/prove/mod.rs:83-91` — same shape for
+  `recursion_prover()`, falling through to `hal::cpu::recursion_prover(hashfn)`.
+- `risc0-circuit-recursion-4.0.5/src/prove/hal/mod.rs:26` — `// pub mod metal;`,
+  the module itself is commented out.
+
+`risc0-zkp-3.0.5/src/hal/metal.rs` still exists and is still a live module, so the
+low-level HAL is there; nothing in either circuit prover dispatches to it. The
+kernels are built (`risc0-sys/build.rs:35` compiles them for any `macos`/`ios`
+target, unconditionally and with no feature gate — which is why enabling `prove`
+is what made the Metal Toolchain a hard requirement) and then never called.
+
+This is also the actual explanation for something the previous version of this file
+got right by accident. In-process and external-`r0vm` proving times matched to
+within noise; that section attributed it to "both being GPU-enabled". They matched
+because **both are CPU**. The right conclusion, the wrong route.
+
+**What follows for the numbers:** a future risc0 that re-enables the Metal path
+would change proving time, possibly substantially, and this benchmark would need
+re-running. How much is unmeasured and not guessed at here. The one thing that can
+be said is that the ~50 s at 4 KB is what ten M1 Pro CPU cores cost, and that it is
+a ceiling a GPU path could only improve on.
 
 Two silent defaults in `risc0-zkvm` are worth recording, because both would have
 produced numbers describing something other than this machine.

@@ -20,8 +20,10 @@ methods = { path = "../methods" }
 #   "local", so neither the compile-time nor the runtime path can go remote
 #   without saying so.
 #
-# `metal` is deliberately absent: in 3.0.6 it is a pure alias for `prove`, and
-# Metal kernels are built by risc0-sys on any macOS target regardless.
+# `metal` is deliberately absent, and it would not buy anything anyway: in 3.0.6
+# it is a pure alias for `prove`, risc0-sys compiles the kernels on any macOS
+# target regardless, and both circuit provers have their Metal branches commented
+# out and fall through to CPU. Proving here is CPU-only. See prover/README.md.
 risc0-zkvm = { version = "^3.0.6", default-features = false, features = ["prove"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = "1.0"

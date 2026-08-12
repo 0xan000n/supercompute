@@ -294,9 +294,12 @@ fn bench() -> Result<()> {
             r.reserved_cycles,
             r.receipt_bytes
         );
-        debug_assert_eq!(
+        // Not debug_assert: --bench is documented to run under --release, where
+        // a debug assertion is compiled out and would never fire anywhere.
+        assert_eq!(
             r.session_user_cycles, r.stats_user_cycles,
-            "executor and prover disagree on user cycles"
+            "executor and prover disagree on user cycles at {} B",
+            r.size
         );
     }
 

@@ -456,6 +456,12 @@ Apple M1 Pro, 10 cores, 32 GB, macOS 26.0.1. risc0 3.0.6 (`cargo-risczero` 3.0.6
 Release build, in-process prover (enforced), dev mode off, three timed runs per
 measurement after one discarded warmup, median reported with min/max alongside.
 
+**These are CPU numbers.** risc0 3.0.6 compiles Metal kernels on macOS and then
+never calls them — the Metal branches of `segment_prover()` and
+`recursion_prover()` are commented out in both circuit crates, falling through to
+the CPU HAL. So this is what ten M1 Pro CPU cores cost, and a future risc0 that
+re-enables the GPU path would change it by an unmeasured amount.
+
 | Input | Executor only | Composite prove | Receipt (bincode) | Verify (cache-hot) |
 |---|---|---|---|---|
 | 256 B | 16.9 ms (15.5–22.4) | 5.70 s (5.61–5.81) | 216.1 KB | 12.2 ms |
@@ -465,6 +471,11 @@ measurement after one discarded warmup, median reported with min/max alongside.
 |---|---|---|---|---|---|---|
 | 256 B | 1 | 16 | 24,927 | 65,536 | 24,870 | 15,739 |
 | 4096 B | 1 | 19 | 265,498 | 524,288 | 26,854 | 231,936 |
+
+A second full run gave prove medians of 5.78 s and 52.30 s — up to ~3.6% higher,
+which exceeds the within-run spread at 4096 B. So the timings are ±5% figures, not
+constants, and a difference of a few percent between future runs means nothing.
+The cycle counts, po2 and receipt sizes were identical across both runs.
 
 **The model was optimistic by roughly 20×.** Phase 1 assumed 2.4 s of proving and
 observed ~2.9 s at p50. Real composite proving of a program that only hashes 4 KB
@@ -500,18 +511,19 @@ number whose sign was wrong, which is precisely the failure this document exists
 to catch. `--bench` now discards a warmup iteration per size and prints
 min/median/max.
 
-**Proving cost tracks the padded total, and user cycles are a minority of it.**
-`total_cycles` lands on exactly 2^po2 — 65,536 and 524,288 — with user, paging and
-reserved cycles summing to it exactly. User cycles are 38% of that total at 256 B
-and 51% at 4096 B; the remainder is paging and reserved overhead that does not
-shrink proportionally. So po2 cannot be predicted from user cycles: at 256 B,
-24,927 user cycles already drag in 40,609 cycles of overhead to fill 2^16, and a
-guest with 65,535 *user* cycles would spill into po2 17 rather than fitting po2 16
-as an earlier draft of this section asserted. Time then scales near-linearly with
-padded rows — 8× the rows cost 8.85× the time, about 0.09 ms per row —
-so the extrapolation for Tasks 4 and 7 is ~105 s at po2 20 and ~210 s at po2 21.
-The practical consequence is that the policy guest's proving cost will be set by
-its paging behaviour as much as by its arithmetic.
+**Proving cost is set by paging as much as by arithmetic.** `reserved_cycles` is
+documented as the cycles the proof system needs *including padding up to the
+nearest power of two*, and the numbers agree: `total_cycles` lands on exactly 2^po2
+in both rows, with reserved as the filler. The real work is user + paging — 49,797
+at 256 B, rounding to 2^16; 292,352 at 4096 B, rounding to 2^19 — which gives a
+usable rule for Tasks 4 and 7: **po2 = ceil(log2(user + paging))**. Note that
+paging is roughly half the real work at 256 B (24,870 against 24,927 user cycles),
+so the policy guest's memory access pattern will move its po2 as readily as its
+arithmetic. It also means po2 cannot be predicted from user cycles alone: an
+earlier draft of this section claimed 24,927 and 65,535 user cycles would both fit
+po2 16, but 65,535 plus even this spike's modest paging lands in po2 17. Time then
+scales near-linearly with padded rows — 8× the rows cost 8.85× the time, about
+0.09 ms per row — so the extrapolation is ~105 s at po2 20 and ~210 s at po2 21.
 
 **A composite receipt is ~250 KB.** The spec treats the proof as an artifact to be
 stored and independently verified; at a quarter of a megabyte each, growing with
@@ -542,9 +554,12 @@ already been written down as a result.
 `prove` is not a default feature. Without it, `default_prover` and
 `default_executor` fall back to an `r0vm` subprocess over IPC — silently, no error,
 no warning. The first run of this benchmark was taken that way and reported ~28 ms
-of executor latency; in-process and warm it is ~17 ms. For a measurement whose
-entire purpose is establishing a ~20 ms request-path budget, a silent default
-inflating it by half is exactly the kind of thing that gets quoted for a year.
+of executor latency; in-process and warm it is ~17 ms. That particular comparison
+is cold-against-warm — the ~28 ms predates the warmup fix — so it is indicative of
+the direction and rough size of the IPC cost, not a measurement of it. Even
+discounted for that, a silent default inflating the number by something like half,
+for a measurement whose entire purpose is establishing a ~20 ms request-path
+budget, is the kind of thing that gets quoted for a year.
 
 `bonsai` **is** a default feature, and `default_prover` tests for `BONSAI_API_URL`
 and `BONSAI_API_KEY` *before* it reaches the local branch. Had those variables
