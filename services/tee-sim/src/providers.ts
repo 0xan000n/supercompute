@@ -81,6 +81,15 @@ export type ProviderOutcome =
        * a class that reads as an upstream failure would blame a contributor for
        * a missing row in our own price table.
        *
+       * That intent is only half-enforced downstream, and the gap is worth
+       * naming: `applyAttemptOutcome` in the coordinator matches `auth_failed`
+       * and `rate_limited` by name and falls through to a generic branch that
+       * increments `failure_count`, so an `unpriced_model` attempt record would
+       * still count against the credential it was not the fault of. It is
+       * unreachable today — `supportsModel()` ANDs `isPriced()`, so an unpriced
+       * model is never dispatched to and never becomes an attempt — but anything
+       * that loosens that gate has to fix the coordinator's branch too.
+       *
        * §5.1 — `egress_denied` and `unpriced_model` are the ONLY classifications
        * decided before any bytes leave, and both carry `httpStatus: 0`. The
        * routing loop reads that distinction to decide whether another candidate

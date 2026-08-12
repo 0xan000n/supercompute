@@ -158,7 +158,10 @@ Close on the primitive:
   `CTN_PROVIDER_RATE_LIMITED` after exactly one attempt node. The enclave will not
   re-send a prompt it has already dispatched — a second credential would double both
   the spend and the exposure. Her credential picks up a COOLDOWN badge on the
-  Contributors page, so the *next* request routes around her.
+  Contributors page, so the *next* request routes around her. The cooldown is
+  60s (`CTN_COOLDOWN_MS`) — if you linger on this slide past a minute Erin comes
+  back into the pool and the next request can 429 again, which is the mechanism
+  working, not a glitch.
 - **Isolate path** — select a request on the Network page and toggle it. Everything
   unrelated dims to near-black and the single request path stays lit.
 - **Compatibility mode** — switch the playground to Compatibility and send. It works

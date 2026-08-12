@@ -305,9 +305,18 @@ set does not survive a restart: **a restarted enclave forgets, and a previously
 consumed envelope could be ingested once more.** What survives is structural rather
 than remembered — the credential id is sealed inside the intent, so a replay can only
 re-mint the *same* capability for the *same* contributor, never a second credential
-under a new id, and the coordinator's unique-id check refuses the duplicate row. A
-durable answer needs monotonic enclave state, which is the same systems problem §4
-already flags for usage counters.
+under a new id, and the coordinator's unique-id check refuses the duplicate row.
+
+It is also **unbounded by design**, and that is the deliberate half of the asymmetry
+with `seenNonces` ten lines above it, which has a TTL, a cap, and oldest-first
+eviction. Evicting a consumed intent digest would not trim memory so much as reopen
+the replay window this set exists to close — the whole point is that the digest is
+remembered *forever*, so an expiry is a scheduled vulnerability. The cost of not
+bounding it is roughly 100 bytes per successful ingest, which at demo scale (tens of
+contributions) is nothing, and the sealed `credentialId` means the worst case if it
+ever did evict is re-minting the *same* capability, not a new one. The fix is not a
+bigger `Set`: a durable answer needs monotonic enclave state, which is the same
+systems problem §4 already flags for usage counters.
 
 ### One dispatch per request
 
@@ -402,6 +411,25 @@ handler than of one field in it.
 
 What revocation still does **not** do is erase the sealed ciphertext from the enclave
 vault, so a key smoke-tested here should be rotated, or `pnpm reset` run afterwards.
+
+### `max_tokens` defaults rather than being required
+
+§5.1 lists `max_tokens` as required in the canonical request. It is not:
+`toCanonicalRequest` supplies `1024` when the caller omits one, and 35 of the
+prototype's call sites — the playground, the seed script, most of the e2e suite —
+rely on that default rather than passing a number.
+
+Recorded as a deviation rather than fixed, because the safety property the
+requirement protects still holds. `max_tokens` is load-bearing for exactly one thing:
+it is the ceiling in the assumed-spend bound above, so an absent one would make an
+unknown outcome unboundable. A default of 1024 is finite, so the bound is finite, and
+a contributor's cap still cannot be drained by a wedged provider. What is lost is
+whose ceiling it is — the protocol's, chosen once for every caller who did not think
+about it, rather than the contributor's or the caller's. `/v1/chat/completions` is
+also the reason the default cannot simply be deleted: OpenAI's own schema makes
+`max_tokens` optional, so the compatibility endpoint has to answer the question for
+SDKs that never ask it. Making it required means choosing a default *there* instead,
+which relocates this paragraph rather than retiring it.
 
 ---
 
