@@ -106,12 +106,6 @@ export const teeClient = {
       policyId: string;
     }>("/credentials/ingest", { method: "POST", body: JSON.stringify(body) }),
 
-  recapability: (capability: unknown) =>
-    call<{ capability: import("@ctn/protocol").CredentialCapability; capabilitySignature: string }>(
-      "/credentials/recapability",
-      { method: "POST", body: JSON.stringify({ capability }) }
-    ),
-
   execute: (envelope: SecureRequestEnvelope, candidates: Candidate[]) =>
     call<ExecuteResult>("/execute", {
       method: "POST",

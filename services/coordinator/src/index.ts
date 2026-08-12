@@ -308,10 +308,21 @@ app.patch("/v1/credentials/:id", async (request, reply) => {
   const { id } = request.params as { id: string };
   const body = request.body as {
     status?: "ACTIVE" | "DISABLED";
-    allowedModels?: string[];
     weight?: number;
     operationalLimits?: { dailyUsd?: number | null; dailyRequests?: number | null };
   };
+
+  // §50 — the capability is derived once, inside the enclave, from the sealed
+  // intent. Nothing downstream can widen it, so nothing downstream may edit it.
+  if ((request.body as Record<string, unknown>).allowedModels !== undefined) {
+    return reply.code(400).send({
+      error: {
+        code: "CTN_CAPABILITY_IMMUTABLE",
+        message: "Capabilities are immutable. Revoke this credential and contribute a new one.",
+      },
+    });
+  }
+
   const row = db.prepare(`SELECT * FROM credentials WHERE id = ?`).get(id) as
     | Record<string, unknown>
     | undefined;
@@ -329,18 +340,6 @@ app.patch("/v1/credentials/:id", async (request, reply) => {
     ).run(
       body.operationalLimits.dailyUsd ?? null,
       body.operationalLimits.dailyRequests ?? null,
-      id
-    );
-  }
-
-  // §50 — changing a cryptographically bound property mints a NEW capability
-  // version with a fresh enclave signature. The coordinator cannot do this itself.
-  if (body.allowedModels) {
-    const capability = JSON.parse(row.capability_json as string) as Record<string, unknown>;
-    const resigned = await teeClient.recapability({ ...capability, allowedModels: body.allowedModels });
-    db.prepare(`UPDATE credentials SET capability_json = ?, capability_signature = ? WHERE id = ?`).run(
-      JSON.stringify(resigned.capability),
-      resigned.capabilitySignature,
       id
     );
   }

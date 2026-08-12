@@ -18,7 +18,6 @@ import {
   sha256Hex,
   toCanonicalRequest,
   type ComputeReceipt,
-  type CredentialCapability,
   type CredentialIntentV1,
   type SecurePayload,
   type SecureRequestEnvelope,
@@ -208,16 +207,9 @@ app.post("/credentials/ingest", async (request, reply) => {
   };
 });
 
-/** Re-sign a capability after a contributor edits it (§50). */
-app.post("/credentials/recapability", async (request) => {
-  const body = request.body as { capability: CredentialCapability };
-  const capability: CredentialCapability = {
-    ...body.capability,
-    allowedModels: [...body.capability.allowedModels].sort(),
-    version: body.capability.version + 1,
-  };
-  return { capability, capabilitySignature: tee.signReceipt(capability) };
-});
+// §50 — there is deliberately no re-signing endpoint. A capability is derived
+// once, from one sealed intent, and never again: editing one means revoking the
+// credential and contributing a new sealed intent.
 
 // ---------------------------------------------------------------------------
 // The secure path

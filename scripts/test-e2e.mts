@@ -1005,6 +1005,39 @@ async function run59_5(): Promise<void> {
   });
 }
 
+async function run60(): Promise<void> {
+  await test("60", "capability widening is structurally impossible", async () => {
+    const creds = await getCredentials();
+    const anyCredentialId = creds.find((c) => c.status === "ACTIVE")?.id;
+    assert(anyCredentialId, "no seeded credential available to patch");
+    const before = creds.find((c) => c.id === anyCredentialId).capability;
+
+    const direct = await fetch(`${TEE}/credentials/recapability`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ capability: { credentialId: "cred_x", allowedModels: ["anything"] } }),
+    });
+    assert(direct.status === 404, `expected 404 from removed enclave endpoint, got ${direct.status}`);
+
+    const patch = await fetch(`${COORD}/v1/credentials/${anyCredentialId}`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ allowedModels: [MODEL_A, MODEL_B] }),
+    });
+    const json = await patch.json();
+    assert(patch.status === 400, `expected 400, got ${patch.status}`);
+    assert(json.error?.code === "CTN_CAPABILITY_IMMUTABLE", `got ${json.error?.code}`);
+
+    // The refusal must also be inert: nothing about the signed capability moved.
+    const after = (await getCredentials()).find((c) => c.id === anyCredentialId).capability;
+    assert(
+      canonicalJson(after) === canonicalJson(before),
+      `a refused PATCH must not touch the capability: ${canonicalJson(after)}`
+    );
+    return `enclave recapability=404, PATCH allowedModels=400 ${json.error?.code}, capability v${after.version} unchanged`;
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -1063,6 +1096,9 @@ async function main(): Promise<void> {
   console.log("\n=== §5.1 SEALED INTENT ===");
   await run59();
   await run59_5();
+
+  console.log("\n=== §50 CAPABILITY IMMUTABILITY ===");
+  await run60();
 
   // ---- Summary ----
   console.log("\n\n=========================== SUMMARY ===========================");
