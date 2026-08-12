@@ -87,6 +87,14 @@ export const teeClient = {
   buildManifest: () => call<Record<string, unknown>>("/build-manifest"),
 
   /**
+   * §5.1 — which providers the enclave has an adapter for, and the pinned
+   * snapshot ids each will serve. Relayed rather than mirrored here: a second
+   * copy of the catalog in this process is a copy that can drift from the one
+   * that actually validates sealed intents.
+   */
+  providers: () => call<ProviderCatalog>("/providers"),
+
+  /**
    * Relays the contributor's sealed intent verbatim. There is deliberately no
    * capability block here: everything the enclave will sign comes out of the
    * ciphertext, so this process has nothing to widen (§5.1).
@@ -136,6 +144,10 @@ export const teeClient = {
       keys?: Record<string, string>;
     }>("/verify", { method: "POST", body: JSON.stringify(body) }),
 };
+
+export interface ProviderCatalog {
+  providers: Array<{ provider: string; models: string[] }>;
+}
 
 export interface VerificationReport {
   valid: boolean;

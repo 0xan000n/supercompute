@@ -141,6 +141,21 @@ app.get("/attestation", async (request) => {
   };
 });
 
+/**
+ * §5.1 — the provider catalog, as the enclave actually holds it.
+ *
+ * Served from the live registry rather than from `MODEL_CATALOG` directly, so
+ * the list a contributor picks from is exactly the list of adapters that can be
+ * dispatched to: a catalog entry with no adapter would be an offer the enclave
+ * cannot honour, and a model the adapter will not serve is a capability the
+ * router would refuse later. The UI has no model constants of its own.
+ */
+app.get("/providers", async () => ({
+  providers: [...registry.entries()]
+    .map(([provider, adapter]) => ({ provider, models: [...adapter.models] }))
+    .sort((a, b) => a.provider.localeCompare(b.provider)),
+}));
+
 /** Public build manifest (§63) — what a contributor inspects before trusting. */
 app.get("/build-manifest", async () => ({
   enclaveMode: tee.mode,

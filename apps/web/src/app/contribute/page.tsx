@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import {
   ComputeTrustClient,
@@ -15,7 +15,14 @@ import { shortHash } from "@/lib/format";
 
 const client = new ComputeTrustClient(COORDINATOR);
 
-const MODELS = ["ctn/demo-model-a", "ctn/demo-model-b", "ctn/demo-model-fast"];
+/**
+ * §5.1 — what may be contributed is the enclave's catalog, fetched, not a list
+ * kept here. A model this page invented would seal an intent the enclave
+ * refuses at ingest, and a model it forgot would be capacity nobody can offer.
+ */
+interface ProviderCatalog {
+  providers: Array<{ provider: string; models: string[] }>;
+}
 
 /**
  * §12 — the contributor onboarding flow.
@@ -31,11 +38,15 @@ export default function ContributePage() {
     data: Array<{ id: string; display_name: string; credential_count: number }>;
   }>("/v1/contributors", 0);
 
+  const { data: catalog } = usePolled<ProviderCatalog>("/v1/providers", 0);
+  const providers = useMemo(() => catalog?.providers ?? [], [catalog]);
+
   const [step, setStep] = useState<Step>("capability");
   const [displayName, setDisplayName] = useState("");
   const [contributorId, setContributorId] = useState("");
   const [label, setLabel] = useState("");
-  const [allowedModels, setAllowedModels] = useState<string[]>([MODELS[0]]);
+  const [provider, setProvider] = useState("");
+  const [allowedModels, setAllowedModels] = useState<string[]>([]);
   const [dailyUsd, setDailyUsd] = useState("5");
   const [dailyRequests, setDailyRequests] = useState("100");
   const [weight, setWeight] = useState("1");
@@ -46,6 +57,27 @@ export default function ContributePage() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [created, setCreated] = useState<Record<string, unknown> | null>(null);
+
+  // The catalog arrives after the first paint, so the active provider is
+  // derived rather than stored. Mock leads when it is offered: it is the one
+  // provider this demo can exercise without spending anybody's money.
+  const activeProvider =
+    provider ||
+    providers.find((p) => p.provider === "mock")?.provider ||
+    providers[0]?.provider ||
+    "";
+  const catalogModels = useMemo(
+    () => providers.find((p) => p.provider === activeProvider)?.models ?? [],
+    [providers, activeProvider]
+  );
+
+  // One model pre-selected, as before — but a selection made under a different
+  // provider is not a narrower capability, it is an invalid one (the enclave
+  // checks allowedModels against THAT provider's catalog), so switching
+  // provider resets rather than merges.
+  useEffect(() => {
+    setAllowedModels(catalogModels.length > 0 ? [catalogModels[0]] : []);
+  }, [catalogModels]);
 
   // One source of truth for "is this attestation trustworthy", shared with the
   // panel on the right — two components asserting opposite verdicts about the
@@ -105,7 +137,7 @@ export default function ContributePage() {
       const result = await client.contributeCredential({
         contributorId: ownerId,
         label: label.trim() || "Contributed capacity",
-        provider: "mock",
+        provider: activeProvider,
         apiKey: apiKey.trim(),
         allowedModels,
         weight: Number(weight) || 1,
@@ -130,6 +162,7 @@ export default function ContributePage() {
     contributorId,
     displayName,
     label,
+    activeProvider,
     apiKey,
     allowedModels,
     weight,
@@ -201,9 +234,27 @@ export default function ContributePage() {
               </div>
 
               <div className="mt-3">
+                <SectionLabel>Provider</SectionLabel>
+                <div className="mt-1.5">
+                  <select
+                    value={activeProvider}
+                    onChange={(e) => setProvider(e.target.value)}
+                    className="w-full rounded-[10px] border border-hairline bg-abyss px-3 py-2.5 text-[13px] text-ink outline-none focus:border-private/50"
+                  >
+                    {providers.length === 0 && <option value="">Loading providers…</option>}
+                    {providers.map((p) => (
+                      <option key={p.provider} value={p.provider}>
+                        {p.provider}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div className="mt-3">
                 <SectionLabel>Allowed models</SectionLabel>
                 <div className="mt-1.5 grid gap-1.5 sm:grid-cols-3">
-                  {MODELS.map((model) => {
+                  {catalogModels.map((model) => {
                     const on = allowedModels.includes(model);
                     return (
                       <button
@@ -331,14 +382,23 @@ export default function ContributePage() {
                       onChange={setApiKey}
                       type="password"
                       mono
-                      placeholder="mock-provider-key-…"
+                      placeholder={activeProvider === "mock" ? "mock-provider-key-…" : "your provider API key"}
                     />
                   </div>
-                  <p className="mt-1.5 text-[11px] text-ink-4">
-                    In this local demo the mock provider accepts any key beginning{" "}
-                    <span className="mono text-ink-3">mock-provider-key-</span>. Suffix{" "}
-                    <span className="mono text-ink-3">RATE</span> to simulate a rate-limited key.
-                  </p>
+                  {activeProvider === "mock" ? (
+                    <p className="mt-1.5 text-[11px] text-ink-4">
+                      In this local demo the mock provider accepts any key beginning{" "}
+                      <span className="mono text-ink-3">mock-provider-key-</span>. Suffix{" "}
+                      <span className="mono text-ink-3">RATE</span> to simulate a rate-limited key.
+                    </p>
+                  ) : (
+                    <p className="mt-1.5 text-[11px] text-ink-4">
+                      This is a real <span className="mono text-ink-3">{activeProvider}</span> key.
+                      Requests routed through it are billed to you by{" "}
+                      <span className="mono text-ink-3">{activeProvider}</span>; the caps above are
+                      enforced operationally, not cryptographically.
+                    </p>
+                  )}
                   <div className="mt-3 flex items-center gap-2">
                     <Button onClick={submit} busy={busy} disabled={apiKey.trim().length < 8}>
                       Encrypt & contribute

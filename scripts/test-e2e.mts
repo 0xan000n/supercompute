@@ -1267,6 +1267,35 @@ async function run64(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// §5.1 PROVIDER CATALOG
+// ---------------------------------------------------------------------------
+
+async function run65(): Promise<void> {
+  await test("65", "provider catalog serves implemented providers with pinned model ids", async () => {
+    const res = await fetch(`${COORD}/v1/providers`);
+    assert(res.ok, `expected 200, got ${res.status}`);
+    const json = (await res.json()) as { providers: Array<{ provider: string; models: string[] }> };
+    const names = json.providers.map((p) => p.provider);
+    // The list is the enclave's registry, not a UI constant: a provider with no
+    // adapter must not appear, and the order is stable so the picker is stable.
+    assert(
+      JSON.stringify(names) === JSON.stringify(["anthropic", "mock", "openai"]),
+      `got ${JSON.stringify(names)}`
+    );
+    const anthropic = json.providers.find((p) => p.provider === "anthropic");
+    assert(anthropic, "anthropic missing from the catalog");
+    assert(
+      anthropic.models.includes("claude-haiku-4-5-20251001"),
+      `pinned snapshot ids listed, got ${JSON.stringify(anthropic.models)}`
+    );
+    // Aliases are exactly what a capability must never name (§5.1).
+    const aliases = json.providers.flatMap((p) => p.models).filter((m) => /^claude-[a-z]+-\d+-\d+$/.test(m));
+    assert(aliases.length === 0, `movable aliases published: ${JSON.stringify(aliases)}`);
+    return `${names.join(", ")} · ${json.providers.reduce((n, p) => n + p.models.length, 0)} pinned models`;
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -1333,6 +1362,9 @@ async function main(): Promise<void> {
 
   console.log("\n=== §5.1 UNKNOWN OUTCOMES ===");
   await run64();
+
+  console.log("\n=== §5.1 PROVIDER CATALOG ===");
+  await run65();
 
   // ---- Summary ----
   console.log("\n\n=========================== SUMMARY ===========================");

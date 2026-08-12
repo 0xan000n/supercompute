@@ -83,6 +83,25 @@ app.get("/v1/models", async () => {
   };
 });
 
+/**
+ * §5.1 — the provider catalog, relayed from the enclave.
+ *
+ * This is what the contribute page offers and what the playground selects from.
+ * It comes from the enclave's registry because the enclave is what enforces it:
+ * a sealed intent naming a provider or a model that is not in this list is
+ * refused at ingest, so publishing anything else here would only invite
+ * contributors to mint capabilities that cannot be honoured.
+ */
+app.get("/v1/providers", async (_request, reply) => {
+  try {
+    return await teeClient.providers();
+  } catch {
+    return reply.code(503).send({
+      error: { code: "CTN_ENCLAVE_UNAVAILABLE", message: "The confidential service is unavailable." },
+    });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // §11 — attestation, relayed from the enclave
 // ---------------------------------------------------------------------------
