@@ -122,8 +122,8 @@ proving or executor latency.
   - Fallback (decided by spike): if executor latency exceeds ~250 ms, the host
     runs the same crate compiled natively for gating. Same source, same fixtures;
     the image is still what gets proved.
-- **Proving path:** on ALLOW (and for a sample of DENYs so denials are also
-  provable), `tee-sim` enqueues `POST /prove`. The host produces a **composite
+- **Proving path:** on every decision — ALLOW and DENY alike, so denials are
+  provable too — `tee-sim` enqueues `POST /prove`. The host produces a **composite
   STARK receipt**. On completion `tee-sim` verifies it in-process, then signs the
   existing `ProofBinding` referencing the receipt digest and image ID.
   `proofSystem` moves from `"simulated-reexec"` to `"risc0"` (the union in
@@ -150,10 +150,14 @@ proving or executor latency.
   operator-contributed credential (cheap model, e.g. Haiku-class), contributed
   through the normal flow with its own spend cap and provider binding. Its calls
   produce ordinary receipts tagged `purpose: "insights"` — the insights layer is
-  itself a policy-bound workload. If its cap is exhausted, facet extraction skips
+  itself a policy-bound workload. Requests tagged `purpose: "insights"` are
+  **excluded from facet extraction** (no recursion: a facet call must never
+  trigger another facet call). If its cap is exhausted, facet extraction skips
   (request unaffected) and the next bulletin records the coverage gap.
-- **Facets** per allowed request: `{ category: closed enum (~12 task types),
-  topic: ≤5 words, language: ISO code, sensitive: bool }`. Extracted by one
+- **Facets** per allowed request: `{ category: closed enum, topic: ≤5 words,
+  language: ISO code, sensitive: bool }`. The category enum (~12 task types) is
+  defined in `policy/v1/manifest.json` alongside `k_min`, so the facet schema is
+  attested by the same measurement as the privacy threshold. Extracted by one
   schema-constrained model call; output validated, retry once on schema failure,
   then skip.
 - **Embeddings:** computed locally inside the enclave process (MiniLM-class ONNX
@@ -169,7 +173,8 @@ proving or executor latency.
   lives in `policy/v1/manifest.json`, so it is covered by the measurement: changing
   the privacy threshold changes the measurement and trips `KMS_REFUSED`. The
   coordinator stores bulletins; raw facets/embeddings/cluster membership never
-  leave the enclave.
+  leave the enclave. Cadence: a bulletin is regenerated at most every 60 s and
+  only when new faceted requests exist since the last one.
 - **Web:** an Insights page renders bulletins (cluster cards, counts, k notice).
   Labels, at equal weight: bulletins are enclave-signed, **not ZK-proved**; demo
   volume comes from seeded mock traffic plus real requests.
