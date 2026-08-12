@@ -99,11 +99,20 @@ dev-mode policy.
 ## Verify the claims instead of believing them
 
 ```bash
-pnpm test                                  # policy fixtures, canonicalisation, crypto, invariants
+pnpm test                                  # policy fixtures, canonicalisation, crypto, invariants + the differential
+pnpm test:differential                     # TS policy engine vs the Rust one the guest runs (part of `pnpm test`)
 pnpm test:e2e                              # 28 security, routing and privacy cases (§53–56, §36, §5.1)
 pnpm privacy-test                          # canary sweep across every persisted surface
 pnpm verify-receipt <requestId>            # independent receipt + proof + binding check
 ```
+
+`pnpm test:differential` needs the Rust toolchain and will **fail loudly** without it
+rather than skip — it is the only thing keeping `prover/policy-core` (the engine a
+proof is about) identical to `packages/policy` (the engine the gateway enforces). Per
+run it compares 125 fixtures and 500 generated Unicode adversarial cases field for
+field, then sweeps all 1,112,064 Unicode code points to assert that the two engines'
+Unicode-version skew only ever makes the Rust side *stricter*. VALIDATION.md §2c has
+the full statement of what that skew is and is not.
 
 `pnpm test:e2e` runs entirely against the local mock upstream and costs nothing. Two
 further cases talk to a **real provider on a real account** and are therefore skipped
