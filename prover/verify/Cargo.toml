@@ -1,0 +1,50 @@
+[package]
+name = "prover-verify"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Offline verifier for policy-guest receipts, pinned to prover/release.json."
+
+# Its own workspace, deliberately, and NOT a member of `prover/`. See the module
+# comment in src/lib.rs: `disable-dev-mode` is a feature of `risc0-zkvm`, cargo
+# unifies features across a workspace build, and unifying it into `prover/host`
+# would turn the daemon's documented one-line dev-mode refusal into a panic
+# inside risc0. Two workspaces is the price of the two crates disagreeing about
+# whether dev mode may exist — which is exactly the disagreement that makes this
+# binary worth running.
+[workspace]
+
+[dependencies]
+# `disable-dev-mode` is the whole point: with it, `VerifierContext` cannot be put
+# into dev mode, so `FakeReceipt::verify_integrity_with_context`
+# (risc0-zkvm-3.0.6/src/receipt.rs:596-607) returns `InvalidProof` unconditionally
+# and a dev-mode receipt fails the seal check cryptographically rather than
+# because something matched a string.
+#
+# `default-features = false` matters as much. The defaults are `client` + `bonsai`:
+# `client` pulls in `rzup` and `risc0-build` (a toolchain *downloader*) and
+# `bonsai` pulls in `bonsai-sdk`, which is an HTTP client for a remote proving
+# service. A verifier that links either has no business claiming it makes no
+# network calls. `std` is all verification needs; `cargo tree` is the check that
+# keeps this honest (see prover/README.md, "Verifying a receipt offline").
+risc0-zkvm = { version = "^3.0.6", default-features = false, features = [
+    "std",
+    "disable-dev-mode",
+] }
+# The proof-nonce bound, the decision vocabulary and the policy-identity
+# derivation — shared with the guest and the host rather than reimplemented here.
+# Default features are on, because `policy_id` is needed; only the guest turns
+# them off.
+policy-core = { path = "../policy-core" }
+# The shape of release.json, shared with the emitter.
+release-manifest = { path = "../release-manifest" }
+# Same codec, same version, as the receipts `prover/host` hands out.
+bincode = "1.3"
+serde_json = "1.0"
+
+[dev-dependencies]
+# Tampered receipts and mutated manifests are written to a scratch directory
+# rather than next to the fixtures, so a failing test cannot leave a file behind
+# that a later run mistakes for a fixture.
+tempfile = "3"
+

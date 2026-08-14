@@ -1,0 +1,30 @@
+[package]
+name = "release-manifest"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "The shape of prover/release.json, shared by the host that emits it and the verifier that reads it."
+
+# Why this is its own crate rather than a module of `policy-core`, which both
+# consumers already depend on:
+#
+# `policy-core` is compiled *into the guest image*, and rustc's symbol mangling
+# folds a hash of a crate's contents into the symbols of everything that links
+# it. Adding a module to `policy-core` — even one the guest cfg's out — changes
+# those symbols, changes the ELF, and therefore changes the ImageID. That was
+# measured, not assumed: adding a `release` module behind an off-by-default
+# feature moved the ImageID from 75751480a7e7… to 52c3ede0c090… with no
+# behavioural change whatsoever.
+#
+# The ImageID is the identity this whole exercise pins. A file describing the
+# image must not be able to move it.
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+# `PROTOCOL_VERSION` — the journal version and the manifest's `journalVersion`
+# are the same number, and it is defined once, in the crate the guest shares.
+# This is a *host-side* dependency on `policy-core`, not the reverse, so nothing
+# here reaches the image.
+policy-core = { path = "../policy-core" }
+
+[dev-dependencies]
+serde_json = "1.0"

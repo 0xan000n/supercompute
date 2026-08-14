@@ -40,6 +40,9 @@ policy-core = { path = "../policy-core" }
 # Same codec as the guest's frame reader.
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 base64 = "0.22"
+# The shape of prover/release.json, shared with `prover/verify`. A leaf crate on
+# purpose: see its Cargo.toml.
+release-manifest = { path = "../release-manifest" }
 # The `--execute-stdin` protocol, the `/execute` response, and the
 # journal-shape tests.
 serde_json = "1.0"
@@ -55,6 +58,14 @@ tracing = "0.1"
 # Job ids: 16 bytes from the OS CSPRNG. Unpredictable rather than merely
 # unique, so a caller cannot enumerate another caller's receipts.
 rand = "0.9"
+
+[build-dependencies]
+# Locates rzup's default Rust toolchain — the compiler `risc0-build` forces into
+# the guest build — so `--emit-release` can pin the compiler that produced the
+# ImageID. Same crate and the same call `risc0-build-3.0.6/src/lib.rs:373-383`
+# makes, so the recorded version cannot drift from the one that was used. It is
+# already in this workspace's lock file as a dependency of `risc0-build`.
+rzup = "0.5"
 
 [dev-dependencies]
 # `tests/guest_io.rs` redirects this process's fd 2 to prove that a guest panic

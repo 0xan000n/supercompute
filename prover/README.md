@@ -1,13 +1,15 @@
 # prover
 
 The real RISC Zero prover for Safety Policy v1. Phase 2a builds it; this
-directory is currently at **Task 5 — the daemon**. The guest image *is* Safety
-Policy v1 (the ruleset is compiled in, the request commitment is recomputed
-inside the zkVM, and the journal it commits is the verifier's allowlist and
-nothing else), and `host --serve` now puts it behind `127.0.0.1:4500` with an
-executor fast path and a single-worker proving queue. The offline verifier is
-Task 6 and does not exist yet, and **nothing in `services/` calls any of this** —
-wiring the daemon into `tee-sim` is Phase 2b.
+directory is currently at **Task 6 — the offline verifier**. The guest image *is*
+Safety Policy v1 (the ruleset is compiled in, the request commitment is
+recomputed inside the zkVM, and the journal it commits is the verifier's
+allowlist and nothing else); `host --serve` puts it behind `127.0.0.1:4500` with
+an executor fast path and a single-worker proving queue; and `prover-verify`
+checks a receipt against `release.json` with no network and no trust in whoever
+produced it. **Nothing in `services/` calls any of this** — wiring the daemon
+into `tee-sim` is Phase 2b, and until that happens a verified receipt says a
+proof exists, not that anything was gated on it.
 
 Phase 1 modelled the cost of proving (`CTN_SIMULATED_PROVING_MS`, default
 2400 ms) and labelled it as modelled. Everything from Task 1 on uses
@@ -45,9 +47,42 @@ takes a while; several minutes is normal.
 | `rzup` | 0.5.0 |
 | `cargo-risczero` | 3.0.6 |
 | `r0vm` | 3.0.6 |
-| risc0 Rust toolchain (guest) | 1.97.0 |
+| risc0 Rust toolchain (guest) | 1.97.0 — `rustc 1.97.0-dev (e638c6cfe 2026-07-15)` |
 | risc0 C++ toolchain | 2024.1.5 |
 | `risc0-zkvm` / `risc0-build` crates | 3.0.6 |
+| `unicode-normalization` / `unicode-properties` | 0.1.25 / 0.1.4 |
+
+`release.json` carries these as data rather than prose — `cargo run -rp host --
+--emit-release` reads them out of the build that produced the image, so they
+cannot drift from this table without the table being visibly wrong.
+
+`rust-toolchain.toml` still says `channel = "stable"`, and that is a decision
+rather than an oversight. The toolchain that determines the ImageID is the
+**guest** one, and it is already pinned outside cargo: `risc0-build` looks up
+rzup's default Rust toolchain and forces it into the nested guest build through
+`RUSTC`, after stripping `RUSTUP_TOOLCHAIN` from the environment
+(`risc0-build-3.0.6/src/lib.rs:355-383, 436`). Pinning the host channel to
+`1.97.1` would install a second copy of a compiler already present under another
+toolchain name, force a full rebuild, and — given how little it takes to move an
+ImageID (see "Reproducibility of the image") — require re-verifying the image and
+re-cutting `release.json` and every fixture. What it would buy is host-side test
+reproducibility, mainly the Unicode version behind `str::to_lowercase` in the
+native differential runs. That is worth having and worth doing at a moment when
+re-measuring is already planned; Task 7 re-measures. The concrete change, for
+whoever does it:
+
+```toml
+[toolchain]
+channel = "1.97.1"                                # was "stable"
+components = ["rustfmt", "rust-src", "clippy"]    # clippy currently comes from
+profile = "minimal"                               # the default-profile stable install
+```
+
+…followed by rebuilding and checking that
+`cargo run -rp host -- --emit-release` still reports
+`75751480a7e7d6b329de6614fee99e8d2cf9a793c32e9c1e3de057f8196b0ee1`. Meanwhile the
+host compiler is *recorded* on every emit even though it is not enforced, so
+drift is visible in a diff rather than silent.
 
 Machine: Apple M1 Pro, 10 cores, 32 GB, macOS 26.0.1. **Proving here is CPU-only.**
 Despite what the toolchain's shape suggests, risc0 3.0.6 does not use the GPU on
@@ -59,8 +94,10 @@ Apple Silicon — see "Proving is CPU-only" below.
 
 ```
 prover/
-  Cargo.toml            workspace: host + methods + policy-core
+  Cargo.toml            workspace: host + methods + policy-core + release-manifest
+                        (verify is EXCLUDED — its own workspace, see below)
   rust-toolchain.toml   stable, with rustfmt and rust-src
+  release.json          the pinned image: ImageID, policy identity, toolchains
   policy-core/          the engine, compiled twice: natively and into the guest
     src/engine.rs         evaluate / evaluate_prepared — the port of engine.ts
     src/normalize.rs      the §23 normalizer
@@ -74,9 +111,17 @@ prover/
     guest/build.rs      bakes policy/v1/{rules,manifest}.json INTO the image
     guest/src/main.rs   the guest: runs inside the zkVM
   host/
+    build.rs            records the toolchains that built this binary
     src/lib.rs          execute_policy — run the image in the executor
-    src/main.rs         --bench and --execute-stdin
+    src/main.rs         --bench, --execute-stdin, --serve, --emit-release
+    src/release.rs      builds release.json
     tests/guest_io.rs   executor round-trip tests against the real image
+  release-manifest/     the shape of release.json — a leaf crate, shared by the
+                        host that writes it and the verifier that reads it
+  verify/               prover-verify: the offline verifier (own workspace)
+    src/lib.rs            the checks
+    src/main.rs           the CLI
+    tests/fixtures/       four real receipts + how to regenerate them
 ```
 
 This is the layout `cargo risczero new` generates, kept deliberately. The
@@ -235,16 +280,28 @@ it, while `canonicalJson` emits `0`. It is declared, and it is the only one.
 (SHA-256 `e5fd1e0d47a2b4422c7a2c614bfaf4d752cc389362f050d38afffb5864414301`) and
 so did the ImageID. That is one machine, one toolchain, two builds — it is
 evidence that the build is not gratuitously nondeterministic, not a claim of
-cross-machine reproducibility, which nothing here has tested. Task 6 pins the
-toolchain versions in `release.json`; that is what makes the claim checkable by
-someone else.
+cross-machine reproducibility, which nothing here has tested. `release.json`
+pins the toolchain versions; that is what makes the claim checkable by someone
+else.
 
 `policy-core` exposes its `policy_id` module behind a default feature, and the
 guest takes the dependency with `default-features = false`. This did **not**
 shrink the ELF — the linker was already dropping the unused code, measured — so
-it buys intent rather than bytes: an edit to the canonicalizer cannot move the
-ImageID, and an auditor reading the crate graph does not have to ask why a JSON
-canonicalizer is inside a measured policy image.
+it buys intent rather than bytes: an auditor reading the crate graph does not
+have to ask why a JSON canonicalizer is inside a measured policy image.
+
+**It does not mean an edit to that module is free.** An earlier version of this
+paragraph claimed "an edit to the canonicalizer cannot move the ImageID", and
+that is false. Task 6 measured it: adding a new module to `policy-core` behind
+an off-by-default feature the guest does not enable moved the ImageID from
+`75751480a7e7…` to `52c3ede0c090…`, with no behavioural change of any kind.
+rustc folds a hash of a crate's contents into the symbol names of everything
+that links it, so **any** source edit to a crate the guest links — a comment, a
+blank line, a module the guest cfg's away — is a new image. (This is the same
+mechanism behind the note that guest panic locations carry line numbers.) That is
+why the shape of `release.json` lives in its own `release-manifest` crate: a file
+describing the image must not be able to move it. Feature gating buys clarity;
+only *not editing the crate* buys a stable ImageID.
 
 ### Needles are normalized at build time
 
@@ -280,6 +337,7 @@ cargo run -rp host -- --serve           # the daemon, 127.0.0.1:4500
 cargo run -rp host -- --bench           # executor + prove + verify, ALLOW and DENY
 CTN_BENCH_PROVE=0 cargo run -rp host -- --bench   # executor only (proving is minutes)
 cargo run -rp host -- --execute-stdin   # newline-JSON executor service
+cargo run -rp host -- --emit-release --out release.json   # regenerate the manifest
 ```
 
 ### The daemon (`--serve`)
@@ -297,7 +355,8 @@ slower than the 57 ms below.
 | `GET /health` | — | `{imageIdHex, policyId, rulesDigest, risc0Version, devMode}` |
 
 - `receiptB64` is base64 of the **bincode**-serialized risc0 receipt — the same
-  codec `--bench` measures and the one `release.json` will pin in Task 6.
+  codec `--bench` measures and the one `release.json` pins as
+  `receiptCodec: "bincode-v1"`.
 - Unknown fields are rejected, so sending `emitScores` to `/prove` is an error
   rather than a silently ignored option: the prove path never captures scores.
 - Every refusal is `{"error": "<one of a fixed set of strings>"}` with status
@@ -352,6 +411,209 @@ The rule for this directory:
   daemon having said so. `--dev` is permission, not a switch: passing it without
   the variable still reports `devMode: true`, because the claim being made is
   "do not trust receipts from this daemon" and the flag is reason enough.
+
+---
+
+## Verifying a receipt offline
+
+A receipt is only worth something to someone who did not produce it. This is the
+program that lets them check one, on their own machine, with no network and no
+trust in whoever handed them the file.
+
+```bash
+cd prover/verify
+cargo build --release
+./target/release/prover-verify \
+    --receipt tests/fixtures/allow-real.receipt.bin \
+    --release ../release.json
+```
+
+Run from the repository root instead and the defaults line up:
+`--release` defaults to `prover/release.json`, and the policy directory defaults
+to `policy/v1` *relative to the manifest*, not to the working directory.
+
+```text
+[ ok ] manifest                   pins imageId 75751480a7e7…, journalVersion 1, risc0 3.0.6, built 2026-08-14T09:09:59Z
+[ ok ] receipt-codec              bincode-v1
+[ ok ] receipt-decodes            537794 bytes
+[ ok ] image-id                   the receipt claims 75751480a7e7…
+[ ok ] seal                       cryptographically valid for the pinned imageId
+[ ok ] journal-parses             JSON object, 259 bytes
+[ ok ] journal-key-set            exactly {decision, policyId, proofNonce, protocolVersion, requestCommitment}
+[ ok ] journal-protocol-version   1
+[ ok ] journal-decision           ALLOW
+[ ok ] journal-request-commitment 0x8873f02c…
+[ ok ] journal-proof-nonce        0xbe0c0000000000000000000000000000
+[ ok ] policy-id                  journal and manifest agree: 0x1f74ba4f…
+[ ok ] rules-digest               re-derived from policy/v1: 0x9f85ba59…
+
+VERIFIED
+```
+
+Exit 0 verified, 1 a check failed (the first failing check is named twice: on its
+own line and in the last line of output), 2 a usage error. `--expect-commitment`,
+`--expect-decision` and `--expect-proof-nonce` add checks for a caller who knows
+what the answer should have been.
+
+### What each check means
+
+| check | what it establishes |
+|---|---|
+| `manifest` | `release.json` parses as a manifest — every field present, none unknown, the identities the right shape. An unknown key is a refusal, not a shrug: a verifier that ignores a field is trusting a claim it did not read. |
+| `receipt-codec` | the manifest names a codec this binary can decode (`bincode-v1`). |
+| `receipt-decodes` | the file is a `risc0_zkvm::Receipt` under that codec. |
+| `image-id` | the ImageID in the receipt's claim is the pinned one. Split out from `seal` so "a valid proof of the wrong program" reads differently from "not a valid proof". |
+| `seal` | the zero-knowledge proof verifies against the pinned ImageID, the guest exited `Halted(0)`, and the journal is the one the proof commits to. **This is the check that carries the weight.** |
+| `journal-parses` | the committed bytes are a JSON object. The journal is *parsed, never re-encoded* — the bytes are already bound by the seal, so re-canonicalizing them would only test this program's serializer. |
+| `journal-key-set` | exactly `{decision, policyId, proofNonce, protocolVersion, requestCommitment}` — the allowlist `services/tee-sim/src/verify.ts` enforces. No category scores, no prompt-derived anything. |
+| `journal-protocol-version` | matches the manifest's `journalVersion`. |
+| `journal-decision` | one of the two the engine can produce. |
+| `journal-request-commitment` | `0x` + 64 lowercase hex. |
+| `journal-proof-nonce` | inside `^(0x)?[0-9a-f]{1,64}$`. The guest enforces this bound too, but the guest is *the thing being authenticated* — a journal from any other image is bounded by nothing, and `proofNonce` is the only variable-length field in a public artifact. Checked here so a fat nonce fails on a named check rather than sliding through the key-set test. |
+| `policy-id` | the `policyId` the image committed is the one the manifest pins. |
+| `rules-digest` | `policy/v1/{rules,manifest}.json` re-derive the manifest's `policyId` **and** `rulesDigest`, through `policy_core::policy_id` — the same function the guest's build script used. |
+
+That last one is the only check that looks outside the receipt, and it has to.
+`rulesDigest` is not in the journal and no receipt can attest to it. What *is* in
+the journal is `policyId = sha256(canonical_manifest ‖ rules_bytes)`, and
+`rulesDigest = sha256(rules_bytes)` — so re-deriving both from the same two files,
+with the `policyId` half already matched against the journal, ties the pinned
+digest to the exact rules bytes the proving image was built from. Without the
+files the check reports `[ -- ]` (not available) and the summary counts it;
+`--no-policy-dir` asks for that explicitly. It is never silently skipped.
+
+### What verification does and does not establish
+
+**Does:** this journal was committed by the image whose ImageID `release.json`
+pins, that image's baked policy identity is the one the manifest names, and — with
+`policy/v1` present — that identity is the one the rules in front of you derive.
+Every field printed above is a field the image itself committed.
+
+**Does not:**
+
+- **That any gateway consulted this proof before answering.** Nothing in Phase 2a
+  puts a proof on the request path. The tool says so on every successful run, in
+  its own output, because a green check mark invites the reader to supply their
+  own meaning for it.
+- **That the journal's request is the request a user sent.** The journal carries
+  a commitment (`sha256("CTN_REQUEST_V1" ‖ canonical_bytes ‖ nonce)`), not the
+  request. Tying a commitment to a request needs the request and the nonce, which
+  the requester has and the verifier does not.
+- **That the pinned ImageID is reproducible on your machine.** `release.json`
+  pins the compilers so you can *try*; two builds on one machine have matched
+  (see "Reproducibility of the image"), across machines is untested.
+- **That the policy is good.** It is a demo ruleset. Verification is about
+  provenance, not about whether `DENY` was the right answer.
+
+### Dev-mode receipts are rejected cryptographically
+
+`prover-verify` takes `risc0-zkvm` with the **`disable-dev-mode`** feature. With
+it, `VerifierContext` cannot carry `dev_mode: true` at all, so
+`FakeReceipt::verify_integrity_with_context` takes its `Err(InvalidProof)` branch
+unconditionally. Nothing in this crate inspects a receipt to decide whether it is
+a stub; the 719-byte dev receipt in `tests/fixtures/` fails the `seal` check the
+way any invalid proof does, and the note explaining what it was is printed
+*because* the check already failed.
+
+Setting `RISC0_DEV_MODE=1` in the verifier's own environment cannot change that —
+risc0 panics on the contradiction, and this binary pre-empts the panic with a
+sentence and exit 2.
+
+The claim was checked by removing the feature. Rebuilt without
+`disable-dev-mode` and run with `RISC0_DEV_MODE=1`, the same binary **accepts the
+same dev-mode stub**: all thirteen checks pass and it prints `VERIFIED`, exit 0.
+The feature is load-bearing, not decoration. (Reverted immediately; the committed
+build rejects it, exit 1.)
+
+### No network I/O
+
+Structural first. `risc0-zkvm` is taken with `default-features = false`, which
+drops two defaults that both speak HTTP: `bonsai` (a client for a remote proving
+service) and `client` (which pulls in `rzup`, a toolchain downloader, and
+`risc0-build`). What is left is 148 crates with nothing network-capable in them:
+
+```console
+$ cd prover/verify && cargo tree | grep -Ei 'reqwest|hyper|tokio|bonsai|rzup|risc0-build|rustls|native-tls|openssl|curl|ureq'
+$                       # no output
+
+$ cd prover && cargo tree -p host | grep -Ei 'reqwest|hyper|rzup|risc0-build' | head
+hyper v0.14.32
+hyper v1.11.0
+hyper-rustls v0.24.2
+reqwest v0.12.28
+risc0-build v3.0.6
+```
+
+The contrast is the point: the daemon legitimately links an HTTP stack, and the
+verifier legitimately cannot.
+
+Then behaviourally, under a macOS sandbox that denies all networking:
+
+```bash
+cat > /tmp/no-network.sb <<'EOF'
+(version 1)
+(allow default)
+(deny network*)
+EOF
+
+# control: the profile really does deny networking
+sandbox-exec -f /tmp/no-network.sb curl -sS https://example.com
+# curl: (6) Could not resolve host: example.com          exit 6
+
+sandbox-exec -f /tmp/no-network.sb ./prover/verify/target/debug/prover-verify \
+    --receipt prover/verify/tests/fixtures/allow-real.receipt.bin \
+    --release prover/release.json
+# … VERIFIED                                             exit 0
+```
+
+Exit 0 on the real receipt and exit 1 on the dev stub, both with networking
+denied. The `curl` line is there because a sandbox demonstration without a
+control demonstrates nothing.
+
+### Which receipt kind, and what `receiptCodec` pins
+
+`receiptCodec: "bincode-v1"` names a **serialization**, not a receipt kind.
+Composite, succinct and Groth16 receipts are all the same `risc0_zkvm::Receipt`
+type, all encode with bincode 1.3, and `Receipt::verify` handles all three — so
+the verifier is kind-agnostic, and `tests/fixtures/allow-succinct.receipt.bin`
+is the fixture that keeps that from being an unchecked claim.
+
+Measured on this machine (M1 Pro, 32 GB, release, CPU-only, **one run each**),
+starting from the committed ALLOW receipt:
+
+| kind | bytes | to produce | verify |
+|---|---|---|---|
+| composite | 537,794 | 124.57 s (the prove itself) | ~30 ms † |
+| succinct | 223,744 | +29.52 s compressing the composite | 12.5 ms |
+| Groth16 | — | **not measurable here** | — |
+
+† the composite verify number is still the previous image's; Task 7 owns
+re-measuring it.
+
+**Groth16 was not measured, and that is a limitation of this machine, not an
+omission.** risc0 3.0.6's STARK-to-SNARK step shells out to a Docker image
+(x86-64), Docker is not installed here, and
+`compress(&ProverOpts::groth16(), …)` fails with `Please install docker first.`
+after 41.56 s. Every Groth16 claim anywhere in this repository is therefore
+unmeasured. What that costs: Groth16 is the ~200-byte receipt an on-chain
+verifier would need, and nothing here knows what it costs to produce.
+
+The daemon keeps shipping **composite**, and `release.json` does not pin a kind:
+
+- composite is what a two-minute prove already produces; succinct adds 24 % to
+  the wall time for a 2.4× smaller artifact, which is a trade worth making when
+  something is paying to store or ship receipts and pointless while nothing is;
+- the verifier accepts either, so switching later is a daemon change and not a
+  manifest or verifier change;
+- the one thing that *would* force the decision — an on-chain verifier, which
+  needs Groth16 — cannot be evaluated on this machine at all.
+
+### Fixtures
+
+`prover/verify/tests/fixtures/` holds four real receipts so that `cargo test`
+costs seconds instead of eight minutes of proving. `tests/fixtures/README.md` has
+the regeneration commands, including how the wrong-image receipt was produced
+without a second image ever existing inside this repository.
 
 ---
 
@@ -653,8 +915,11 @@ prompts. Specifically **not** shown:
 - **How receipt size scales.** Two data points at one segment (spike, ~250 KB)
   and two at two segments (policy guest, ~525 KB) are consistent with "roughly
   linear in segments" and do not establish it. Nothing here measured a
-  three-segment session, and nothing measured a succinct or Groth16 receipt at
-  all — Task 6 must, before `release.json` pins a receipt codec.
+  three-segment session.
+- **Anything about Groth16.** Task 6 measured succinct (223,744 bytes, +29.52 s
+  from the composite, 12.5 ms to verify) but Groth16 proving needs Docker, which
+  this machine does not have — see "Which receipt kind". Any Groth16 number in
+  this repository is unmeasured.
 - **Cost as a function of the prompt.** Both fixtures are one short user message.
   The executor cost is dominated by the ruleset, which is why the two agree to
   0.4% — but that is an argument from two similar inputs, not a curve. Task 7's
@@ -768,7 +1033,15 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test
 
-# the guest is its own workspace and the line above never reaches it
+# `verify` is its own workspace (see below) and the three lines above do not
+# reach it either
+cd verify
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+cd ..
+
+# the guest is its own workspace and the lines above never reach it
 cd methods/guest
 cargo fmt --check
 RUSTFLAGS='-C passes=lower-atomic -C panic=abort --cfg getrandom_backend="custom"' \
@@ -811,6 +1084,27 @@ back and assert it reaches neither the caller nor the process's stderr, plus the
 positive control). A full `--bench`, at these po2s, is a **~30 minute** command;
 use `CTN_BENCH_PROVE=0` while iterating.
 
-`prover/target/` and `prover/methods/guest/target/` (both matched by `target/`)
-are the only gitignored paths here. Both `Cargo.lock` files are committed on
-purpose: the guest image id depends on the exact dependency graph.
+### Three workspaces, on purpose
+
+`prover/`, `prover/verify/` and `prover/methods/guest/` are three separate cargo
+workspaces, so each of the three gate blocks above is necessary. The guest's
+separation is inherent — a different target triple, a different toolchain. The
+verifier's is a consequence of cargo unifying features across a workspace build:
+
+```console
+$ # with verify added as a member, for one command:
+$ cargo tree --workspace -e features -f '{p} {f}' | grep -o 'risc0-zkvm v3.0.6.*' | sort -u
+risc0-zkvm v3.0.6 client,disable-dev-mode,prove,std
+```
+
+One resolution for the whole workspace, so `host` would be compiled with
+`disable-dev-mode` too — and with that feature, risc0 *panics* when it sees
+`RISC0_DEV_MODE` set (`risc0-zkvm-3.0.6/src/lib.rs:211-218`) rather than letting
+the daemon exit with the one-line refusal Task 5 specified. The two crates
+genuinely disagree about whether dev mode may exist, and that disagreement is the
+point of the verifier; two workspaces is what it costs.
+
+`prover/target/`, `prover/verify/target/` and `prover/methods/guest/target/` (all
+matched by `target/`) are the only gitignored paths here. All three `Cargo.lock`
+files are committed on purpose: the guest image id depends on the exact
+dependency graph.

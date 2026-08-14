@@ -28,6 +28,10 @@
 //! makes — so `scripts/differential-test.ts` can assert that the journal the
 //! *image* commits matches what the TypeScript protocol code computes.
 //!
+//! `--emit-release` writes `prover/release.json` — the ImageID, the policy
+//! identity and the toolchain pins this binary was built with, which is what
+//! `prover/verify` checks receipts against. See `host::release`.
+//!
 //! `--serve` is the daemon: `127.0.0.1:4500`, serving `/execute`, `/prove`,
 //! `/jobs/:id` and `/health`. The routing and the queue live in `host::server`
 //! and `host::queue`; what lives here is the startup policy — which arguments
@@ -36,7 +40,7 @@
 
 use std::io::{self, BufRead, BufWriter, Write};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use base64::prelude::{Engine as _, BASE64_STANDARD};
@@ -594,6 +598,47 @@ fn execute_stdin() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// --emit-release
+// ---------------------------------------------------------------------------
+
+/// Write `prover/release.json`: the pinned description of the image this binary
+/// was built against.
+///
+/// Everything in it except the timestamp is a compile-time constant of *this*
+/// binary — the ImageID it measured, the identities its build scripts derived,
+/// the compilers `build.rs` recorded. There is deliberately no way to pass any
+/// of them in. A manifest whose contents an operator can choose describes
+/// whatever they chose.
+///
+/// Emits to stdout by default so it can be diffed before it is committed;
+/// `--out <path>` writes the file.
+fn emit_release(args: &[String]) -> Result<()> {
+    let mut out: Option<String> = None;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--out" => out = Some(rest.next().context("--out needs a value")?.clone()),
+            other => bail!("unknown argument {other:?}; see --help"),
+        }
+    }
+
+    let manifest = host::release::release_manifest(host::release::rfc3339_utc(SystemTime::now()));
+    // Pretty-printed with a trailing newline: this file is committed and read by
+    // people, and a one-line JSON blob produces a useless diff.
+    let mut json = serde_json::to_string_pretty(&manifest).context("serializing the manifest")?;
+    json.push('\n');
+
+    match out {
+        Some(path) => {
+            std::fs::write(&path, &json).with_context(|| format!("writing {path}"))?;
+            eprintln!("wrote {path}");
+        }
+        None => print!("{json}"),
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // --serve
 // ---------------------------------------------------------------------------
 
@@ -703,10 +748,12 @@ fn main() -> Result<()> {
         Some("--bench") => bench(),
         Some("--execute-stdin") => execute_stdin(),
         Some("--serve") => serve(&args[1..]),
+        Some("--emit-release") => emit_release(&args[1..]),
         _ => {
             eprintln!("usage: cargo run -rp host -- --serve [--port N] [--dev]");
             eprintln!("       cargo run -rp host -- --bench");
             eprintln!("       cargo run -rp host -- --execute-stdin");
+            eprintln!("       cargo run -rp host -- --emit-release [--out release.json]");
             eprintln!();
             eprintln!("--serve binds 127.0.0.1 only and refuses to start under RISC0_DEV_MODE");
             eprintln!("unless --dev is passed, in which case every response is stamped devMode.");

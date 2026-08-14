@@ -23,6 +23,7 @@
 //! [`UNCLASSIFIED_FAILURE`].
 
 pub mod queue;
+pub mod release;
 pub mod server;
 
 use std::rc::Rc;
