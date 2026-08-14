@@ -144,7 +144,7 @@ prover/
   verify/               prover-verify: the offline verifier (own workspace)
     src/lib.rs            the checks
     src/main.rs           the CLI
-    tests/fixtures/       four real receipts + how to regenerate them
+    tests/fixtures/       five real receipts + how to regenerate them
 ```
 
 This is the layout `cargo risczero new` generates, kept deliberately. The
@@ -344,9 +344,13 @@ expensive thing the engine does, and it runs over every phrase in `rules.json` o
 every evaluation. None of that work depends on the request, so `PreparedRules`
 does it once, in `build.rs`, and the image carries the *prepared* form.
 
-Measured in-guest with `env::cycle_count()`, ALLOW fixture, this machine:
-preparing the needles inside the zkVM costs **2,264,222 cycles** (plus 202,190 to
-parse `rules.json`); postcard-decoding the prepared form costs **358,084**. The
+Measured in-guest with `env::cycle_count()`, ALLOW fixture, this machine — and
+therefore **not at the current image**: reading a cycle counter inside the guest
+requires a guest with the readings in it, which is a different image. These come
+from the instrumented `4a05b4e9…` build; see ["Where the user cycles
+go"](#where-the-user-cycles-go) for the caveat in full. Preparing the needles
+inside the zkVM costs **2,264,222 cycles** (plus 202,190 to parse `rules.json`);
+postcard-decoding the prepared form costs **358,084**. The
 hoist is worth ~1.9M user cycles per execution, which is the difference between a
 5-segment session and a 2-segment one. It is a pure hoist —
 `policy_core::evaluate` still takes a `PolicyRules` and prepares it eagerly — and
@@ -369,7 +373,7 @@ Rust identifier.)
 cd prover
 cargo run -rp host -- --serve           # the daemon, 127.0.0.1:4500
 cargo run -rp host -- --bench --fixtures            # the gate cost over all 125 fixtures (~30 s)
-cargo run -rp host -- --bench           # + three real proofs: ALLOW, DENY, adversarial (~30 min)
+cargo run -rp host -- --bench           # + three real proofs: ALLOW, DENY, adversarial (about 24 min)
 cargo run -rp host -- --bench --keep-receipts /tmp/r # …and write the proved receipts out
 CTN_BENCH_PROVE=0 cargo run -rp host -- --bench     # the three cases, executor only
 cargo run -rp host -- --execute-stdin   # newline-JSON executor service
@@ -380,7 +384,8 @@ cargo run -rp host -- --emit-release --out release.json   # regenerate the manif
 in under a minute, it runs the *whole* labelled corpus rather than three chosen
 prompts, and it fails if the guest disagrees with any corpus label — so it is a
 correctness check as much as a benchmark. `--bench` on its own is three fixture
-prompts proved four times each (one warmup, three timed) and is half an hour.
+prompts proved four times each (one warmup, three timed) and took **about 24
+minutes** measured end to end.
 The receipts `--keep-receipts` writes are ordinary receipts: hand one to
 `prover-verify` and it checks out.
 
@@ -770,10 +775,18 @@ The daemon keeps shipping **composite**, and `release.json` does not pin a kind:
 
 ### Fixtures
 
-`prover/verify/tests/fixtures/` holds four real receipts so that `cargo test`
-costs seconds instead of eight minutes of proving. `tests/fixtures/README.md` has
+`prover/verify/tests/fixtures/` holds five real receipts so that `cargo test`
+costs seconds instead of ~6.5 minutes of proving. `tests/fixtures/README.md` has
 the regeneration commands, including how the wrong-image receipt was produced
 without a second image ever existing inside this repository.
+
+The fifth is `adv-004-deny.receipt.bin`, and it is there because it is the only
+committed artifact carrying the claim that **the Unicode fold ran in the image**:
+its prompt spells the blocked phrase fullwidth (`ｂｏｍｂ`), nothing in
+`rules.json` matches that literally, and the seal binds the resulting DENY to
+image `75751480a7e7…`. The test rebuilds the canonical request from the corpus
+fixture and requires the receipt to verify 13/13 against that exact commitment,
+so the artifact and the prompt on disk cannot drift apart silently.
 
 ---
 
@@ -822,23 +835,37 @@ The extremes, from the same run:
 
 | | fixture | prompt bytes | median | user cycles |
 |---|---|---|---|---|
-| slowest | `deny-027` | 55 | 59.6 ms | 1,054,214 |
-| fastest | `adv-020` (empty prompt) | 0 | 50.4 ms | 468,795 |
 | most cycles | `allow-050` | 244 | 59.5 ms | 1,696,862 |
+| fewest cycles | `adv-020` (empty prompt) | 0 | 50.4 ms | 468,795 |
 | longest prompt | `adv-022` | 300 | 57.2 ms | 1,255,930 |
+| slowest *(this run only)* | `deny-027` | 55 | 59.6 ms | 1,054,214 |
+| fastest *(this run only)* | `adv-020` | 0 | 50.4 ms | 468,795 |
+
+**Only the cycle-ranked rows are corpus facts.** Cycle counts are byte-identical
+across runs of a given image, so "most cycles" and "fewest cycles" name the same
+two fixtures every time. The wall-time ranks do not: a rerun on this machine put
+`allow-050` slowest at 59.9 ms and `deny-050` fastest at 50.5 ms, with `adv-020`
+fifth at 52.0 ms. **The band is 50–60 ms; the ordering inside it is noise.** Read
+the last two rows as "what a single run happened to rank", not as properties of
+those fixtures.
 
 **Cycles vary 3.6×; wall time varies 1.18×.** That gap is the useful fact. Fitting
-a line through the two ends of the range gives roughly **47 ms of fixed session
-setup plus ~7.4 ms per million user cycles** — a two-point estimate off the
-extremes, not a regression, and quoted as an order of magnitude. It says the gate
-is very nearly a constant per-request cost: about 50 ms of it happens whatever the
-request is, and the entire labelled corpus fits in a 9 ms band on top of that.
+a line through the two ends of the *cycle* range gives roughly **47 ms of fixed
+session setup plus ~7.4 ms per million user cycles** — a two-point estimate, not a
+regression, and quoted as an order of magnitude. Its anchor is honest only at that
+resolution: both constants come from one run's extremes, and re-fitting on the
+rerun above moves them to ~49 ms + ~6.4 ms per million — a 14% swing in the slope
+off two points. What survives the reshuffle is the shape: the gate is very nearly a
+constant per-request cost, about 50 ms of it happens whatever the request is, and
+the entire labelled corpus fits in a 9 ms band on top of that.
 
 **Prompt length is not the lever either.** The longest prompt in the corpus sits
 mid-distribution and the empty one sits at the floor, but `allow-050` at 244 bytes
 burns more cycles than `adv-022` at 300. What moves cycles is how much of the
-ruleset a prompt makes the matcher touch. Phase 2b should budget a flat **60 ms**
-per `/execute` and should not expect to recover any of it by shrinking inputs.
+ruleset a prompt makes the matcher touch. Phase 2b should budget a **tight ~60 ms**
+per `/execute` — the corpus max is 59.6 ms here and a rerun hit 59.9, so treat
+anything over as load, not as policy work — and should not expect to recover any
+of it by shrinking inputs.
 
 ### Three proofs, end to end
 
@@ -900,9 +927,11 @@ one machine, thermal state uncontrolled; report it, do not model it.
 **Prove cost tracks padded rows, and the constant is stable.** 124.10 s over
 1,310,720 rows, 122.85 s over 1,310,720, 113.37 s over 1,179,648 — that is
 **0.0937, 0.0947 and 0.0961 ms per padded row**, a 2.5% band across three
-measurements of two different row counts. The cheapest of the three is cheapest
-because it pads to `2^20 + 2^17` rather than `2^20 + 2^18`, not because it does
-less policy work (it is within 10% of the others on user cycles).
+measurements of two different row counts. The cheapest of the three pads to
+`2^20 + 2^17` rather than `2^20 + 2^18` — but it *also* runs 9.3% fewer user
+cycles, and at n=3 those two explanations coincide and cannot be separated. The
+padding story is the one the row counts support directly; "it does less policy
+work" is equally consistent with these three numbers and is not ruled out.
 
 **Prove wall time is still noisy at the ±20% level between runs, and the ±20% is
 not visible in this table.** Within this run the widest case is `deny-001` at
@@ -1073,8 +1102,10 @@ whole-session to `allow-001` (1,109,291 user + 127,270 paging) the rule predicts
 2^21 = 2,097,152 padded rows. The real total is 1,310,720 = 2^20 + 2^18, because a
 session that spans segments pads each segment separately and packs the tail into
 a smaller block — 37% *cheaper* than the whole-session reading. `adv-004` pads to
-2^20 + 2^17 = 1,179,648 and costs 9% less than `allow-001` for the same reason,
-on 9% fewer user cycles. So: a lower bound on the po2 of any single segment, an
+2^20 + 2^17 = 1,179,648 and costs 9% less than `allow-001`; it also runs 9.3%
+fewer user cycles, so at n=3 "fewer padded rows" and "less policy work" coincide
+and this data cannot tell them apart. So: a lower bound on the po2 of any single
+segment, an
 upper bound on the padded total once a session segments, and never a cost
 prediction on its own. `total_cycles` — which is a sum, not a power of two — is
 the quantity to multiply by the per-row rate.
@@ -1157,7 +1188,9 @@ handful of runs. Specifically **not** shown:
 
 ### Proving is CPU-only
 
-The 50 s figure is a **CPU** number. Nothing here is GPU-accelerated, despite the
+Every proving number in this file is a **CPU** number — the policy guest's
+113–124 s composite proofs above, and the spike's 50 s at 4 KB alike. Nothing
+here is GPU-accelerated, despite the
 Metal Toolchain being a hard build requirement and Metal kernels being compiled
 into the binary. In risc0 3.0.6 those kernels are dead code:
 
@@ -1183,8 +1216,9 @@ because **both are CPU**. The right conclusion, the wrong route.
 **What follows for the numbers:** a future risc0 that re-enables the Metal path
 would change proving time, possibly substantially, and this benchmark would need
 re-running. How much is unmeasured and not guessed at here. The one thing that can
-be said is that the ~50 s at 4 KB is what ten M1 Pro CPU cores cost, and that it is
-a ceiling a GPU path could only improve on.
+be said is that **113–124 s for one policy proof** is what ten M1 Pro CPU cores
+cost (and, in the spike, ~50 s at 4 KB), and that those are ceilings a GPU path
+could only improve on.
 
 Two silent defaults in `risc0-zkvm` are worth recording, because both would have
 produced numbers describing something other than this machine.

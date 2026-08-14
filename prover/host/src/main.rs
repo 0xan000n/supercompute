@@ -290,7 +290,7 @@ fn check_bench_cases_match_corpus(corpus: &[CorpusCase]) -> Result<()> {
 /// is the number a live request would pay, and the point of running the whole
 /// corpus rather than two prompts is the *spread* — whether the gate costs the
 /// same for a haiku and for a 300-byte obfuscated jailbreak.
-fn bench_fixtures(executor: &Rc<dyn risc0_zkvm::Executor>) -> Result<()> {
+fn bench_fixtures(executor: &Rc<dyn risc0_zkvm::Executor>, backend: &str) -> Result<()> {
     let corpus = load_corpus()?;
     check_bench_cases_match_corpus(&corpus)?;
 
@@ -302,6 +302,11 @@ fn bench_fixtures(executor: &Rc<dyn risc0_zkvm::Executor>) -> Result<()> {
     println!("policy id:      {POLICY_ID_V2}");
     println!("rules digest:   {RULES_DIGEST}");
     println!("fixtures:       {} in the corpus", corpus.len());
+    // The same provenance line the proving mode prints. The backend was enforced
+    // upstream in `bench()`; this only reports what that check accepted, so a
+    // reader of an executor-only transcript can see it was this machine.
+    println!("prover backend: {backend} (enforced, in-process)");
+    println!("executor only — no proofs in this run, so RISC0_DEV_MODE is irrelevant here");
     println!();
 
     struct Measured {
@@ -712,7 +717,7 @@ fn bench(args: &[String]) -> Result<()> {
     }
 
     if fixtures_mode {
-        return bench_fixtures(&executor);
+        return bench_fixtures(&executor, &backend);
     }
 
     // The proved prompts are quoted inline; this is what stops them drifting

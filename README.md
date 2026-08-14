@@ -72,9 +72,12 @@ three and a half minutes on an M1 Pro, most of it compiling the guest.
 ```bash
 cd prover
 cargo run -rp host -- --bench --fixtures    # the gate cost, over all 125 fixtures (~30 s)
-cargo run -rp host -- --bench               # + three real proofs (~25 minutes)
-cargo run -p prover-verify --release --manifest-path verify/Cargo.toml -- \
-  --receipt verify/tests/fixtures/allow-real.receipt.bin
+cargo run -rp host -- --bench               # + three real proofs (about 24 minutes)
+cd ..                                       # the verifier's defaults are repo-root-relative:
+                                            # --release defaults to prover/release.json, and
+                                            # the policy dir to policy/v1 *relative to it*
+cargo run --release --manifest-path prover/verify/Cargo.toml -p prover-verify -- \
+  --receipt prover/verify/tests/fixtures/allow-real.receipt.bin
 ```
 
 **What `prover/` is, and what it is not.** It *is* a real RISC Zero zkVM program

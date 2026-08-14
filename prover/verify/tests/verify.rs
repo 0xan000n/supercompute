@@ -174,6 +174,92 @@ fn a_succinct_receipt_of_the_same_execution_also_verifies() {
     );
 }
 
+/// The adversarial receipt, and the one claim in this repository that no other
+/// artifact carries: **the Unicode fold ran inside the zkVM.**
+///
+/// `adv-004`'s prompt spells the blocked phrase in fullwidth characters
+/// (`ｂｏｍｂ`), which no rule in `policy/v1/rules.json` matches literally. Its DENY
+/// therefore exists *only* if §23 normalization folded those characters back to
+/// ASCII inside the guest. The test rebuilds the canonical request from the
+/// fixture on disk, recomputes the commitment the bench used (fixed nonce
+/// `0x5a…`, `host/src/main.rs`), and requires the receipt to verify against *that*
+/// commitment with decision DENY — so the seal binds the fullwidth bytes below to
+/// the DENY the image committed.
+#[test]
+fn the_adversarial_receipt_binds_a_fullwidth_prompt_to_a_deny() {
+    let raw = std::fs::read(
+        dir()
+            .join("..")
+            .join("..")
+            .join("policy")
+            .join("v1")
+            .join("fixtures")
+            .join("adversarial")
+            .join("adv-004.json"),
+    )
+    .expect("adv-004 fixture is committed");
+    let json: serde_json::Value = serde_json::from_slice(&raw).expect("fixture is JSON");
+    assert_eq!(json["expected"], "DENY", "the corpus label moved");
+    let content = json["request"]["messages"][0]["content"]
+        .as_str()
+        .expect("prompt is a string");
+
+    // The premise, asserted rather than assumed: the literal phrase is absent and
+    // only appears after normalization.
+    assert!(
+        !content.contains("bomb"),
+        "adv-004 no longer spells the phrase in fullwidth: {content:?}"
+    );
+    assert!(
+        policy_core::normalize(content).contains("bomb"),
+        "normalization no longer folds adv-004's prompt to the blocked phrase"
+    );
+
+    // Byte-for-byte what `bench_input` sent the guest (host/src/main.rs).
+    let canonical = format!(
+        r#"{{"max_tokens":1024,"messages":[{{"content":{},"role":"user"}}],"model":"ctn/demo-model-a","temperature_millis":1000}}"#,
+        serde_json::to_string(content).expect("string serializes")
+    );
+    let commitment = policy_core::request_commitment(canonical.as_bytes(), &[0x5a; 32]);
+
+    let output = run(&[
+        "--receipt",
+        fixture("adv-004-deny.receipt.bin").to_str().unwrap(),
+        "--release",
+        release_json().to_str().unwrap(),
+        "--expect-commitment",
+        &commitment,
+        "--expect-decision",
+        "DENY",
+    ]);
+    let text = stdout(&output);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    for check in [
+        "manifest",
+        "receipt-codec",
+        "receipt-decodes",
+        "image-id",
+        "seal",
+        "journal-parses",
+        "journal-key-set",
+        "journal-protocol-version",
+        "journal-decision",
+        "journal-request-commitment",
+        "journal-proof-nonce",
+        "policy-id",
+        "rules-digest",
+    ] {
+        assert_passed(&output, check);
+    }
+    assert_passed(&output, "expect-commitment");
+    assert_passed(&output, "expect-decision");
+    assert!(text.contains("VERIFIED"), "{text}");
+    assert!(
+        !text.contains("[ -- ]"),
+        "a check was not available:\n{text}"
+    );
+}
+
 /// The expectation flags, all three at once, against the values the fixture's
 /// journal actually carries.
 #[test]

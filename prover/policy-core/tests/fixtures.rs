@@ -115,15 +115,7 @@ fn every_fixture_evaluates_to_its_expected_decision() {
     let allow = load_bucket("allow");
     let deny = load_bucket("deny");
     let adversarial = load_bucket("adversarial");
-
-    // Spec §35 minimums.
-    assert!(allow.len() >= 50, "need >=50 allow, got {}", allow.len());
-    assert!(deny.len() >= 50, "need >=50 deny, got {}", deny.len());
-    assert!(
-        adversarial.len() >= 25,
-        "need >=25 adversarial, got {}",
-        adversarial.len()
-    );
+    // Counts are guarded by `the_corpus_is_exactly_fifty_fifty_twentyfive` below.
 
     let mut failures = Vec::new();
     check(&rules, &allow, &mut failures);
@@ -137,6 +129,40 @@ fn every_fixture_evaluates_to_its_expected_decision() {
         failures.len(),
         total,
         failures.join("\n")
+    );
+}
+
+/// Spec §35 sets minimums (>=50 / >=50 / >=25). Three documents go further and
+/// state the *exact* total — "all 125 fixtures" — next to measurements taken over
+/// that corpus, so the number is a published fact and not just a floor. This test
+/// is what pins it: growing the corpus must be a deliberate edit that updates the
+/// documents in the same commit, not a silent drift that leaves three READMEs
+/// describing a corpus that no longer exists.
+#[test]
+fn the_corpus_is_exactly_fifty_fifty_twentyfive() {
+    let allow = load_bucket("allow").len();
+    let deny = load_bucket("deny").len();
+    let adversarial = load_bucket("adversarial").len();
+
+    let counts = [
+        ("allow", allow, 50),
+        ("deny", deny, 50),
+        ("adversarial", adversarial, 25),
+    ];
+    for (bucket, got, want) in counts {
+        assert_eq!(
+            got, want,
+            "policy/v1/fixtures/{bucket} holds {got} fixtures, not {want}. If the corpus \
+             changed on purpose, update this assertion AND the three documents that quote \
+             the total: prover/README.md, VALIDATION.md and the root README.md (all say \
+             \"125 fixtures\", and the corpus benchmark tables are measured over exactly \
+             that set)."
+        );
+    }
+    assert_eq!(
+        allow + deny + adversarial,
+        125,
+        "the corpus total moved; see the per-bucket message above for what to update"
     );
 }
 

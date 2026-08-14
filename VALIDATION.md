@@ -507,14 +507,23 @@ Segments across the corpus: 1 or 2. Max po2: **20 for every one of the 125**.
 
 The shape of that is the finding. User cycles vary by **3.6×** across the corpus
 and wall time by **1.18×**, because most of the 56 ms is not policy work at all:
-the two extremes (468,795 cycles at 50.4 ms, 1,696,862 at 59.5 ms) imply roughly
-**47 ms of fixed session setup plus ~7.4 ms per million user cycles**. That is a
-two-point estimate from the ends of the range, not a fit, and it is offered as an
-order of magnitude. Prompt length is not the lever either: the longest prompt in
-the corpus (300 bytes, `adv-022`) lands at 57.2 ms, mid-distribution, while a
-6-byte prompt (`allow-045`) costs 50.9 ms. What drives cycles is how much of the
-ruleset a prompt makes the matcher touch, and what drives wall time is mostly
-neither.
+the two extremes of the *cycle* range (468,795 cycles at 50.4 ms, `adv-020`;
+1,696,862 at 59.5 ms, `allow-050`) imply roughly **47 ms of fixed session setup
+plus ~7.4 ms per million user cycles**. That is a two-point estimate from the ends
+of the range, not a fit, and it is offered as an order of magnitude — including
+its anchor: both constants come from one run's extremes, and a rerun on this
+machine re-fits them to ~49 ms + ~6.4 ms per million, a 14% swing in the slope.
+
+The cycle ranks are reproducible (cycle counts are byte-identical across runs of a
+given image); **wall-time ranks are not.** The same rerun made `allow-050` the
+slowest fixture at 59.9 ms and `deny-050` the fastest at 50.5 ms, with `adv-020`
+fifth at 52.0. The band is 50–60 ms and the ordering inside it is noise, so no
+fixture in this corpus is "the slow one".
+
+Prompt length is not the lever either: the longest prompt in the corpus (300
+bytes, `adv-022`) lands at 57.2 ms, mid-distribution, while a 6-byte prompt
+(`allow-045`) costs 50.9 ms. What drives cycles is how much of the ruleset a
+prompt makes the matcher touch, and what drives wall time is mostly neither.
 
 ### The proof: three fixtures, proved end to end
 
@@ -551,8 +560,10 @@ All three receipts were written out by the benchmark and verified by the release
 
 **Prove cost tracks padded rows at a stable rate.** 0.0937, 0.0947 and
 0.0961 ms per padded row across the three — a 2.5% band over two different row
-counts. `adv-004` is the cheapest because it pads to 2^20 + 2^17 rather than
-2^20 + 2^18, not because it does materially less policy work.
+counts. `adv-004` is the cheapest and it pads to 2^20 + 2^17 rather than
+2^20 + 2^18 — but it also runs 9.3% fewer user cycles, so at n=3 the padding
+explanation and the "less policy work" explanation coincide and this data cannot
+separate them.
 
 **But prove wall time is noisy at the ±20% level between runs, and that is not
 visible in the spread above.** Three runs inside one process share a thermal

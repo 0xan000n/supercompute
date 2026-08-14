@@ -90,7 +90,12 @@ def main():
             raise SystemExit("daemon never came up")
         print("health:", json.dumps(health, indent=2))
 
-        canonical = CANONICAL % json.dumps(args.prompt)
+        # ensure_ascii=False on purpose: `serde_json::to_string` (what
+        # prover/host's --bench canonicalizes with) emits non-ASCII as raw UTF-8,
+        # and JCS does not escape it either. Python's default would send
+        # an escaped \\uff42 for adv-004's fullwidth prompt, i.e. different canonical
+        # bytes and therefore a different requestCommitment than the fixture.
+        canonical = CANONICAL % json.dumps(args.prompt, ensure_ascii=False)
         status, body = post(
             args.port,
             "/prove",
