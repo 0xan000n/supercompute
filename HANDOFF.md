@@ -37,15 +37,18 @@ simulated TEE, signed receipts, live graph. See git history and `VALIDATION.md`.
 **Gates at HEAD (`5a86b1a`):** tsc clean · unit 88/88 · web build clean ·
 e2e 28/28 + 2 env-gated skips (fresh stack) · privacy-test clean.
 
-## The one thing never exercised
+## Live-key status
 
-**Cases 70/71 (real Anthropic/OpenAI round-trips) have never run with a live key.**
-Everything up to the provider's 200 is verified (mock-path scratch run; a bogus-key
-run produced a real 401 with exactly one dispatched attempt and terminal cleanup).
-To run for real (~<$0.01, credential auto-revoked, rotate the key afterwards):
+**Case 70 (real Anthropic round-trip) PASSED with a live key on 2026-08-13** — twice:
+sealed-intent contribution, one real dispatch to `api.anthropic.com`
+(`claude-haiku-4-5-20251001`, 15/5 tokens, est $0.000040 from pinned price table
+`0x6c0977f2`), COMPLETE receipt, credential auto-revoked, terminal revocation held.
+A reusable test key lives in the gitignored `.env.local` (semi-exposed — keep a
+provider-side spend cap on it). **Case 71 (OpenAI) has still never run with a live
+key.** To rerun:
 
 ```bash
-ANTHROPIC_API_KEY=sk-ant-… OPENAI_API_KEY=sk-… pnpm test:e2e
+set -a; source .env.local; set +a; pnpm test:e2e   # add OPENAI_API_KEY=… for 71
 ```
 
 ## Open items (triaged, none merge-blocking)
