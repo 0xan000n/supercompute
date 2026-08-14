@@ -518,6 +518,67 @@ fn a_rejected_proof_nonce_leaks_nothing_to_stderr() {
     );
 }
 
+/// `CTN_UNSAFE_GUEST_DIAGNOSTICS=0` must mean **off**.
+///
+/// The first version of the predicate was `var_os(...).is_some()`, so `0`,
+/// `false` and `off` all *enabled* the dump that prints the raw executor error
+/// and the guest's stderr — the one thing in this crate that deliberately
+/// prints prompt-derived text. Nobody who types `=0` means that.
+///
+/// The assertion is on the dump's own banner rather than on a leaked secret,
+/// and that is deliberate: today the executor error and the guest's stderr are
+/// both taxonomy constants, so an accidentally-enabled dump leaks nothing yet
+/// and a secret-based assertion would pass with the bug still in place. The
+/// banner is what distinguishes on from off. The `"1"` case is the positive
+/// control proving this test can tell the difference.
+#[test]
+fn diagnostics_are_off_unless_the_value_says_on() {
+    const BANNER: &str = "MAY CONTAIN PROMPT TEXT";
+    const SECRET: &str = "PLANTED_DIAGNOSTICS_SECRET_ZORK";
+
+    // A request the guest refuses, so the diagnostics branch is reached at all.
+    let mut inp = input(&ALLOW_MESSAGES, "0x1ea4", false);
+    inp.canonical_request_bytes =
+        format!(r#"{{"max_tokens":"{SECRET}","messages":[{{"content":"hi","role":"user"}}],"model":"m","temperature_millis":1000}}"#)
+            .into_bytes();
+
+    for (value, expect_dump) in [
+        (Some("0"), false),
+        (Some("false"), false),
+        (Some("off"), false),
+        (Some(""), false),
+        (None, false),
+        // Positive control.
+        (Some("1"), true),
+    ] {
+        match value {
+            Some(v) => std::env::set_var(host::UNSAFE_DIAGNOSTICS_ENV, v),
+            None => std::env::remove_var(host::UNSAFE_DIAGNOSTICS_ENV),
+        }
+        assert_eq!(
+            host::unsafe_diagnostics_enabled(),
+            expect_dump,
+            "{value:?} decided the wrong way"
+        );
+
+        let (result, stderr) = capturing_process_stderr(|| host::execute_policy(&inp));
+        assert!(result.is_err(), "the guest accepted the probe");
+        assert_eq!(
+            stderr.contains(BANNER),
+            expect_dump,
+            "{value:?}: stderr {} the diagnostics dump: {stderr}",
+            if expect_dump { "lacks" } else { "carries" }
+        );
+        if !expect_dump {
+            assert!(
+                !stderr.contains(SECRET),
+                "{value:?}: stderr leaked the request: {stderr}"
+            );
+        }
+    }
+    std::env::remove_var(host::UNSAFE_DIAGNOSTICS_ENV);
+}
+
 /// The defence is two independent layers, and this checks the second one on its
 /// own terms: whatever the guest says, the *host* never hands a caller anything
 /// but a constant. A hand-built error carrying a secret classifies to

@@ -40,8 +40,21 @@ policy-core = { path = "../policy-core" }
 # Same codec as the guest's frame reader.
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 base64 = "0.22"
-# The `--execute-stdin` protocol and the journal-shape tests.
+# The `--execute-stdin` protocol, the `/execute` response, and the
+# journal-shape tests.
 serde_json = "1.0"
+# The :4500 daemon. `axum`'s default features are the ones it needs (http1,
+# json, the tokio listener); nothing here speaks TLS or makes an outbound
+# request, and `cargo tree` is the check that stays true.
+axum = "0.8"
+# One multi-threaded runtime serves HTTP. Proving does NOT run on it — see
+# `queue.rs`: that is one dedicated OS thread, because a composite prove
+# saturates every core for minutes and would starve `/execute` otherwise.
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time"] }
+tracing = "0.1"
+# Job ids: 16 bytes from the OS CSPRNG. Unpredictable rather than merely
+# unique, so a caller cannot enumerate another caller's receipts.
+rand = "0.9"
 
 [dev-dependencies]
 # `tests/guest_io.rs` redirects this process's fd 2 to prove that a guest panic

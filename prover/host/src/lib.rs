@@ -5,9 +5,10 @@
 //! source" is not "same compiled semantics"), hand back the journal it committed
 //! and the private scores it wrote to stdout.
 //!
-//! Task 5 wraps this in the `:4500` daemon. It is a library today so that
-//! `tests/guest_io.rs` and the `--execute-stdin` mode of the binary exercise
-//! exactly the same call.
+//! [`server`] wraps this in the `:4500` daemon and [`queue`] runs the proving
+//! half on its own thread. It is a library so that `tests/guest_io.rs`,
+//! `tests/api.rs`, the daemon and the `--execute-stdin` mode of the binary all
+//! exercise exactly the same call.
 //!
 //! **Nothing here may log its input.** `PolicyInputV1::canonical_request_bytes`
 //! *is* the plaintext prompt; the same redaction discipline that applies to
@@ -20,6 +21,9 @@
 //! sink for guest stderr, and every value that leaves this module on a failure
 //! path is one of the constants in `policy_core::GuestRejection` or
 //! [`UNCLASSIFIED_FAILURE`].
+
+pub mod queue;
+pub mod server;
 
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -38,15 +42,30 @@ use risc0_zkvm::{default_executor, Executor, ExecutorEnv};
 /// [`UNSAFE_DIAGNOSTICS_ENV`].
 pub const UNCLASSIFIED_FAILURE: &str = "policy guest execution failed for an unclassified reason";
 
-/// Set this to any value and [`execute_frame_with`] prints the raw executor
+/// Set this to `1` or `true` and [`execute_frame_with`] prints the raw executor
 /// error and the guest's stderr to the host's stderr on failure.
 ///
 /// **This defeats the leak defence and is named to say so.** The raw error and
 /// the guest's stderr can both contain fragments of the canonical request, which
 /// is the plaintext prompt. It exists for someone debugging the guest on their
-/// own laptop with their own input. Nothing in CI, in `pnpm test`, or in Task
-/// 5's daemon may set it.
+/// own laptop with their own input. Nothing in CI, in `pnpm test`, or in the
+/// `:4500` daemon may set it.
+///
+/// Only `1` and `true` enable it. The first version tested `var_os().is_some()`,
+/// so `CTN_UNSAFE_GUEST_DIAGNOSTICS=0` — and `=false`, and `=off` — *enabled*
+/// the dump. That is the opposite of what anyone typing it means, and the
+/// variable is one whose accidental activation prints prompt text.
 pub const UNSAFE_DIAGNOSTICS_ENV: &str = "CTN_UNSAFE_GUEST_DIAGNOSTICS";
+
+/// Whether [`UNSAFE_DIAGNOSTICS_ENV`] is set to one of the two values that mean
+/// "yes". Anything else — unset, empty, `0`, `false`, `off`, a typo, non-UTF-8
+/// — means no.
+pub fn unsafe_diagnostics_enabled() -> bool {
+    matches!(
+        std::env::var(UNSAFE_DIAGNOSTICS_ENV).as_deref(),
+        Ok("1") | Ok("true")
+    )
+}
 
 /// One executor run.
 pub struct ExecOutcome {
@@ -172,12 +191,21 @@ pub fn execute_frame_with(executor: &Rc<dyn Executor>, frame: &[u8]) -> Result<E
     let session = match result {
         Ok(session) => session,
         Err(err) => {
-            if std::env::var_os(UNSAFE_DIAGNOSTICS_ENV).is_some() {
-                eprintln!(
-                    "{UNSAFE_DIAGNOSTICS_ENV} is set — the two lines below MAY CONTAIN PROMPT TEXT\n\
-                       executor error: {err:#}\n\
-                       guest stderr:   {}",
-                    String::from_utf8_lossy(&stderr_buf).trim_end()
+            if unsafe_diagnostics_enabled() {
+                // Written straight to fd 2 rather than through `eprintln!`,
+                // which the test harness intercepts at the Rust level
+                // (`std::io::set_output_capture`) — the one place this text is
+                // asserted about is a test, so it has to travel the same way
+                // risc0's own guest-stderr writes do.
+                let _ = std::io::Write::write_all(
+                    &mut std::io::stderr(),
+                    format!(
+                        "{UNSAFE_DIAGNOSTICS_ENV} is set — the two lines below MAY CONTAIN PROMPT TEXT\n\
+                           executor error: {err:#}\n\
+                           guest stderr:   {}\n",
+                        String::from_utf8_lossy(&stderr_buf).trim_end()
+                    )
+                    .as_bytes(),
                 );
             }
             // Not `.context(err)`: the rendered error is exactly what must not

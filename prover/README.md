@@ -1,12 +1,13 @@
 # prover
 
 The real RISC Zero prover for Safety Policy v1. Phase 2a builds it; this
-directory is currently at **Task 4 — the policy guest**, which means the guest
-image now *is* Safety Policy v1: the ruleset is compiled in, the request
-commitment is recomputed inside the zkVM, and the journal it commits is the
-verifier's allowlist and nothing else. The `:4500` daemon is Task 5 and the
-offline verifier is Task 6; neither exists yet, and nothing in `services/` calls
-any of this.
+directory is currently at **Task 5 — the daemon**. The guest image *is* Safety
+Policy v1 (the ruleset is compiled in, the request commitment is recomputed
+inside the zkVM, and the journal it commits is the verifier's allowlist and
+nothing else), and `host --serve` now puts it behind `127.0.0.1:4500` with an
+executor fast path and a single-worker proving queue. The offline verifier is
+Task 6 and does not exist yet, and **nothing in `services/` calls any of this** —
+wiring the daemon into `tee-sim` is Phase 2b.
 
 Phase 1 modelled the cost of proving (`CTN_SIMULATED_PROVING_MS`, default
 2400 ms) and labelled it as modelled. Everything from Task 1 on uses
@@ -275,10 +276,44 @@ Rust identifier.)
 
 ```bash
 cd prover
+cargo run -rp host -- --serve           # the daemon, 127.0.0.1:4500
 cargo run -rp host -- --bench           # executor + prove + verify, ALLOW and DENY
 CTN_BENCH_PROVE=0 cargo run -rp host -- --bench   # executor only (proving is minutes)
 cargo run -rp host -- --execute-stdin   # newline-JSON executor service
 ```
+
+### The daemon (`--serve`)
+
+`--serve [--port N] [--dev]`. It binds `127.0.0.1` and only `127.0.0.1` — the
+bind address is not configurable, `--port` is (0 picks an ephemeral one, which is
+what the tests use). Run it under `--release`: a debug executor run is much
+slower than the 57 ms below.
+
+| Endpoint | Body | Answer |
+|---|---|---|
+| `POST /execute` | `{protocolVersion, canonicalRequestBytesB64, requestNonceHex, proofNonce, emitScores}` | `200 {journal:{…5 allowlist fields…}, privateScores:{…}\|null, execWallMs}` |
+| `POST /prove` | the same, minus `emitScores` | `202 {jobId}` |
+| `GET /jobs/:id` | — | `{status:"QUEUED"\|"PROVING"\|"GENERATED"\|"FAILED", receiptB64?, proveWallMs?, error?, devMode}` |
+| `GET /health` | — | `{imageIdHex, policyId, rulesDigest, risc0Version, devMode}` |
+
+- `receiptB64` is base64 of the **bincode**-serialized risc0 receipt — the same
+  codec `--bench` measures and the one `release.json` will pin in Task 6.
+- Unknown fields are rejected, so sending `emitScores` to `/prove` is an error
+  rather than a silently ignored option: the prove path never captures scores.
+- Every refusal is `{"error": "<one of a fixed set of strings>"}` with status
+  400 (malformed request, including a body over the 10 MiB cap or the wrong
+  content type), 404 (`no such job`, `no such endpoint`), 503 (`prove queue is
+  full`) or 500 (the daemon's own fault). **No reason string ever contains a byte
+  of the request** — the guest-side ones are the `policy_core::GuestRejection`
+  constants, the host-side ones are `&'static str`s in `host/src/server.rs`, and
+  `tests/api.rs` plants a marker in every caller-controlled field and asserts it
+  comes back in none of them and is logged nowhere.
+- The queue is one worker thread, FIFO, in memory, and dies with the process. It
+  holds at most 32 waiting jobs (`503` past that) and retains the last 64
+  finished ones. Persistence and real backpressure are Phase 2b (§5.6).
+- Logs go to **stderr** at `host=info` unless `RUST_LOG` says otherwise, and
+  carry job ids, byte counts, wall times, digests and decisions — never canonical
+  bytes, never scores, never the caller's proof nonce (its length instead).
 
 `--execute-stdin` is what `scripts/differential-test.ts` drives: one JSON request
 per line, one response per line, until EOF.
@@ -292,8 +327,8 @@ per line, one response per line, until EOF.
     "segments":…,"maxPo2":…}
 ```
 
-Field names match the `POST /execute` body Task 5 will accept, so the harness and
-the daemon speak the same vocabulary. The proving daemon itself is Task 5.
+Field names match the `POST /execute` body the daemon accepts, so the harness and
+the daemon speak the same vocabulary.
 
 ---
 
@@ -310,9 +345,13 @@ The rule for this directory:
   not a global — and exits with an error rather than printing fast, meaningless
   numbers.
 - No number in this README or in `VALIDATION.md` was produced in dev mode.
-- When the daemon lands in Task 5, dev mode must be surfaced in the receipt it
-  emits, the same way simulated attestation is labelled today. A receipt that
-  does not say it is fake is worse than no receipt.
+- **The daemon refuses to start under `RISC0_DEV_MODE` unless `--dev` is
+  passed** — it exits non-zero with a one-line reason before it binds a port.
+  With `--dev`, `/health.devMode` is `true` and *every* `/jobs/:id` response
+  carries `devMode: true`, so a fake receipt cannot be collected without the
+  daemon having said so. `--dev` is permission, not a switch: passing it without
+  the variable still reports `devMode: true`, because the claim being made is
+  "do not trust receipts from this daemon" and the flag is reason enough.
 
 ---
 
@@ -385,9 +424,11 @@ than Task 1 predicted.
 **The executor gate costs ~56 ms, not ~20 ms.** The spike's floor was 16.9–18.3 ms
 and this file told Phase 2b to budget ~20 ms per execution regardless of prompt
 size. That was a floor, and the policy guest sits about 38 ms above it. This is
-the number `tee-sim` will pay synchronously on every request once Task 5 wires
+the number `tee-sim` will pay synchronously on every request once Phase 2b wires
 `/execute` in; it does not go away by shrinking the prompt, because it is
-dominated by the ruleset, not the request.
+dominated by the ruleset, not the request. (`POST /execute` now exists and costs
+the same — see the Task 5 section below — but nothing calls it yet; the
+`tee-sim` wiring is Phase 2b.)
 
 **Proving is a little over two minutes per request, and the timing is noisy at
 the ±20% level.** Within this run, ALLOW ranged 127.3–166.8 s. Between runs it is
@@ -439,6 +480,44 @@ Nothing was optimized beyond the two hoists described above. If a later task
 needs a po2 back, those first two rows are the entire conversation — and note
 that the second one is *already* the cheap version: normalizing the needles
 in-guest instead of at build time costs 2,264,222 cycles.
+
+### Task 5 — the daemon (two runs, current image)
+
+Same machine (Apple M1 Pro, 10 cores, 32 GB, macOS 26.0.1), `--release`, dev mode
+off, backend `local`, **image `75751480…`** — the image the tables above describe
+with a `†` on their prove column. Produced by the gated end-to-end test, which
+enqueues one `POST /prove` for the `allow-001` fixture, fires one `POST /execute`
+while it is running, then verifies the returned receipt against the baked
+ImageID:
+
+```bash
+CTN_PROVE_TEST=1 cargo test -rp host --test api -- --ignored --nocapture
+```
+
+| Run | Composite prove | Receipt (bincode) | `/execute` during the prove | Machine state |
+|---|---|---|---|---|
+| 1 | 134.70 s | 525.3 KB | 66 ms | a release build + the differential suite were running |
+| 2 | 122.58 s | 525.3 KB | 90 ms | otherwise idle |
+
+**One run each, and they disagree by 10%.** That is the same ±20% prove noise the
+Task 4 section documents, and run 1 was not on an idle machine — it is reported
+rather than dropped because dropping the inconvenient run is how a ±20% number
+becomes a ±0% claim. Expect ±20% and quote **"two to three minutes on an idle
+M1 Pro, CPU-only"**, not either number.
+
+What this **does** retire from the `†` list: prove wall time and receipt size are
+now measured at the current image, and they land inside the previous image's band
+(126.14–137.69 s prove, 525.1 KB receipt). What it does **not** retire: verify
+wall time, `total_cycles`, `paging_cycles` and `reserved_cycles` still come only
+from `--bench`, are still the `4a05b4e9…` image's, and are still marked `†`. Task
+7 owns those, and owns re-measuring all of it properly rather than one run at a
+time.
+
+**`/execute` is not starved by a prove in flight, on this one probe.** 66 ms and
+90 ms against a ~57 ms idle median — the prove worker is a separate OS thread and
+the tokio runtime keeps its own. Two samples of one concurrent request is not a
+load characterisation; the test's assertion is the weak one it can defend
+(under 2 s), and the numbers above are the observation.
 
 ### Task 1 — the spike guest (a different, much smaller program)
 
@@ -563,9 +642,11 @@ prompts. Specifically **not** shown:
   20–26% at the median, and the within-run ALLOW spread is 127–167 s. There is a
   central tendency of roughly two to three minutes and no evidence for anything
   tighter. The cause of the between-run drift was not investigated.
-- **Prove numbers for the current image.** They are the previous image's, marked
-  `†` above. The delta is +0.76% user cycles; whether that is visible at all is
-  an expectation, not a measurement. Task 7 owns it.
+- **A full set of prove numbers for the current image.** Task 5 measured *prove
+  wall time and receipt size* at image `75751480…` (two single runs, below), which
+  retires the `†` on those two quantities only. Verify time, `total_cycles`,
+  `paging_cycles` and `reserved_cycles` are still the previous image's — they come
+  out of `--bench`, not out of the daemon, and Task 7 owns re-measuring them.
 - **Anything about GPUs.** Proving here is CPU-only (next section). A risc0 that
   re-enables the Metal path invalidates every prove number on this page, by an
   unmeasured amount.
@@ -580,10 +661,12 @@ prompts. Specifically **not** shown:
   fixture corpus is where the distribution comes from.
 - **Cross-machine reproducibility of the image.** Two builds on one machine with
   one toolchain, as the section above says.
-- **Concurrency.** Every number is a single request on an otherwise idle laptop.
-  What happens when the Task 5 daemon executes and proves at the same time is
-  unmeasured, and the prove worker is deliberately one thread partly because that
-  is unmeasured.
+- **Concurrency, beyond one probe.** Task 5 measured a single `/execute` fired
+  during a single in-flight prove (66 ms and 90 ms, two runs) — enough to show
+  the executor is not starved, not enough to characterise the daemon under load.
+  Nothing here measures several concurrent `/execute` calls, a full queue, or
+  what a second prove would do; the prove worker is one thread partly because
+  that is unmeasured.
 
 ### Proving is CPU-only
 
@@ -700,17 +783,33 @@ The guest lint needs both halves of that incantation and neither is optional.
 values are copied from `risc0-build-3.0.6/src/lib.rs:455-503`; `-Ttext` and the
 link args are omitted because `clippy` does not link.
 
-`cargo test` is executor-only and stays fast. `host/tests/guest_io.rs` runs the
-real image sixteen ways — ALLOW and DENY journals against independently
+One test proves, and it is `#[ignore]`d twice over — by the attribute and by an
+env var — because it is minutes:
+
+```bash
+CTN_PROVE_TEST=1 cargo test -rp host --test api -- --ignored --nocapture
+```
+
+`cargo test` is otherwise executor-only and stays fast. `host/tests/api.rs`
+spawns the real binary and drives it over a socket: `/health` against the baked
+identities, `/execute` for ALLOW and DENY (determinism on identical input,
+scores present only when asked), eleven malformed-request shapes against both
+POST endpoints with a marker planted in every caller-controlled field, a body
+over the 10 MiB cap, the job lifecycle end to end in dev mode, the dev-mode
+startup refusal (the process must exit non-zero *before* it binds), and a
+log-capture assertion that reads the daemon's stdout and stderr and finds
+neither the prompt, nor its base64 framing, nor the caller's proof nonce.
+`host/tests/guest_io.rs` runs the real image seventeen ways — ALLOW and DENY journals against independently
 recomputed commitments, the allowlist key set, canonical-JSON ordering,
 `emitScores: false` writing nothing, a rejected protocol version, a rejected
 non-canonical request, a rejected padded frame, determinism across two runs, the
 `proofNonce` bound in both directions (every nonce this repository mints is
 accepted; six out-of-bound shapes are refused with the taxonomy constant), and
 the leak probes, which plant a marker in six positions `serde_json` used to quote
-back and assert it reaches neither the caller nor the process's stderr. Nothing in the test suite proves, because proving belongs in `--bench`
-— which, at these po2s, is a **~30 minute** command. Use `CTN_BENCH_PROVE=0`
-while iterating.
+back and assert it reaches neither the caller nor the process's stderr, plus the
+`CTN_UNSAFE_GUEST_DIAGNOSTICS` predicate (`=0` must mean off, with `=1` as the
+positive control). A full `--bench`, at these po2s, is a **~30 minute** command;
+use `CTN_BENCH_PROVE=0` while iterating.
 
 `prover/target/` and `prover/methods/guest/target/` (both matched by `target/`)
 are the only gitignored paths here. Both `Cargo.lock` files are committed on

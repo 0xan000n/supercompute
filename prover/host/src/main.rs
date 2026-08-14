@@ -27,6 +27,12 @@
 //! It runs the real image in the executor — the same call `tests/guest_io.rs`
 //! makes — so `scripts/differential-test.ts` can assert that the journal the
 //! *image* commits matches what the TypeScript protocol code computes.
+//!
+//! `--serve` is the daemon: `127.0.0.1:4500`, serving `/execute`, `/prove`,
+//! `/jobs/:id` and `/health`. The routing and the queue live in `host::server`
+//! and `host::queue`; what lives here is the startup policy — which arguments
+//! exist, what makes the process refuse to run, and what it says about itself
+//! before it binds.
 
 use std::io::{self, BufRead, BufWriter, Write};
 use std::rc::Rc;
@@ -34,6 +40,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use base64::prelude::{Engine as _, BASE64_STANDARD};
+use host::queue::ProveQueue;
+use host::server::AppState;
 use host::{execute_policy_with, image_id_hex, policy_frame};
 use methods::{POLICY_GUEST_ELF, POLICY_GUEST_ID, POLICY_ID_V2, RULES_DIGEST};
 use policy_core::{PolicyInputV1, PROTOCOL_VERSION};
@@ -497,12 +505,18 @@ fn handle_stdin(req: StdinRequest, executor: &Rc<dyn risc0_zkvm::Executor>) -> S
             proof_nonce,
             emit_scores,
         } => {
+            // Fixed string, not `{e}`. `base64`'s error interpolates the
+            // offending byte and its offset ("Invalid symbol 33, offset 4"),
+            // which is a slow but real read of caller-supplied text on a surface
+            // that shares its discipline with the daemon. Every reason string
+            // this mode returns is now a constant, for the same reason
+            // `GuestRejection` is.
             let canonical_request_bytes = match BASE64_STANDARD.decode(&canonical_request_bytes_b64)
             {
                 Ok(b) => b,
-                Err(e) => {
+                Err(_) => {
                     return StdinResponse::Failed {
-                        error: format!("canonicalRequestBytesB64 is not base64: {e}"),
+                        error: "canonicalRequestBytesB64 is not valid base64".to_owned(),
                     }
                 }
             };
@@ -526,8 +540,8 @@ fn handle_stdin(req: StdinRequest, executor: &Rc<dyn risc0_zkvm::Executor>) -> S
                         segments: out.segments,
                         max_po2: out.max_po2,
                     },
-                    Err(e) => StdinResponse::Failed {
-                        error: format!("journal is not UTF-8: {e}"),
+                    Err(_) => StdinResponse::Failed {
+                        error: "journal is not UTF-8".to_owned(),
                     },
                 },
                 // Already reduced to a `GuestRejection` constant (or
@@ -563,8 +577,11 @@ fn execute_stdin() -> Result<()> {
         }
         let response = match serde_json::from_str::<StdinRequest>(&line) {
             Ok(req) => handle_stdin(req, &executor),
-            Err(e) => StdinResponse::Failed {
-                error: format!("bad request: {e}"),
+            // Fixed, for the same reason as the base64 arm above and then some:
+            // a `serde_json` type error quotes the value it choked on, and the
+            // values on this line include the base64 of the plaintext prompt.
+            Err(_) => StdinResponse::Failed {
+                error: "line is not a well-formed request".to_owned(),
             },
         };
         serde_json::to_writer(&mut out, &response)?;
@@ -576,20 +593,123 @@ fn execute_stdin() -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// --serve
+// ---------------------------------------------------------------------------
+
+/// The port the spec names (§4). `--port` overrides it, which exists for tests
+/// (port 0 → an ephemeral port) and for running two daemons on one machine.
+const DEFAULT_PORT: u16 = 4500;
+
+fn serve(args: &[String]) -> Result<()> {
+    let mut port = DEFAULT_PORT;
+    let mut dev_flag = false;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--dev" => dev_flag = true,
+            "--port" => {
+                let value = rest.next().context("--port needs a value")?;
+                port = value.parse().context("--port must be a number 0-65535")?;
+            }
+            other => bail!("unknown argument {other:?}; see --help"),
+        }
+    }
+
+    // Dev mode is decided by the environment, and `ProverOpts::composite()` is
+    // where risc0 reads it — so ask the options that would actually be proved
+    // with, not a global. A dev-mode receipt is a stub: the prover returns
+    // almost immediately and any verifier not built with `disable-dev-mode`
+    // accepts it. A daemon that produced those without saying so would be the
+    // single most misleading thing in this repository, so it does not start.
+    let dev_active = ProverOpts::composite().dev_mode();
+    if dev_active && !dev_flag {
+        eprintln!(
+            "refusing to start: RISC0_DEV_MODE is set, so every receipt would be an unproved stub. Unset it, or pass --dev to run a daemon that stamps devMode on everything it returns."
+        );
+        std::process::exit(2);
+    }
+
+    // `default_prover` will happily return a *remote* prover if the environment
+    // points at one, and the frame it would ship contains the plaintext prompt.
+    // Leaving this process is exactly what may not happen silently.
+    let backend = default_prover().get_name();
+    if backend != "local" {
+        bail!(
+            "prover backend is {backend:?}, expected \"local\". This daemon proves in-process; \
+             a remote backend would ship the plaintext request off this machine. Unset \
+             RISC0_PROVER / BONSAI_API_URL / BONSAI_API_KEY."
+        );
+    }
+    match std::env::var("RISC0_EXECUTOR") {
+        Ok(v) if !v.is_empty() && v.to_lowercase() != "local" => {
+            bail!("RISC0_EXECUTOR is set to {v:?}, which moves execution out of process. Unset it.")
+        }
+        _ => {}
+    }
+
+    // `--dev` is permission, not a switch: it does not turn dev mode on, it
+    // allows an environment that already has. Reporting `devMode: true` for a
+    // daemon started with the flag but without the variable is deliberate
+    // over-reporting — "do not trust receipts from this daemon" is the claim,
+    // and the flag is enough reason to make it.
+    let dev_mode = dev_flag || dev_active;
+    if dev_mode {
+        tracing::warn!(
+            dev_active,
+            dev_flag,
+            "DEV MODE: receipts from this daemon may be unproved stubs and every response says so"
+        );
+    }
+    tracing::info!(
+        image_id = %image_id_hex(),
+        policy_id = POLICY_ID_V2,
+        rules_digest = RULES_DIGEST,
+        risc0_version = risc0_zkvm::VERSION,
+        backend,
+        dev_mode,
+        "policy prover daemon"
+    );
+
+    let state = AppState {
+        queue: ProveQueue::start(dev_mode),
+        dev_mode,
+    };
+    // One runtime for HTTP. Proving is not on it — `ProveQueue` owns a thread.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building the tokio runtime")?
+        .block_on(host::server::serve(port, state))
+}
+
 fn main() -> Result<()> {
+    // Logs go to **stderr**, not stdout: `--execute-stdin` speaks a
+    // newline-delimited JSON protocol on stdout and a log line in the middle of
+    // it would corrupt the stream. The default filter is `host=info` so the
+    // daemon says something without RUST_LOG being set; risc0's own targets stay
+    // quiet unless asked for, which also keeps its executor traces (which can
+    // mention guest state) out of the daemon's output by default.
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::filter::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::filter::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::filter::EnvFilter::new("host=info")),
+        )
         .init();
 
-    let mode = std::env::args().nth(1);
-    match mode.as_deref() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
         Some("--bench") => bench(),
         Some("--execute-stdin") => execute_stdin(),
+        Some("--serve") => serve(&args[1..]),
         _ => {
-            eprintln!("usage: cargo run -rp host -- --bench");
+            eprintln!("usage: cargo run -rp host -- --serve [--port N] [--dev]");
+            eprintln!("       cargo run -rp host -- --bench");
             eprintln!("       cargo run -rp host -- --execute-stdin");
             eprintln!();
-            eprintln!("Phase 2a. The :4500 proving daemon arrives in Task 5.");
+            eprintln!("--serve binds 127.0.0.1 only and refuses to start under RISC0_DEV_MODE");
+            eprintln!("unless --dev is passed, in which case every response is stamped devMode.");
             std::process::exit(2);
         }
     }
