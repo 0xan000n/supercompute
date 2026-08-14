@@ -212,7 +212,7 @@ pub struct PolicyInputV1 {
     pub protocol_version: u32,            // must be 1
     pub canonical_request_bytes: Vec<u8>, // the SIGNED canonical request, verbatim
     pub request_nonce: [u8; 32],
-    pub proof_nonce: String,              // caller-chosen, echoed in the journal
+    pub proof_nonce: String,              // caller-chosen; guest-validated ^(0x)?[0-9a-f]{1,64}$ (Task 4 fix round 1 — an unbounded host field was a journal exfiltration channel), then echoed in the journal
     pub emit_scores: bool,                // executor mode only; prove path sends false
 }
 
@@ -336,7 +336,7 @@ git commit -m "prover/verify: offline verifier pinned to release.json, dev-mode 
 - Modify: `VALIDATION.md` (§66 addendum finalized), `prover/README.md`, root `README.md`
 - Modify: `apps/web/src/app/trust/page.tsx` — ONLY if a claim there is now false; otherwise leave it (the trust-page rewrite belongs to 2b when the proof is actually wired in). Read it and decide; state the decision in the report.
 
-- [ ] **Step 1: Bench over the fixture corpus:** executor latency distribution across all 125 fixture requests (min/median/p95), 3 real composite proofs (one ALLOW, one DENY, one adversarial) timed end-to-end incl. verify.
+- [ ] **Step 1: Bench over the fixture corpus:** executor latency distribution across all 125 fixture requests (min/median/p95), 3 real composite proofs (one ALLOW, one DENY, one adversarial) timed end-to-end incl. verify. **Debt from Task 4 fix round 1:** prove/receipt/verify numbers and total/paging/reserved cycles in `prover/README.md` are still the PRIOR image's (`4a05b4e9…`, marked †) — this bench re-measures them at the current image and retires the daggers; also fix the undaggered prose restatements the re-review flagged (README ~:255-260, :393-421, :674, and the backwards-reading delta at :340).
 - [ ] **Step 2: Record** in VALIDATION §66 (replacing the spike's provisional numbers) with the honest sentence about what they mean for a live demo (per-request gate cost; proof lag).
 - [ ] **Step 3: Docs:** `prover/README.md` = install, build, bench, verify walkthrough (the "anyone can verify" §5.2 promise, written down); root README gains the Rust prerequisite + one paragraph on what `prover/` is and is not (not yet wired into the demo — 2b).
 - [ ] **Step 4: Full gates:** cargo suite; `pnpm test` (incl. differential); tsc; web build untouched-but-run.
