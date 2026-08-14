@@ -380,6 +380,50 @@ fn trailing_bytes_in_the_frame_fail_the_session() {
 // The leak probes
 // ---------------------------------------------------------------------------
 
+/// The lock every test that mutates process-global state must hold.
+///
+/// Two mutations here are process-wide, not per-test: the fd-2 swap in
+/// `capturing_process_stderr` and `set_var`/`remove_var` on
+/// `CTN_UNSAFE_GUEST_DIAGNOSTICS`. libtest runs tests as threads of one
+/// process, in parallel by default, so unserialized they interleave — and this
+/// is not theoretical. On a loaded machine, 2 of 15 runs of this file printed
+/// the diagnostics banner and a guest panic to the *real* process stderr while
+/// the suite still reported all-pass (one test had the env var on while a
+/// sibling held the capture, so the sibling's dup2 restore reopened the window),
+/// and a third run died with `dup(2) failed`. Worse than the noise: a sibling's
+/// restore can end a capture early, so a "stderr is clean" assertion passes
+/// vacuously.
+///
+/// Both mutations take the *same* lock, because they are not independent —
+/// serializing them separately still lets an env change straddle someone else's
+/// capture window.
+///
+/// A `Mutex` only orders threads within one test binary. That is sufficient
+/// here: cargo gives each integration-test file its own process, and
+/// `tests/api.rs` — the only sibling — neither swaps a descriptor nor writes to
+/// the environment (it reads `CTN_PROVE_TEST` and reads its children's piped
+/// stdout/stderr, which are not this process's). A second file that did either
+/// would need its own static, plus `--test-threads=1` or a file lock to be
+/// ordered against this one.
+static PROCESS_GLOBAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Held for the whole window in which fd 2 or the environment is mutated.
+///
+/// `capturing_process_stderr` takes one by reference rather than acquiring it
+/// itself, so a test that also touches the environment can hold a single guard
+/// across both — `Mutex` is not reentrant, and acquiring inside the capture
+/// would deadlock such a test. Making the guard an argument means the lock
+/// cannot be forgotten: there is no way to call the capture without one.
+struct ProcessGlobal(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+/// `unwrap_or_else(into_inner)` rather than `unwrap`: a panicking test poisons
+/// the mutex, and a poisoned mutex would turn one real failure into a cascade of
+/// unrelated ones. The data behind the lock is `()`, so there is no invariant a
+/// panic could have left broken.
+fn process_global() -> ProcessGlobal {
+    ProcessGlobal(PROCESS_GLOBAL.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 /// Redirect this process's fd 2 to a temp file for the duration of `f`, then
 /// give back everything written to it.
 ///
@@ -391,10 +435,9 @@ fn trailing_bytes_in_the_frame_fail_the_session() {
 ///
 /// `dup`/`dup2` rather than a Rust-level shim because the write happens inside
 /// risc0, through `std::io::stderr()`, which no Rust-level indirection here can
-/// reach. Cargo runs tests in threads of one process, so this briefly redirects
-/// every thread's stderr; the assertions are all "the secret is absent", so an
-/// interleaved line from another test can only add noise, never a false pass.
-fn capturing_process_stderr<T>(f: impl FnOnce() -> T) -> (T, String) {
+/// reach. The swap is process-wide, hence the `ProcessGlobal` the caller must
+/// already hold.
+fn capturing_process_stderr<T>(_serialized: &ProcessGlobal, f: impl FnOnce() -> T) -> (T, String) {
     let mut file = tempfile::tempfile().expect("temp file for stderr capture");
     // Flush anything buffered before the swap so it lands in the real stderr.
     std::io::stderr().flush().ok();
@@ -469,6 +512,7 @@ fn leak_probes(secret: &str) -> Vec<(&'static str, Vec<u8>)> {
 #[test]
 fn a_rejected_request_leaks_nothing_to_the_caller_or_to_stderr() {
     const SECRET: &str = "PLANTED_SECRET_XYZZY";
+    let lock = process_global();
     for (label, bytes) in leak_probes(SECRET) {
         // Valid hex, deliberately: the proof-nonce bound is checked before the
         // request is parsed, so a nonce the guest rejects would make every probe
@@ -481,7 +525,7 @@ fn a_rejected_request_leaks_nothing_to_the_caller_or_to_stderr() {
         );
         inp.canonical_request_bytes = bytes;
 
-        let (result, stderr) = capturing_process_stderr(|| host::execute_policy(&inp));
+        let (result, stderr) = capturing_process_stderr(&lock, || host::execute_policy(&inp));
         let err = result
             .map(|_| ())
             .expect_err(&format!("guest accepted {label}"));
@@ -510,7 +554,8 @@ fn a_rejected_request_leaks_nothing_to_the_caller_or_to_stderr() {
 fn a_rejected_proof_nonce_leaks_nothing_to_stderr() {
     const SECRET: &str = "PLANTED_NONCE_SECRET_QUUX";
     let inp = input(&ALLOW_MESSAGES, SECRET, false);
-    let (result, stderr) = capturing_process_stderr(|| host::execute_policy(&inp));
+    let lock = process_global();
+    let (result, stderr) = capturing_process_stderr(&lock, || host::execute_policy(&inp));
     assert!(result.is_err(), "guest accepted a non-hex proof nonce");
     assert!(
         !stderr.contains(SECRET),
@@ -535,6 +580,11 @@ fn a_rejected_proof_nonce_leaks_nothing_to_stderr() {
 fn diagnostics_are_off_unless_the_value_says_on() {
     const BANNER: &str = "MAY CONTAIN PROMPT TEXT";
     const SECRET: &str = "PLANTED_DIAGNOSTICS_SECRET_ZORK";
+
+    // Held across every `set_var` *and* every capture below, not re-taken per
+    // iteration: the window in which this process has the diagnostics variable
+    // set is exactly the window in which no sibling test may be capturing fd 2.
+    let lock = process_global();
 
     // A request the guest refuses, so the diagnostics branch is reached at all.
     let mut inp = input(&ALLOW_MESSAGES, "0x1ea4", false);
@@ -561,7 +611,7 @@ fn diagnostics_are_off_unless_the_value_says_on() {
             "{value:?} decided the wrong way"
         );
 
-        let (result, stderr) = capturing_process_stderr(|| host::execute_policy(&inp));
+        let (result, stderr) = capturing_process_stderr(&lock, || host::execute_policy(&inp));
         assert!(result.is_err(), "the guest accepted the probe");
         assert_eq!(
             stderr.contains(BANNER),
@@ -577,6 +627,7 @@ fn diagnostics_are_off_unless_the_value_says_on() {
         }
     }
     std::env::remove_var(host::UNSAFE_DIAGNOSTICS_ENV);
+    drop(lock);
 }
 
 /// The defence is two independent layers, and this checks the second one on its
