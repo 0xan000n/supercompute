@@ -347,13 +347,20 @@ async function run56_2(): Promise<void> {
 async function run56_3(): Promise<void> {
   await test("56.3", "replayed request nonce -> second submission rejected", async () => {
     const att = await client.attestation();
-    const nonce = randomHex(32);
-    const { envelope: env1 } = await sealCustom(
-      att,
-      { model: MODEL_A, messages: [{ role: "user", content: `replay-1 ${randomUUID()}` }] },
-      { nonce }
-    );
-    const r1 = await postSecure(env1);
+    // Routing may draw Erin's 429ing credential (see completionRetryingRateLimits);
+    // a dispatched failure consumes the nonce, so each retry re-seals with a fresh one.
+    let nonce = "";
+    let r1: { status: number; json: any } = { status: 0, json: undefined };
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      nonce = randomHex(32);
+      const { envelope: env1 } = await sealCustom(
+        att,
+        { model: MODEL_A, messages: [{ role: "user", content: `replay-1 ${randomUUID()}` }] },
+        { nonce }
+      );
+      r1 = await postSecure(env1);
+      if (r1.status === 200 || r1.json?.error?.code !== "CTN_PROVIDER_RATE_LIMITED") break;
+    }
     assert(r1.status === 200, `first submission with a fresh nonce should succeed, got ${r1.status} ${JSON.stringify(r1.json)}`);
 
     const { envelope: env2 } = await sealCustom(
