@@ -63,9 +63,15 @@ rand = "0.9"
 # Locates rzup's default Rust toolchain — the compiler `risc0-build` forces into
 # the guest build — so `--emit-release` can pin the compiler that produced the
 # ImageID. Same crate and the same call `risc0-build-3.0.6/src/lib.rs:373-383`
-# makes, so the recorded version cannot drift from the one that was used. It is
-# already in this workspace's lock file as a dependency of `risc0-build`.
-rzup = "0.5"
+# makes, so the recorded version cannot drift from the one that was used.
+#
+# `default-features = false` is how `risc0-build` itself takes it, and it is not
+# cosmetic: rzup's default features are its *installer*, and taking them added 99
+# packages to prover/Cargo.lock — aws-config, aws-sdk-secretsmanager, aws-lc-sys,
+# clap, indicatif, tar and the rest of a downloader-with-credentials. This build
+# script reads one already-installed toolchain path; it downloads nothing and
+# authenticates to nothing, and the dependency graph should say so.
+rzup = { version = "0.5", default-features = false }
 
 [dev-dependencies]
 # `tests/guest_io.rs` redirects this process's fd 2 to prove that a guest panic

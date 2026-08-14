@@ -56,6 +56,17 @@ takes a while; several minutes is normal.
 --emit-release` reads them out of the build that produced the image, so they
 cannot drift from this table without the table being visibly wrong.
 
+The two Unicode versions come from **`prover/methods/guest/Cargo.lock`**, not
+from `prover/Cargo.lock`: the guest is its own cargo workspace with its own
+committed lock, and that lock is what the guest compiler resolves against, so it
+is the one that governs what is compiled into the image. If the prover
+workspace's lock ever pins a different version of either crate, `host/build.rs`
+panics and names both files — the ImageID is the real pin, so drift between the
+locks changes nothing that was proved, but two answers to one question is not
+something anyone should discover while reading a `release.json`.
+`host/tests/lock_pins.rs` tests those rules directly, against the same code the
+build script runs.
+
 `rust-toolchain.toml` still says `channel = "stable"`, and that is a decision
 rather than an oversight. The toolchain that determines the ImageID is the
 **guest** one, and it is already pinned outside cargo: `risc0-build` looks up
@@ -112,6 +123,8 @@ prover/
     guest/src/main.rs   the guest: runs inside the zkVM
   host/
     build.rs            records the toolchains that built this binary
+    build_lock.rs       Cargo.lock reading, include!d by build.rs and tested by
+                        tests/lock_pins.rs
     src/lib.rs          execute_policy — run the image in the executor
     src/main.rs         --bench, --execute-stdin, --serve, --emit-release
     src/release.rs      builds release.json
@@ -420,40 +433,102 @@ A receipt is only worth something to someone who did not produce it. This is the
 program that lets them check one, on their own machine, with no network and no
 trust in whoever handed them the file.
 
-```bash
-cd prover/verify
-cargo build --release
-./target/release/prover-verify \
-    --receipt tests/fixtures/allow-real.receipt.bin \
-    --release ../release.json
-```
-
-Run from the repository root instead and the defaults line up:
+Build it, then run it from the repository root, where the defaults line up:
 `--release` defaults to `prover/release.json`, and the policy directory defaults
 to `policy/v1` *relative to the manifest*, not to the working directory.
 
-```text
-[ ok ] manifest                   pins imageId 75751480a7e7…, journalVersion 1, risc0 3.0.6, built 2026-08-14T09:09:59Z
+```console
+$ cd prover/verify && cargo build --release && cd ../..
+$ ./prover/verify/target/release/prover-verify \
+    --receipt prover/verify/tests/fixtures/allow-real.receipt.bin
+prover-verify
+  release manifest: prover/release.json
+  receipt:          prover/verify/tests/fixtures/allow-real.receipt.bin (537794 bytes)
+
+[ ok ] manifest                   pins imageId 75751480a7e7d6b329de6614fee99e8d2cf9a793c32e9c1e3de057f8196b0ee1, journalVersion 1, risc0 3.0.6, built 2026-08-14T09:09:59Z
 [ ok ] receipt-codec              bincode-v1
-[ ok ] receipt-decodes            537794 bytes
-[ ok ] image-id                   the receipt claims 75751480a7e7…
+[ ok ] receipt-decodes            537794 bytes, all of them decoded
+[ ok ] image-id                   the receipt claims 75751480a7e7d6b329de6614fee99e8d2cf9a793c32e9c1e3de057f8196b0ee1
 [ ok ] seal                       cryptographically valid for the pinned imageId
 [ ok ] journal-parses             JSON object, 259 bytes
 [ ok ] journal-key-set            exactly {decision, policyId, proofNonce, protocolVersion, requestCommitment}
 [ ok ] journal-protocol-version   1
 [ ok ] journal-decision           ALLOW
-[ ok ] journal-request-commitment 0x8873f02c…
+[ ok ] journal-request-commitment 0x8873f02c5c418bd7d13f302162d91f4991bbedf8f531572fee74ba4b26a169c6
 [ ok ] journal-proof-nonce        0xbe0c0000000000000000000000000000
-[ ok ] policy-id                  journal and manifest agree: 0x1f74ba4f…
-[ ok ] rules-digest               re-derived from policy/v1: 0x9f85ba59…
+[ ok ] policy-id                  journal and manifest agree: 0x1f74ba4f2353012cd26f5d3279625c3b45e927eeb341f0ee4b72124b056a7db2
+[ ok ] rules-digest               re-derived from prover/../policy/v1: 0x9f85ba59fd1429f10c373efc56d69aefa255a01a08df3ab6bd8e1ccecd3f93ea
 
 VERIFIED
+  This receipt was produced by the image pinned in the release manifest, and the journal above is what that image committed.
+  It does NOT establish that any gateway consulted this proof before answering a request; wiring the proof into the request path is Phase 2b.
+  Image built with rustc 1.97.0-dev (e638c6cfe 2026-07-15) (guest) / 1.97.1 (8bab26f4f 2026-07-14) (host), risc0 3.0.6.
+$ echo $?
+0
 ```
 
-Exit 0 verified, 1 a check failed (the first failing check is named twice: on its
-own line and in the last line of output), 2 a usage error. `--expect-commitment`,
-`--expect-decision` and `--expect-proof-nonce` add checks for a caller who knows
-what the answer should have been.
+Every transcript in this section is a verbatim capture from that binary, at the
+paths shown, on the machine described under "Measured on this machine". Where a
+transcript below starts at `…`, the lines above it are the ones already shown
+here and nothing else has been edited.
+
+`--expect-commitment`, `--expect-decision` and `--expect-proof-nonce` add checks
+for a caller who knows what the answer should have been.
+
+### The exit contract
+
+**Exit 0 means every check ran and passed.** Not "nothing failed": a check that
+could not run is not a check that passed, so a missing input is a failure like
+any other.
+
+| exit | meaning |
+|---|---|
+| 0 | every check ran and passed — or `rules-digest` was skipped, and only ever by `--no-policy-dir`, which the report says on the line and repeats in the summary |
+| 1 | a check failed, or a check could not run. The first failing check is named twice: on its own `[FAIL]` line and in the last line of output |
+| 2 | a usage error, an unreadable input file, or `RISC0_DEV_MODE` set to a value risc0 treats as enabled. `--help` is **not** a usage error and exits 0 |
+
+`rules-digest` is the only check with an input the receipt does not carry, so it
+is the only one where this distinction bites. There are three ways to ask for it
+and they are three different questions:
+
+```console
+$ ./prover/verify/target/release/prover-verify \
+    --receipt prover/verify/tests/fixtures/allow-real.receipt.bin \
+    --policy-dir /tmp/empty-policy
+…
+[FAIL] rules-digest               policy files unreadable at /tmp/empty-policy: --policy-dir must name a directory holding a readable rules.json and manifest.json. Pass --no-policy-dir to skip this check deliberately.
+
+NOT VERIFIED — first failing check: rules-digest
+$ echo $?
+1
+```
+
+An explicit `--policy-dir` is a question the operator asked; answering it with a
+shrug and exit 0 would report a receipt as checked against rules that were never
+read. A **missing default** path is exit 1 for the same reason, and its message
+names `--no-policy-dir` as the way to proceed on purpose.
+
+```console
+$ ./prover/verify/target/release/prover-verify \
+    --receipt prover/verify/tests/fixtures/allow-real.receipt.bin \
+    --no-policy-dir
+…
+[ -- ] rules-digest               skipped by flag (--no-policy-dir): rulesDigest is pinned by the manifest and was NOT re-derived
+
+VERIFIED
+  This receipt was produced by the image pinned in the release manifest, and the journal above is what that image committed.
+  It does NOT establish that any gateway consulted this proof before answering a request; wiring the proof into the request path is Phase 2b.
+  Image built with rustc 1.97.0-dev (e638c6cfe 2026-07-15) (guest) / 1.97.1 (8bab26f4f 2026-07-14) (host), risc0 3.0.6.
+  1 check(s) marked [ -- ] were skipped by --no-policy-dir and were NOT verified.
+$ echo $?
+0
+```
+
+That is the one deliberate hole in the contract, and it is exactly as wide as it
+looks: with `--no-policy-dir`, a manifest whose `rulesDigest` is wrong also exits
+0, because nothing was asked to check it. The flag is for someone who has the
+receipt and the manifest but not the policy files; it is not a way to make a run
+green.
 
 ### What each check means
 
@@ -461,7 +536,7 @@ what the answer should have been.
 |---|---|
 | `manifest` | `release.json` parses as a manifest — every field present, none unknown, the identities the right shape. An unknown key is a refusal, not a shrug: a verifier that ignores a field is trusting a claim it did not read. |
 | `receipt-codec` | the manifest names a codec this binary can decode (`bincode-v1`). |
-| `receipt-decodes` | the file is a `risc0_zkvm::Receipt` under that codec. |
+| `receipt-decodes` | the file is a `risc0_zkvm::Receipt` under that codec — **the whole file**. Trailing bytes are refused (`reject_trailing_bytes`), so the byte count printed is a count of bytes that were decoded rather than a count of bytes on disk. `bincode`'s default is to decode a receipt out of the prefix and ignore the rest, which made a real receipt with anything appended verify. |
 | `image-id` | the ImageID in the receipt's claim is the pinned one. Split out from `seal` so "a valid proof of the wrong program" reads differently from "not a valid proof". |
 | `seal` | the zero-knowledge proof verifies against the pinned ImageID, the guest exited `Halted(0)`, and the journal is the one the proof commits to. **This is the check that carries the weight.** |
 | `journal-parses` | the committed bytes are a JSON object. The journal is *parsed, never re-encoded* — the bytes are already bound by the seal, so re-canonicalizing them would only test this program's serializer. |
@@ -471,7 +546,7 @@ what the answer should have been.
 | `journal-request-commitment` | `0x` + 64 lowercase hex. |
 | `journal-proof-nonce` | inside `^(0x)?[0-9a-f]{1,64}$`. The guest enforces this bound too, but the guest is *the thing being authenticated* — a journal from any other image is bounded by nothing, and `proofNonce` is the only variable-length field in a public artifact. Checked here so a fat nonce fails on a named check rather than sliding through the key-set test. |
 | `policy-id` | the `policyId` the image committed is the one the manifest pins. |
-| `rules-digest` | `policy/v1/{rules,manifest}.json` re-derive the manifest's `policyId` **and** `rulesDigest`, through `policy_core::policy_id` — the same function the guest's build script used. |
+| `rules-digest` | `policy/v1/{rules,manifest}.json` re-derive the manifest's `policyId` **and** `rulesDigest`, through `policy_core::policy_id` — the same function the guest's build script used. The only check whose input the receipt does not carry, and so the only one governed by the exit contract above: no readable policy files is exit 1 unless `--no-policy-dir` said to skip it. |
 
 That last one is the only check that looks outside the receipt, and it has to.
 `rulesDigest` is not in the journal and no receipt can attest to it. What *is* in
@@ -479,8 +554,9 @@ the journal is `policyId = sha256(canonical_manifest ‖ rules_bytes)`, and
 `rulesDigest = sha256(rules_bytes)` — so re-deriving both from the same two files,
 with the `policyId` half already matched against the journal, ties the pinned
 digest to the exact rules bytes the proving image was built from. Without the
-files the check reports `[ -- ]` (not available) and the summary counts it;
-`--no-policy-dir` asks for that explicitly. It is never silently skipped.
+files it is exit 1; with `--no-policy-dir` it reports `[ -- ]`, says the flag
+skipped it, and the summary counts it. It is never silently skipped and never
+quietly passed.
 
 ### What verification does and does not establish
 
@@ -517,7 +593,15 @@ way any invalid proof does, and the note explaining what it was is printed
 
 Setting `RISC0_DEV_MODE=1` in the verifier's own environment cannot change that —
 risc0 panics on the contradiction, and this binary pre-empts the panic with a
-sentence and exit 2.
+sentence and exit 2. "Set" means what risc0 means by it: the variable
+lowercased is `1`, `true` or `yes` (`risc0-zkvm-3.0.6/src/lib.rs:204-209`).
+`RISC0_DEV_MODE=0` is *off* to risc0 and is off here too, so the verifier runs
+normally under it — refusing there would have made the tool unusable in any CI
+image that exports the variable disabled, without rejecting one extra receipt.
+The same predicate discipline as `--bench` and the daemon, which ask
+`ProverOpts::composite().dev_mode()` rather than inventing a second reading of
+the variable; this binary cannot call that (with `disable-dev-mode` compiled in,
+that call is the panic being pre-empted), so it mirrors it.
 
 The claim was checked by removing the feature. Rebuilt without
 `disable-dev-mode` and run with `RISC0_DEV_MODE=1`, the same binary **accepts the
@@ -530,40 +614,61 @@ build rejects it, exit 1.)
 Structural first. `risc0-zkvm` is taken with `default-features = false`, which
 drops two defaults that both speak HTTP: `bonsai` (a client for a remote proving
 service) and `client` (which pulls in `rzup`, a toolchain downloader, and
-`risc0-build`). What is left is 148 crates with nothing network-capable in them:
+`risc0-build`). What is left has nothing network-capable in it. Both numbers and
+both greps below are reproducible with the commands as written:
 
 ```console
-$ cd prover/verify && cargo tree | grep -Ei 'reqwest|hyper|tokio|bonsai|rzup|risc0-build|rustls|native-tls|openssl|curl|ureq'
-$                       # no output
+$ cd prover/verify && cargo tree --prefix none | awk '{print $1}' | sort -u | grep -v '^$' | wc -l
+     142
 
-$ cd prover && cargo tree -p host | grep -Ei 'reqwest|hyper|rzup|risc0-build' | head
-hyper v0.14.32
+$ cd prover/verify && cargo tree | grep -Ei 'reqwest|hyper|tokio|bonsai|rzup|risc0-build|rustls|native-tls|openssl|curl|ureq'
+$                       # no output, exit 1
+
+$ cd prover && cargo tree -p host --prefix none | awk '{print $1, $2}' | sort -u \
+    | grep -Ei '^(reqwest|hyper|hyper-rustls|hyper-util|rzup|risc0-build|bonsai-sdk) '
 hyper v1.11.0
-hyper-rustls v0.24.2
+hyper-rustls v0.27.9
+hyper-util v0.1.20
 reqwest v0.12.28
 risc0-build v3.0.6
+rzup v0.5.2
 ```
 
+142 is a count of **unique package names** in the verifier's tree, which is what
+that command counts; the same tree has more nodes than that, because one package
+can appear at several versions and at many places in the graph. Quoting a number
+without the command that produces it is how "148 crates" got into this README and
+stayed wrong.
+
 The contrast is the point: the daemon legitimately links an HTTP stack, and the
-verifier legitimately cannot.
+verifier legitimately cannot. One caveat on the right-hand column, unchanged from
+when it was written: `cargo tree -p host` includes build-dependencies, so
+`risc0-build` and `rzup` in that list are the guest *build* graph rather than
+anything the daemon links at run time. `hyper`, `hyper-util` and `reqwest` are
+run-time, and the daemon links `axum` on top of them anyway, so the contrast
+holds — but it is two facts, not one.
 
 Then behaviourally, under a macOS sandbox that denies all networking:
 
-```bash
-cat > /tmp/no-network.sb <<'EOF'
+```console
+$ cat > /tmp/no-network.sb <<'EOF'
 (version 1)
 (allow default)
 (deny network*)
 EOF
 
-# control: the profile really does deny networking
-sandbox-exec -f /tmp/no-network.sb curl -sS https://example.com
-# curl: (6) Could not resolve host: example.com          exit 6
+$ # control: the profile really does deny networking
+$ sandbox-exec -f /tmp/no-network.sb curl -sS https://example.com; echo "exit $?"
+curl: (6) Could not resolve host: example.com
+exit 6
 
-sandbox-exec -f /tmp/no-network.sb ./prover/verify/target/debug/prover-verify \
-    --receipt prover/verify/tests/fixtures/allow-real.receipt.bin \
-    --release prover/release.json
-# … VERIFIED                                             exit 0
+$ sandbox-exec -f /tmp/no-network.sb ./prover/verify/target/release/prover-verify \
+    --receipt prover/verify/tests/fixtures/allow-real.receipt.bin > /dev/null; echo "exit $?"
+exit 0
+
+$ sandbox-exec -f /tmp/no-network.sb ./prover/verify/target/release/prover-verify \
+    --receipt prover/verify/tests/fixtures/dev-mode.receipt.bin > /dev/null; echo "exit $?"
+exit 1
 ```
 
 Exit 0 on the real receipt and exit 1 on the dev stub, both with networking

@@ -289,20 +289,66 @@ fn a_dev_mode_receipt_fails_to_verify() {
 /// panic with a sentence and exit 2. Either way the answer is "no".
 #[test]
 fn the_verifier_refuses_to_run_under_risc0_dev_mode() {
+    // Every value risc0 treats as enabling, case included: it lowercases before
+    // comparing (risc0-zkvm-3.0.6/src/lib.rs:204-209).
+    for value in ["1", "true", "TRUE", "yes", "Yes"] {
+        let output = run_with_env(
+            &[
+                "--receipt",
+                fixture("allow-real.receipt.bin").to_str().unwrap(),
+                "--release",
+                release_json().to_str().unwrap(),
+            ],
+            &[("RISC0_DEV_MODE", value)],
+        );
+        assert_eq!(output.status.code(), Some(2), "for RISC0_DEV_MODE={value}");
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(err.contains("disable-dev-mode"), "{err}");
+        // And a receipt is not quietly accepted on the way out.
+        assert!(!stdout(&output).contains("VERIFIED"));
+    }
+}
+
+/// The other half of that predicate, and the bug M4 fixed: `RISC0_DEV_MODE=0`
+/// is *off* to risc0, so it must be off here. Testing `var_os().is_some()`
+/// instead made this binary refuse to run in any CI image that exports the
+/// variable disabled — a verifier that will not verify is not fail-closed, it is
+/// just broken. Same bug class as Task 5's N1 on the host side.
+#[test]
+fn a_disabled_risc0_dev_mode_variable_does_not_stop_the_run() {
+    for value in ["0", "", "false", "no", "off", "2"] {
+        let output = run_with_env(
+            &[
+                "--receipt",
+                fixture("allow-real.receipt.bin").to_str().unwrap(),
+                "--release",
+                release_json().to_str().unwrap(),
+            ],
+            &[("RISC0_DEV_MODE", value)],
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "RISC0_DEV_MODE={value:?} is not an enabling value to risc0, so the run should \
+             proceed:\n{}\n{}",
+            stdout(&output),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(stdout(&output).contains("VERIFIED"));
+    }
+
+    // And the dev stub is still rejected under exactly that environment: the
+    // predicate decides whether this binary *runs*, never what it accepts.
     let output = run_with_env(
         &[
             "--receipt",
-            fixture("allow-real.receipt.bin").to_str().unwrap(),
+            fixture("dev-mode.receipt.bin").to_str().unwrap(),
             "--release",
             release_json().to_str().unwrap(),
         ],
-        &[("RISC0_DEV_MODE", "1")],
+        &[("RISC0_DEV_MODE", "0")],
     );
-    assert_eq!(output.status.code(), Some(2));
-    let err = String::from_utf8_lossy(&output.stderr);
-    assert!(err.contains("disable-dev-mode"), "{err}");
-    // And a receipt is not quietly accepted on the way out.
-    assert!(!stdout(&output).contains("VERIFIED"));
+    assert_failed_at(&output, "seal");
 }
 
 /// A manifest whose `rulesDigest` is not the digest of the rules the pinned
@@ -421,11 +467,189 @@ fn a_receipt_that_is_not_a_receipt_fails_on_the_decode() {
     assert_failed_at(&output, "receipt-decodes");
 }
 
-/// Without the policy files the digest cannot be re-derived. That is reported as
-/// a check that did not run — never as a check that passed — and the summary
-/// counts it.
+// ---------------------------------------------------------------------------
+// the receipt file is exactly one receipt (I1)
+// ---------------------------------------------------------------------------
+//
+// `bincode::deserialize` allows trailing bytes: it decodes the receipt out of
+// the file's prefix and returns `Ok` whatever follows. Under it, the real
+// fixture with 100 KB appended printed VERIFIED, exit 0, and reported a byte
+// count that included bytes no decoder ever read. Each case below fails at
+// `receipt-decodes` only because the verifier rejects trailing bytes; every one
+// of them exits 0 without that change.
+
+/// Deterministic filler. A test that pads with `[0u8; n]` cannot tell "the
+/// decoder stopped early" from "the decoder read zeros"; this is arbitrary,
+/// reproducible bytes.
+fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
 #[test]
-fn without_the_policy_files_the_rules_digest_is_reported_as_not_available() {
+fn a_receipt_with_anything_appended_fails_on_the_decode() {
+    let base = std::fs::read(fixture("allow-real.receipt.bin")).expect("fixture");
+
+    let mut plus_one = base.clone();
+    plus_one.push(0);
+
+    let mut plus_random = base.clone();
+    plus_random.extend_from_slice(&pseudo_random(4096, 0x5157_1480));
+
+    let mut doubled = base.clone();
+    doubled.extend_from_slice(&base);
+
+    for (name, bytes) in [
+        ("one zero byte appended", plus_one),
+        ("4096 arbitrary bytes appended", plus_random),
+        ("the file concatenated with itself", doubled),
+    ] {
+        let (_dir, path) = temp_file("appended.receipt.bin", &bytes);
+        let output = run(&[
+            "--receipt",
+            path.to_str().unwrap(),
+            "--release",
+            release_json().to_str().unwrap(),
+        ]);
+        assert_failed_at(&output, "receipt-decodes");
+        assert!(
+            !stdout(&output).contains("VERIFIED\n"),
+            "{name} was accepted:\n{}",
+            stdout(&output)
+        );
+    }
+}
+
+#[test]
+fn a_truncated_receipt_fails_on_the_decode() {
+    let base = std::fs::read(fixture("allow-real.receipt.bin")).expect("fixture");
+    for fraction in [99, 50] {
+        let len = base.len() * fraction / 100;
+        let (_dir, path) = temp_file("truncated.receipt.bin", &base[..len]);
+        let output = run(&[
+            "--receipt",
+            path.to_str().unwrap(),
+            "--release",
+            release_json().to_str().unwrap(),
+        ]);
+        assert_failed_at(&output, "receipt-decodes");
+    }
+}
+
+/// The number the report prints next to `receipt-decodes` is a number of bytes
+/// that were *decoded*, not a number of bytes that were on disk. Those are the
+/// same number now only because a file with anything extra in it is refused —
+/// which is the point, and is why this asserts on the exact fixture length.
+#[test]
+fn the_reported_byte_count_is_the_decoded_length() {
+    let base = std::fs::read(fixture("allow-real.receipt.bin")).expect("fixture");
+    let output = verify_fixture("allow-real.receipt.bin");
+    let text = stdout(&output);
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    let line = text
+        .lines()
+        .find(|l| l.contains("receipt-decodes"))
+        .unwrap_or_else(|| panic!("no receipt-decodes line:\n{text}"));
+    assert!(
+        line.starts_with("[ ok ]"),
+        "receipt-decodes did not pass: {line}"
+    );
+    assert!(
+        line.contains(&format!("{} bytes, all of them decoded", base.len())),
+        "expected the decoded length {}: {line}",
+        base.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// the exit contract: exit 0 means every check ran and passed (I2)
+// ---------------------------------------------------------------------------
+//
+// The four paths through `rules-digest`, which is the only check with an input
+// the receipt does not carry. Before the fix, the first two exited 0 with the
+// check downgraded to `[ -- ]`: an operator who pointed `--policy-dir` at the
+// wrong directory got the same green answer as one who pointed it at the right
+// one.
+
+/// `policy/v1` next to the release manifest, nothing said on the command line:
+/// the check runs, and the run is a full pass.
+#[test]
+fn the_default_policy_dir_is_found_and_the_check_runs() {
+    let output = verify_fixture("allow-real.receipt.bin");
+    assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
+    assert_passed(&output, "rules-digest");
+    assert!(!stdout(&output).contains("[ -- ]"), "{}", stdout(&output));
+}
+
+/// An explicit `--policy-dir` naming a directory with no policy files in it.
+/// The operator asked a question; "I could not be bothered" is not an answer to
+/// it, and 0 would say the receipt checked out against rules nothing ever read.
+#[test]
+fn an_explicit_policy_dir_without_policy_files_fails() {
+    let empty = tempfile::tempdir().expect("temp dir");
+    let output = run(&[
+        "--receipt",
+        fixture("allow-real.receipt.bin").to_str().unwrap(),
+        "--release",
+        release_json().to_str().unwrap(),
+        "--policy-dir",
+        empty.path().to_str().unwrap(),
+    ]);
+    assert_failed_at(&output, "rules-digest");
+    let text = stdout(&output);
+    assert!(
+        text.contains(&format!(
+            "policy files unreadable at {}",
+            empty.path().display()
+        )),
+        "the failure should name the path it was given, in fixed words:\n{text}"
+    );
+    assert!(
+        text.contains("--no-policy-dir"),
+        "the failure should name the opt-out:\n{text}"
+    );
+    // Everything before it still passed: this is a missing input, not a bad
+    // receipt, and the report has to keep those apart.
+    assert_passed(&output, "seal");
+    assert_passed(&output, "policy-id");
+}
+
+/// No flags at all, and the default path holds nothing. Same rule: a check that
+/// did not run is not a check that passed. The failure names the flag that makes
+/// skipping it deliberate.
+#[test]
+fn a_missing_default_policy_dir_fails_and_names_the_opt_out() {
+    // A copy of the manifest somewhere with no `../policy/v1` under it.
+    let bytes = std::fs::read(release_json()).expect("release.json");
+    let (_dir, path) = temp_file("release.json", &bytes);
+    let output = run(&[
+        "--receipt",
+        fixture("allow-real.receipt.bin").to_str().unwrap(),
+        "--release",
+        path.to_str().unwrap(),
+    ]);
+    assert_failed_at(&output, "rules-digest");
+    let text = stdout(&output);
+    assert!(text.contains("policy files unreadable at"), "{text}");
+    assert!(
+        text.contains("a check that did not run is not a check that passed"),
+        "{text}"
+    );
+    assert!(text.contains("--no-policy-dir"), "{text}");
+}
+
+/// `--no-policy-dir` is the documented opt-out and the only thing that can exit
+/// 0 with a check that did not run. It is reported as skipped by the flag, and
+/// the summary repeats that it was not verified.
+#[test]
+fn no_policy_dir_skips_the_check_by_flag_and_may_still_exit_zero() {
     let output = run(&[
         "--receipt",
         fixture("allow-real.receipt.bin").to_str().unwrap(),
@@ -437,9 +661,39 @@ fn without_the_policy_files_the_rules_digest_is_reported_as_not_available() {
     let text = stdout(&output);
     assert!(text.contains("[ -- ] rules-digest"), "{text}");
     assert!(
-        text.contains("1 check(s) marked [ -- ] could not run"),
+        text.contains("skipped by flag (--no-policy-dir)"),
+        "the line must say the flag did it:\n{text}"
+    );
+    assert!(
+        text.contains("1 check(s) marked [ -- ] were skipped by --no-policy-dir"),
         "{text}"
     );
+}
+
+/// The honest limit of that opt-out, stated as a test: with `--no-policy-dir` a
+/// manifest whose `rulesDigest` is wrong still exits 0, because nothing was
+/// asked to check it. That is what the flag *means* — and it is why the run says
+/// so on its own output instead of printing an unqualified VERIFIED.
+#[test]
+fn no_policy_dir_cannot_catch_a_wrong_rules_digest_and_says_so() {
+    let (_dir, path) = manifest_with(
+        "rulesDigest",
+        serde_json::json!(format!("0x{}", "9".repeat(64))),
+    );
+    let output = run(&[
+        "--receipt",
+        fixture("allow-real.receipt.bin").to_str().unwrap(),
+        "--release",
+        path.to_str().unwrap(),
+        "--no-policy-dir",
+    ]);
+    assert_eq!(output.status.code(), Some(0), "{}", stdout(&output));
+    let text = stdout(&output);
+    assert!(text.contains("[ -- ] rules-digest"), "{text}");
+    assert!(text.contains("were skipped by --no-policy-dir"), "{text}");
+    // The same manifest with the policy files present is exit 1 — see
+    // `a_manifest_with_the_wrong_rules_digest_fails`. The difference between the
+    // two runs is entirely the flag.
 }
 
 // ---------------------------------------------------------------------------
@@ -621,6 +875,29 @@ fn malformed_journal_fields_fail_their_own_checks() {
 // ---------------------------------------------------------------------------
 // usage
 // ---------------------------------------------------------------------------
+
+/// Asking for help is not a usage error. It used to route through the error arm
+/// and exit 2, which reads as a broken tool to `set -e` and to anyone checking
+/// `$?` after `--help`.
+#[test]
+fn help_is_printed_on_stdout_and_exits_zero() {
+    for flag in ["-h", "--help"] {
+        let output = run(&[flag]);
+        assert_eq!(output.status.code(), Some(0), "for {flag}");
+        let text = stdout(&output);
+        assert!(
+            text.contains("usage: prover-verify"),
+            "help should go to stdout, not stderr: {text}"
+        );
+        assert!(text.contains("--no-policy-dir"), "{text}");
+        assert!(!text.contains("VERIFIED"), "{text}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).is_empty(),
+            "help wrote to stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
 
 #[test]
 fn usage_errors_exit_two_and_do_not_claim_anything() {

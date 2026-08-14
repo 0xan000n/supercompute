@@ -29,6 +29,18 @@
 //!    verifier checks the shape itself instead of relying on the check that runs
 //!    inside the image it is trying to authenticate.
 //!
+//! # The exit contract
+//!
+//! **Exit 0 means every check ran and passed.** Not "nothing failed" — a check
+//! that could not run is not a check that passed, so a missing input is a
+//! failure like any other. The single exception is deliberate and has to be
+//! asked for by name: `--no-policy-dir` says "I do not have `policy/v1`, do not
+//! try", and then [`Check::RulesDigest`] is reported as skipped-by-flag, the
+//! summary counts it, and the run may still exit 0. Every other way of failing
+//! to re-derive the policy identity — an explicit `--policy-dir` pointing at a
+//! directory with no readable policy files, or the default path missing — exits
+//! 1 with `rules-digest` named.
+//!
 //! # Dev-mode receipts
 //!
 //! Rejecting them is not a policy this code implements. It is a consequence of
@@ -43,6 +55,7 @@
 
 use std::path::Path;
 
+use bincode::Options as _;
 use policy_core::{proof_nonce_is_well_formed, Decision};
 use release_manifest::{
     is_0x_sha256_hex, is_image_id_hex, ReleaseManifest, JOURNAL_VERSION, RECEIPT_CODEC_BINCODE_V1,
@@ -117,9 +130,34 @@ impl Check {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     Passed,
-    /// The check could not run because an input it needs was not supplied. It
-    /// is reported, never silently dropped, and the summary counts it.
+    /// The check did not run because the caller asked for it not to. Reachable
+    /// only through `--no-policy-dir`: a *missing* input is a failure (see the
+    /// exit contract in the module comment), so this status now means "skipped
+    /// on purpose", not "we could not manage it". It is reported, never silently
+    /// dropped, and the summary counts it.
     NotAvailable,
+}
+
+/// Where [`Check::RulesDigest`] gets its policy files — and, just as
+/// importantly, whether the caller asked for them.
+///
+/// The distinction is the whole of the exit contract for this check: the same
+/// empty directory is an operator error when they named it, an operator error
+/// when it is the default, and a deliberate choice only when they passed the
+/// flag that says so.
+#[derive(Debug, Clone, Copy)]
+pub enum PolicySource<'a> {
+    /// `--policy-dir <path>`: the operator named this directory, so finding no
+    /// policy files in it is a failed check. Silently downgrading to "not
+    /// available" would answer a question they explicitly asked.
+    Explicit(&'a Path),
+    /// Nobody said anything, so this is the path derived from the manifest's
+    /// location. Still a failure when it holds nothing readable — but the
+    /// failure names `--no-policy-dir` as the way to proceed on purpose.
+    Default(&'a Path),
+    /// `--no-policy-dir`: the documented opt-out, and the only way a run can
+    /// exit 0 with a check that did not run.
+    SkippedByFlag,
 }
 
 /// One line of the report.
@@ -223,13 +261,13 @@ fn fail(check: Check, reason: impl Into<String>) -> Failure {
 /// Run every check.
 ///
 /// `manifest_bytes` is `release.json` verbatim, `receipt_bytes` is the receipt
-/// file verbatim, and `policy_dir` is the directory holding `rules.json` and
-/// `manifest.json` — `None` when the caller has no copy of them, which downgrades
-/// [`Check::RulesDigest`] to [`Status::NotAvailable`] rather than skipping it.
+/// file verbatim, and `policy` says where the `rules.json` + `manifest.json`
+/// that [`Check::RulesDigest`] re-derives from come from — and whether their
+/// absence is an error or a choice. See [`PolicySource`].
 pub fn verify(
     manifest_bytes: &[u8],
     receipt_bytes: &[u8],
-    policy_dir: Option<&Path>,
+    policy: PolicySource<'_>,
     expectations: &Expectations,
 ) -> Report {
     let mut run = Run { lines: Vec::new() };
@@ -237,7 +275,7 @@ pub fn verify(
         &mut run,
         manifest_bytes,
         receipt_bytes,
-        policy_dir,
+        policy,
         expectations,
     )
     .err();
@@ -251,7 +289,7 @@ fn run_checks(
     run: &mut Run,
     manifest_bytes: &[u8],
     receipt_bytes: &[u8],
-    policy_dir: Option<&Path>,
+    policy: PolicySource<'_>,
     expectations: &Expectations,
 ) -> Result<(), Failure> {
     // --- the manifest ------------------------------------------------------
@@ -276,7 +314,7 @@ fn run_checks(
         format!("journal and manifest agree: {}", manifest.policy_id),
     );
 
-    check_rules_digest(run, &manifest, policy_dir)?;
+    check_rules_digest(run, &manifest, policy)?;
 
     // --- the caller's expectations -----------------------------------------
     check_expectations(run, &journal, expectations)?;
@@ -358,15 +396,35 @@ fn check_receipt(
     }
     run.pass(Check::ReceiptCodec, RECEIPT_CODEC_BINCODE_V1);
 
-    let receipt: Receipt = bincode::deserialize(receipt_bytes).map_err(|_| {
-        fail(
-            Check::ReceiptDecodes,
-            format!("the receipt file is not a {RECEIPT_CODEC_BINCODE_V1}-encoded risc0 receipt"),
-        )
-    })?;
+    // `bincode::deserialize` is `DefaultOptions` with fixint encoding *and*
+    // `allow_trailing_bytes`, which decodes a receipt out of the file's prefix
+    // and returns `Ok` no matter what follows it. A real receipt with 100 KB of
+    // anything appended verified, and this line reported a byte count that
+    // included bytes the decoder never looked at — a verifier saying "537,794
+    // bytes checked" about a file it read 437,794 of is worse than one that says
+    // nothing. Same options with trailing bytes refused: the encoding is
+    // byte-for-byte the one `prover/host` writes, the committed fixtures decode
+    // unchanged, and one extra byte is now a failed check.
+    //
+    // `receipt_bytes.len()` is therefore the *decoded* length: the decode either
+    // consumed every byte of the slice or it failed.
+    let receipt: Receipt = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .deserialize(receipt_bytes)
+        .map_err(|_| {
+            fail(
+                Check::ReceiptDecodes,
+                format!(
+                    "the receipt file is not a {RECEIPT_CODEC_BINCODE_V1}-encoded risc0 receipt, \
+                     or it is one with extra bytes appended (a receipt file is exactly one \
+                     encoded receipt and nothing else)"
+                ),
+            )
+        })?;
     run.pass(
         Check::ReceiptDecodes,
-        format!("{} bytes", receipt_bytes.len()),
+        format!("{} bytes, all of them decoded", receipt_bytes.len()),
     );
 
     // Inverting `host::image_id_hex()` exactly: eight u32 words, each rendered
@@ -603,18 +661,24 @@ fn check_journal(
 /// files, and having the `policyId` half already match the journal, ties the
 /// pinned `rulesDigest` to the exact rules bytes the proving image was built
 /// from. Without the files, the digest is a claim the manifest makes and nothing
-/// checks — which is what [`Status::NotAvailable`] says.
+/// checks — so without the files this check *fails*, unless the caller said
+/// `--no-policy-dir` and took the claim knowingly. See the exit contract in the
+/// module comment.
 fn check_rules_digest(
     run: &mut Run,
     manifest: &ReleaseManifest,
-    policy_dir: Option<&Path>,
+    policy: PolicySource<'_>,
 ) -> Result<(), Failure> {
-    let Some(dir) = policy_dir else {
-        run.skip(
-            Check::RulesDigest,
-            "no policy directory given: rulesDigest is pinned but not re-derived",
-        );
-        return Ok(());
+    let dir = match policy {
+        PolicySource::SkippedByFlag => {
+            run.skip(
+                Check::RulesDigest,
+                "skipped by flag (--no-policy-dir): rulesDigest is pinned by the manifest and \
+                 was NOT re-derived",
+            );
+            return Ok(());
+        }
+        PolicySource::Explicit(dir) | PolicySource::Default(dir) => dir,
     };
     let rules_path = dir.join("rules.json");
     let manifest_path = dir.join("manifest.json");
@@ -622,15 +686,29 @@ fn check_rules_digest(
         std::fs::read(&rules_path),
         std::fs::read_to_string(&manifest_path),
     ) else {
-        run.skip(
+        // Fixed phrasing, and the only variable in it is the path — which is the
+        // operator's own argument (or the default derived from the `--release`
+        // path they gave), not anything the receipt supplied. The underlying
+        // `io::Error` is deliberately not rendered: "unreadable" is the whole of
+        // what this check needs to say, and the fixed sentence is what a script
+        // can match on.
+        return Err(fail(
             Check::RulesDigest,
-            format!(
-                "{} does not hold a readable rules.json + manifest.json: \
-                 rulesDigest is pinned but not re-derived",
-                dir.display()
-            ),
-        );
-        return Ok(());
+            match policy {
+                PolicySource::Explicit(_) => format!(
+                    "policy files unreadable at {}: --policy-dir must name a directory holding \
+                     a readable rules.json and manifest.json. Pass --no-policy-dir to skip this \
+                     check deliberately.",
+                    dir.display()
+                ),
+                _ => format!(
+                    "policy files unreadable at {}: rulesDigest cannot be re-derived, and a \
+                     check that did not run is not a check that passed. Point --policy-dir at \
+                     the policy files, or pass --no-policy-dir to skip this check deliberately.",
+                    dir.display()
+                ),
+            },
+        ));
     };
 
     // `policy_core::policy_id` is the single derivation site for both values —
