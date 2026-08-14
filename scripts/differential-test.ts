@@ -1072,10 +1072,24 @@ interface GuestExecuted {
  *     one: the guest would bake a policy id from bytes no TypeScript verifier
  *     can reproduce.
  *
- * The `-0` probe is the fail-closed case that already exists, and it was found
- * by this suite on its first run: `serde_json` parses `-0` as the float `-0.0`,
- * so Rust refuses it as a non-integer, while `Number.isSafeInteger(-0)` is true
- * and `canonicalJson` emits `0`.
+ * The `-0` probe is the fail-closed case that was found by this suite on its
+ * first run: `serde_json` parses `-0` as the float `-0.0`, so Rust refuses it as
+ * a non-integer, while `Number.isSafeInteger(-0)` is true and `canonicalJson`
+ * emits `0`.
+ *
+ * **`-0` is an instance; the declared thing is the class.** The rule on the Rust
+ * side is `serde_json`'s tokenizer, not the value: *any* JSON number whose
+ * literal makes `serde_json` choose `f64` over `i64` is refused, however
+ * integral the value is. That is every literal carrying a `.`, an exponent, or a
+ * `-0` — `1.0`, `1e2`, `0e0`, `-0` — each of which JavaScript parses to an
+ * ordinary safe integer and `canonicalJson` happily emits. `1.0`, `1e2` and
+ * `0e0` are probed below alongside `-0` so the table declares the class rather
+ * than the one member that happened to be discovered first.
+ *
+ * The direction is the safe one: a manifest written that way fails the *build*,
+ * loudly, rather than producing a policy id nobody else can reproduce. What it
+ * costs is a surprising build failure for a manifest author who writes `1.0`
+ * where they meant `1`. Nobody has, because today's manifest is ASCII integers.
  */
 const MANIFEST_PROBES: Array<{
   id: string;
@@ -1158,10 +1172,31 @@ const MANIFEST_PROBES: Array<{
     why: "is_u64() used to wave this through on the Rust side",
   },
   { id: "a fraction", json: '{"n":1.5}', why: "two different float-to-string algorithms" },
+  // The fail-closed class: four literals that serde_json tokenizes as f64 and
+  // JavaScript parses as safe integers. Declared as a class, not as the one
+  // instance the suite happened to find first.
   {
     id: "negative zero",
     json: '{"n":-0}',
     why: "serde_json parses -0 as the float -0.0; Number.isSafeInteger(-0) is true",
+    rustStricter: true,
+  },
+  {
+    id: "integral float 1.0",
+    json: '{"n":1.0}',
+    why: "the decimal point alone makes serde_json choose f64; JSON.parse gives 1",
+    rustStricter: true,
+  },
+  {
+    id: "exponent 1e2",
+    json: '{"n":1e2}',
+    why: "the exponent alone makes serde_json choose f64; JSON.parse gives 100",
+    rustStricter: true,
+  },
+  {
+    id: "zero with exponent 0e0",
+    json: '{"n":0e0}',
+    why: "same class as -0 and 1e2, at the value both sides agree is zero",
     rustStricter: true,
   },
 ];

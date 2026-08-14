@@ -5,7 +5,7 @@
   "journalVersion": 1,
   "risc0Version": "3.0.6",
   "receiptCodec": "bincode-v1",
-  "builtAt": "2026-08-14T09:09:59Z",
+  "builtAt": "2026-08-14T11:11:39Z",
   "toolchain": {
     "hostRustc": "1.97.1 (8bab26f4f 2026-07-14)",
     "guestRustc": "1.97.0-dev (e638c6cfe 2026-07-15)",

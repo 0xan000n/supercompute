@@ -457,21 +457,182 @@ until then it is labelled here.
 §66 is the section this prototype has been answering on credit. Phase 1 measured
 everything on the request path and *modelled* the proof —
 `CTN_SIMULATED_PROVING_MS`, default 2400 ms, labelled as modelled everywhere it
-surfaced. Phase 2a Task 1 installs a real RISC Zero toolchain and replaces the
-model with measurements. The guest here is a spike, not the policy engine: it reads
-one length-prefixed frame and commits its sha256. The policy guest is Task 4. What
-follows is therefore a floor for the real thing, and is written down as a floor.
+surfaced. Phase 2a installed a real RISC Zero toolchain and replaced the model
+with measurements.
+
+It did so twice. Task 1 built a **spike** guest that reads one length-prefixed
+frame and commits its SHA-256 — no policy, no rules, nothing to evaluate. Task 4
+built the **policy guest**: Safety Policy v1 compiled into the image, the
+ruleset baked in at build time, the request commitment recomputed inside the
+zkVM. This section leads with the policy guest, because that is the program a
+receipt from this repository is about. The spike numbers are kept at the end,
+relabelled as what they are — the floor the zkVM costs *before* any policy work —
+because three predictions this section made from them turned out to be wrong,
+and the two sets side by side are the only honest way to read either.
 
 Apple M1 Pro, 10 cores, 32 GB, macOS 26.0.1. risc0 3.0.6 (`cargo-risczero` 3.0.6,
-`r0vm` 3.0.6, `risc0-zkvm` 3.0.6), host rustc 1.97.1, guest toolchain 1.97.0.
-Release build, in-process prover (enforced), dev mode off, three timed runs per
-measurement after one discarded warmup, median reported with min/max alongside.
+`r0vm` 3.0.6, `risc0-zkvm` 3.0.6), host rustc 1.97.1 (pinned in
+`prover/rust-toolchain.toml` as of Task 7), guest toolchain 1.97.0. Release
+build, in-process prover (enforced — `--bench` refuses to run against a remote or
+subprocess backend), dev mode off (refused outright). Guest image
+`75751480a7e7d6b329de6614fee99e8d2cf9a793c32e9c1e3de057f8196b0ee1`.
 
 **These are CPU numbers.** risc0 3.0.6 compiles Metal kernels on macOS and then
 never calls them — the Metal branches of `segment_prover()` and
 `recursion_prover()` are commented out in both circuit crates, falling through to
 the CPU HAL. So this is what ten M1 Pro CPU cores cost, and a future risc0 that
 re-enables the GPU path would change it by an unmeasured amount.
+
+### The gate: what a live request would pay
+
+`cargo run -rp host -- --bench --fixtures` runs **all 125 corpus fixtures**
+(50 allow, 50 deny, 25 adversarial) through the real image in the executor — no
+proof — three timed runs each after one discarded warmup, and refuses to report a
+timing for any fixture whose decision disagrees with the corpus label. The
+distribution is over the 125 per-fixture medians; p95 is nearest-rank
+(`ceil(0.95 × 125)` = sample 119 of 125 sorted), not interpolated.
+
+| bucket | n | min | median | p95 | max |
+|---|---|---|---|---|---|
+| allow | 50 | 50.9 ms | 56.4 ms | 56.7 ms | 59.5 ms |
+| deny | 50 | 50.5 ms | 56.4 ms | 58.3 ms | 59.6 ms |
+| adversarial | 25 | 50.4 ms | 56.4 ms | 57.2 ms | 59.2 ms |
+| **all** | **125** | **50.4 ms** | **56.4 ms** | **58.1 ms** | **59.6 ms** |
+
+| | min | median | p95 | max |
+|---|---|---|---|---|
+| user cycles | 468,795 | 1,114,823 | 1,204,208 | 1,696,862 |
+
+Segments across the corpus: 1 or 2. Max po2: **20 for every one of the 125**.
+
+The shape of that is the finding. User cycles vary by **3.6×** across the corpus
+and wall time by **1.18×**, because most of the 56 ms is not policy work at all:
+the two extremes (468,795 cycles at 50.4 ms, 1,696,862 at 59.5 ms) imply roughly
+**47 ms of fixed session setup plus ~7.4 ms per million user cycles**. That is a
+two-point estimate from the ends of the range, not a fit, and it is offered as an
+order of magnitude. Prompt length is not the lever either: the longest prompt in
+the corpus (300 bytes, `adv-022`) lands at 57.2 ms, mid-distribution, while a
+6-byte prompt (`allow-045`) costs 50.9 ms. What drives cycles is how much of the
+ruleset a prompt makes the matcher touch, and what drives wall time is mostly
+neither.
+
+### The proof: three fixtures, proved end to end
+
+Three fixture prompts, proved four times each (one discarded warmup, three
+timed), on the image above. The adversarial one is `adv-004` and it was chosen
+over the other 24 for a reason: its prompt spells the target phrase in fullwidth
+characters (`ｂｏｍｂ`), so its DENY exists **only** if the §23 normalizer folds
+them back to `bomb` *inside the zkVM*. A verified receipt for that journal is
+evidence that the Unicode half of the policy ran in the image.
+
+| Case | Executor | Composite prove | Receipt | Verify (in-process) | Verify (`prover-verify`) |
+|---|---|---|---|---|---|
+| `allow-001` ALLOW | 58.3 ms | 124.10 s | 537,794 B | 29.1 ms | 31.3 ms |
+| `deny-001` DENY | 56.4 ms | 122.85 s | 537,792 B | 29.4 ms | 31.9 ms |
+| `adv-004` DENY | 57.3 ms | 113.37 s | 526,080 B | 29.7 ms | 30.5 ms |
+
+| Case | Segments | Max po2 | User cyc | Total cyc | Paging cyc | Reserved cyc |
+|---|---|---|---|---|---|---|
+| `allow-001` | 2 | 20 | 1,109,291 | 1,310,720 | 127,270 | 74,159 |
+| `deny-001` | 2 | 20 | 1,090,549 | 1,310,720 | 128,223 | 91,948 |
+| `adv-004` | 2 | 20 | 1,005,773 | 1,179,648 | 129,514 | 44,361 |
+
+Prove spread within the run: 120.3–126.4 s, 122.5–129.8 s, 111.0–114.0 s.
+`total = user + paging + reserved` exactly in all three rows.
+
+**The two verify columns are two different questions.** In-process is
+`Receipt::verify` on a receipt still in memory: ~29 ms, the cryptography alone.
+The `prover-verify` column is the whole process — exec the binary, read the
+receipt off disk, parse the release manifest, re-derive the rules digest from
+`policy/v1/`, run all thirteen checks, print the report — five timed runs after a
+warmup, and it is what an independent third party actually pays: **about 31 ms**.
+All three receipts were written out by the benchmark and verified by the release
+`prover-verify` binary at 13/13 checks, exit 0.
+
+**Prove cost tracks padded rows at a stable rate.** 0.0937, 0.0947 and
+0.0961 ms per padded row across the three — a 2.5% band over two different row
+counts. `adv-004` is the cheapest because it pads to 2^20 + 2^17 rather than
+2^20 + 2^18, not because it does materially less policy work.
+
+**But prove wall time is noisy at the ±20% level between runs, and that is not
+visible in the spread above.** Three runs inside one process share a thermal
+state and a warm allocator. Between runs, an earlier bench of an image differing
+by 228 user cycles gave 164.88 s and 159.42 s medians on the same idle laptop,
+and the daemon's runs of `allow-001` gave 134.70, 122.58 and 121.21 s. Do not
+quote 124 s as a constant; quote "two to three minutes on an idle M1 Pro,
+CPU-only". Cycle counts are the reproducible quantity — byte-identical across
+every run of a given image.
+
+### What this means for a live demo
+
+Four sentences, and none of them are the ones Phase 1's numbers implied.
+
+**A synchronous policy gate in the zkVM costs about 57 ms per request.** Not the
+~20 ms this section predicted from the spike; the corpus says 50–60 ms with a
+median of 56.4, and the tail is 60 ms rather than something pathological. Against
+a ~450 ms provider call that is affordable, and Phase 2b should budget it as a
+flat 60 ms rather than as a function of the prompt.
+
+**The proof lags the request by two to three minutes.** It is not concurrent with
+inference in any useful sense; it finishes long after the response was returned
+and the connection closed. §66's architectural claim survives — §25–26 make the
+proof an audit artifact rather than a gate, so the caller never waits for it —
+but the honest framing is "receipts become available minutes after the answer",
+and every consumer of a receipt (the verifier UI, the graph projection) has to be
+built for an artifact that is not there yet. Phase 1's model was optimistic by
+roughly **50×**, and it was correctly labelled as a model at the time.
+
+**Verifying costs milliseconds, and that asymmetry is the whole point.** Minutes
+to produce, milliseconds to check, by anyone, offline, with no trust in the
+producer. `prover-verify` is the program that does it.
+
+**A receipt is ~525 KB.** Composite, which is what the daemon ships; the same
+execution compressed to a succinct receipt is 223,744 bytes for +29.52 s of
+proving. At half a megabyte each, growing with segment count, storage is a real
+decision rather than a detail. Groth16 — the ~200-byte on-chain-verifiable form —
+**has never been measured here**: risc0 3.0.6's STARK-to-SNARK step shells out to
+a Docker image and Docker is not installed on this machine, so every Groth16
+claim in this repository is unbacked.
+
+### Three predictions this section made, and what they turned out to be
+
+The spike numbers below were written up with forward-looking claims attached.
+The policy guest falsified all three, and they are corrected here rather than
+quietly deleted.
+
+**"~20 ms whatever the prompt" → 50–60 ms.** The spike's 16.9–18.3 ms was a
+floor, and this section read it as a budget. The policy guest sits ~38 ms above
+it. The *shape* of the claim survived — the cost is dominated by fixed setup and
+does not track prompt size — but the constant was wrong by 3×, and the corpus run
+is what replaces a two-point argument with a distribution.
+
+**"~105 s at po2 20" → measured 113–124 s, and the interesting part is *which
+half* was wrong.** The rate held: 0.0937–0.0961 ms per padded row across the
+three proofs, inside the spike's 0.087–0.096 band, on a guest a hundred times
+larger. What was wrong was the row count. "po2 20" was read as 2^20 = 1,048,576
+padded rows; the real sessions span two segments and pad to 2^20 + 2^18 =
+1,310,720 and 2^20 + 2^17 = 1,179,648. At the measured rate those predict 123 s
+and 111 s against 124.10 s and 113.37 s observed. The near-linear-in-padded-rows
+model is in good shape; the way to misuse it is to guess the rows from a single
+po2.
+
+**The po2 rule is a bound in both directions, not an equality.** It was written
+as `po2 ≥ ceil(log2(user + paging))` and read as a prediction. Applied
+whole-session to the policy guest's ~1.11 M user + ~0.13 M paging cycles it
+predicts 2^21 = 2,097,152 padded rows; the real total is **2^20 + 2^18 =
+1,310,720**, 37% cheaper, because a session that spans segments pads each segment
+separately and packs the tail into a smaller block. So: a *lower* bound on the
+po2 of any single segment, an *upper* bound on total padded rows once a session
+segments, and never a cost prediction on its own. `total_cycles` — a sum, not a
+power of two — is the quantity to multiply by the per-row rate. Plan against the
+next po2 up when a guest lands within ~15k cycles of a boundary.
+
+### The spike, kept as the floor
+
+A guest that reads one frame and commits its SHA-256. Not re-measurable — that
+guest no longer exists — and kept because the difference between the two tables
+is the cost of the policy, isolated. Image
+`d094ec7bbac59857234c8c316573b591e5830ed9656fec4cf332440a0e19ff50`.
 
 | Input | Executor only | Composite prove | Receipt (bincode) | Verify (cache-hot) |
 |---|---|---|---|---|
@@ -486,68 +647,29 @@ re-enables the GPU path would change it by an unmeasured amount.
 A second full run of the same binary drifted by up to **5.7%** — that worst case
 being verify at 256 B, the smallest measurement here; prove at 4096 B moved 3.6%,
 to 52.30 s. Between-run drift therefore exceeds the within-run spread at 4096 B,
-so read every timing above as **±6%** rather than as a constant, and treat a few
-percent of movement between future runs as meaningless. The cycle counts, po2 and
-receipt sizes were byte-identical across both runs.
+so read every spike timing as **±6%** rather than as a constant. The cycle counts,
+po2 and receipt sizes were byte-identical across both runs. (The policy guest's
+prove timings are far noisier — see above.)
 
-**The model was optimistic by roughly 20×.** Phase 1 assumed 2.4 s of proving and
-observed ~2.9 s at p50. Real composite proving of a program that only hashes 4 KB
-takes 50.5 s. §66's architectural claim survives this — proving runs parallel to
-inference and the caller does not wait for it — but the claim that survives is
-narrower than the one the README currently implies. At ~450 ms of inference and
-~50 s of proving, the proof is no longer "concurrent with the request"; it finishes
-long after the response has been returned and the connection closed. That is still
-a coherent design, because §25–26 make the proof an audit artifact rather than a
-gate. It is not the design the p50 table describes. The honest framing is that
-receipts become available seconds to minutes after the answer, and anything that
-waits on a receipt — the verifier UI, the graph projection — has to be built for
-that. Phase 1's numbers are not being restated here as wrong; they were correctly
-labelled as modelled, and this is what the measurement turned out to be.
-
-**Executor latency is a fixed ~17–18 ms floor.** This is the number that would gate
-a live request, and it barely moves with input: 16.9 ms at 256 B, 18.3 ms at
-4096 B, across a 10.6× difference in user cycles. The 1.4 ms between those medians
-is smaller than the run-to-run spread at 256 B, which by itself covers
-15.5–22.4 ms, so the marginal cost of the extra cycles is real but below this
-sample's noise floor rather than separable from it. The bulk is session setup.
-Two consequences. Running the policy in the zkVM on the request path would add
-~20 ms whatever the prompt, which is affordable against a ~450 ms provider call.
-And it cannot be optimised by trimming input, so Phase 2b should treat it as a
-constant.
-
-This paragraph originally said 23 ms at 256 B and pointed at the *inversion* —
-the small input measuring slower than the large — as the evidence. That was an
-artifact of the harness, not a property of the zkVM: sizes ran in a fixed order
-with no warmup, so first-call cost landed entirely on the first row. The
-conclusion happened to survive re-measurement, but it had been argued from a
-number whose sign was wrong, which is precisely the failure this document exists
-to catch. `--bench` now discards a warmup iteration per size and prints
-min/median/max.
-
-**Proving cost is set by paging as much as by arithmetic.** `reserved_cycles` is
-documented as the cycles the proof system needs *including padding up to the
-nearest power of two*, and the numbers agree: `total_cycles` lands on exactly 2^po2
-in both rows, with reserved as the filler. The real work is user + paging — 49,797
-at 256 B, rounding to 2^16; 292,352 at 4096 B, rounding to 2^19 — which gives a
-planning rule for Tasks 4 and 7: **po2 ≥ ceil(log2(user + paging))**. A bound
-rather than an equality, because two rows consistent with `reserved` being pure
-padding cannot prove that it is; if some fixed non-padding allocation hides in
-there, the 256 B row caps it at 15,739 cycles, so the rule can under-predict by one
-po2 within ~15k cycles of a boundary. Note that
-paging is roughly half the real work at 256 B (24,870 against 24,927 user cycles),
-so the policy guest's memory access pattern will move its po2 as readily as its
-arithmetic. It also means po2 cannot be predicted from user cycles alone: an
+Two things from the spike survive intact. **Proving cost is set by paging as much
+as by arithmetic**: `reserved_cycles` is documented as the cycles the proof system
+needs *including padding up to the nearest power of two*, `total_cycles` lands on
+exactly 2^po2 in both rows, and the real work is user + paging — 49,797 at 256 B
+rounding to 2^16, 292,352 at 4096 B rounding to 2^19. Paging is roughly half the
+real work at 256 B, so a guest's memory access pattern moves its po2 as readily as
+its arithmetic does. And **po2 cannot be predicted from user cycles alone**: an
 earlier draft of this section claimed 24,927 and 65,535 user cycles would both fit
-po2 16, but 65,535 plus even this spike's modest paging lands in po2 17. Time then
-scales near-linearly with padded rows — 8× the rows cost 8.85× the time, about
-0.09 ms per row — so the extrapolation is ~105 s at po2 20 and ~210 s at po2 21.
+po2 16, but 65,535 plus even this spike's modest paging lands in po2 17.
 
-**A composite receipt is ~250 KB.** The spec treats the proof as an artifact to be
-stored and independently verified; at a quarter of a megabyte each, growing with
-execution length, that is a real storage decision rather than a detail. Groth16
-compression would make it constant-size and small, at the cost of extra proving
-time. Neither was measured. Task 6 should measure both before the release manifest
-fixes a receipt format, because that choice is hard to reverse afterwards.
+This section also once reported **23 ms** at 256 B and pointed at the *inversion* —
+the small input measuring slower than the large one — as evidence that executor
+cost is fixed setup. That was an artifact of the harness, not a property of the
+zkVM: sizes ran in a fixed order with no warmup, so first-call cost landed
+entirely on the first row. The conclusion happened to survive re-measurement, but
+it had been argued from a number whose sign was wrong, which is precisely the
+failure this document exists to catch. `--bench` discards a warmup iteration per
+measurement and prints spread; `--bench --fixtures` prints a distribution over
+125 of them.
 
 ### What the plan assumed that turned out to be false
 
@@ -669,10 +791,16 @@ table-version artefact but a genuine property disagreement, and it would also
 mean the randomized suite's greenness had stopped proving anything.
 
 This is a real limitation, not a solved problem. It resolves properly only when
-both engines read the same Unicode tables, which in practice means pinning them —
-Task 6's release manifest has to pin the Rust *toolchain* as well as the two
-crates, because `str::to_lowercase` is a third table source that floats with
-whatever stable compiler is installed.
+both engines read the same Unicode tables. All three Rust-side table sources are
+now pinned, which does not fix the divergence but does stop it drifting:
+`unicode-normalization` 0.1.25 and `unicode-properties` 0.1.4 come out of
+`prover/methods/guest/Cargo.lock` — the guest's own lock, which is what the guest
+compiler resolves against — and `str::to_lowercase`, the third source, lives in
+the toolchain's `core` and is pinned twice over: the guest compiler is rzup's
+(recorded as `guestRustc` in `prover/release.json`), and the host channel is
+pinned to 1.97.1 in `prover/rust-toolchain.toml`. Every one of those is a field
+in `release.json`, so a change shows up in a diff. The Node side is still
+whatever ICU the installed Node ships, and that is the half nobody here controls.
 
 ---
 

@@ -1,4 +1,10 @@
+# Pinned, not floating. The compiler that determines the ImageID is the *guest*
+# one (rzup's, forced through RUSTC by risc0-build after it strips
+# RUSTUP_TOOLCHAIN), so this channel cannot reach the image — the pin buys
+# host-side reproducibility instead: `str::to_lowercase`'s Unicode tables in the
+# native differential runs, and the `hostRustc` field in release.json. Task 7
+# pinned it and re-verified that the ImageID did not move.
 [toolchain]
-channel = "stable"
-components = ["rustfmt", "rust-src"]
+channel = "1.97.1"
+components = ["rustfmt", "rust-src", "clippy"]
 profile = "minimal"

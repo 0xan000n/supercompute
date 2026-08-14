@@ -5,14 +5,16 @@
 //! Tasks 1-3 say so explicitly, and this file is the answer to all three:
 //!
 //! * Task 1: `rust-toolchain.toml` floated on `stable` while the README pinned
-//!   1.97.1. It still does: pinning the channel was **deferred to Task 7**, on
-//!   the reasoning recorded in prover/README.md — the toolchain that determines
-//!   the ImageID is the *guest* one, `risc0-build` forces rzup's `rustc` into
-//!   the guest build after stripping `RUSTUP_TOOLCHAIN`, so the host channel
-//!   never reaches the image, and re-pinning it means re-verifying the image and
-//!   re-cutting every fixture. What this file does instead is record the exact
-//!   `rustc` that built *this* binary on every emit, so the drift a pin would
-//!   prevent shows up in a diff of `release.json` rather than going unnoticed.
+//!   1.97.1. **Task 7 pinned the channel to `1.97.1`** and verified that the
+//!   ImageID did not move — it cannot: the toolchain that determines the ImageID
+//!   is the *guest* one, and `risc0-build` forces rzup's `rustc` into the guest
+//!   build after stripping `RUSTUP_TOOLCHAIN`, so the host channel never reaches
+//!   the image. (The cold rebuild under the pin returned a byte-identical guest
+//!   ELF; see prover/README.md "Toolchain".) The pin therefore buys host-side
+//!   reproducibility, and what this file does is orthogonal to it and still
+//!   necessary: it records the exact `rustc` that built *this* binary on every
+//!   emit, so a toolchain change shows up in a diff of `release.json` whether or
+//!   not the pin was respected.
 //! * Task 2: `str::to_lowercase` is a third Unicode table source, and it lives
 //!   in the toolchain's `core`, not in a crate anyone can pin in `Cargo.toml`.
 //!   The toolchain that matters for that is the **guest** one — the image is
@@ -52,6 +54,13 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", lock_path.display());
+    // Observation, recorded rather than fixed: this line makes the host's build
+    // script depend on a file a *different* cargo invocation owns. If a future
+    // guest dependency change ever made risc0-build's nested build rewrite
+    // `methods/guest/Cargo.lock` during a build, `host` would be dirty again on
+    // the next one — a rebuild per build, quietly. Not reproducible today (the
+    // guest lock is committed and the nested build leaves it alone), and the
+    // alternative — not depending on the file the pin is read from — is worse.
     println!("cargo:rerun-if-changed={}", guest_lock_path.display());
 
     // The compiler cargo is driving. `RUSTC` is set by cargo for every build

@@ -807,6 +807,15 @@ pub fn image_id_from_hex(hex: &str) -> Option<Digest> {
 /// A convenience for callers that only have a journal: run the journal checks
 /// and hand back the report. Used by the tests that exercise checks no real
 /// receipt can reach.
+///
+/// **This runs no seal check; a caller that uses it has verified nothing.** It
+/// reads bytes that nothing has proved came from the pinned image — the whole
+/// content of a receipt's guarantee is the seal, and this function does not look
+/// at one. It is `pub` only because the integration tests live outside the crate
+/// and `pub(crate)` would not reach them; it is `#[doc(hidden)]` so it does not
+/// present itself to anyone else as an entry point. The entry point is
+/// [`verify`].
+#[doc(hidden)]
 pub fn verify_journal_only(manifest: &ReleaseManifest, journal_bytes: &[u8]) -> Report {
     let mut run = Run { lines: Vec::new() };
     let failure = check_journal(&mut run, manifest, journal_bytes).err();

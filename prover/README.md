@@ -1,21 +1,26 @@
 # prover
 
-The real RISC Zero prover for Safety Policy v1. Phase 2a builds it; this
-directory is currently at **Task 6 — the offline verifier**. The guest image *is*
-Safety Policy v1 (the ruleset is compiled in, the request commitment is
-recomputed inside the zkVM, and the journal it commits is the verifier's
-allowlist and nothing else); `host --serve` puts it behind `127.0.0.1:4500` with
-an executor fast path and a single-worker proving queue; and `prover-verify`
-checks a receipt against `release.json` with no network and no trust in whoever
-produced it. **Nothing in `services/` calls any of this** — wiring the daemon
-into `tee-sim` is Phase 2b, and until that happens a verified receipt says a
-proof exists, not that anything was gated on it.
+The real RISC Zero prover for Safety Policy v1. **Phase 2a is complete**: the
+guest image *is* Safety Policy v1 (the ruleset is compiled in, the request
+commitment is recomputed inside the zkVM, and the journal it commits is the
+verifier's allowlist and nothing else); `host --serve` puts it behind
+`127.0.0.1:4500` with an executor fast path and a single-worker proving queue;
+and `prover-verify` checks a receipt against `release.json` with no network and
+no trust in whoever produced it. **Nothing in `services/` calls any of this** —
+wiring the daemon into `tee-sim` is Phase 2b, and until that happens a verified
+receipt says a proof exists, not that anything was gated on it.
 
 Phase 1 modelled the cost of proving (`CTN_SIMULATED_PROVING_MS`, default
-2400 ms) and labelled it as modelled. Everything from Task 1 on uses
-measurements instead — see "Measured on this machine" below, which now carries
-both the Task 1 spike numbers (a guest that only hashed its input) and the Task 4
-policy-guest numbers. They are different guests and the difference is large.
+2400 ms) and labelled it as modelled. Everything here is measured instead — see
+"Measured on this machine" below, which carries the policy-guest numbers over the
+whole 125-fixture corpus and keeps the Task 1 spike numbers (a guest that only
+hashed its input) alongside them as the floor. They are different guests and the
+difference is large.
+
+Read in this order if you are here to check the claims rather than to work on
+them: "Verifying a receipt offline" is the promise anyone can exercise on their
+own machine, "Measured on this machine" is every number, and "What is not
+established" is the list of things none of it shows.
 
 ---
 
@@ -67,33 +72,38 @@ something anyone should discover while reading a `release.json`.
 `host/tests/lock_pins.rs` tests those rules directly, against the same code the
 build script runs.
 
-`rust-toolchain.toml` still says `channel = "stable"`, and that is a decision
-rather than an oversight. The toolchain that determines the ImageID is the
-**guest** one, and it is already pinned outside cargo: `risc0-build` looks up
-rzup's default Rust toolchain and forces it into the nested guest build through
-`RUSTC`, after stripping `RUSTUP_TOOLCHAIN` from the environment
-(`risc0-build-3.0.6/src/lib.rs:355-383, 436`). Pinning the host channel to
-`1.97.1` would install a second copy of a compiler already present under another
-toolchain name, force a full rebuild, and — given how little it takes to move an
-ImageID (see "Reproducibility of the image") — require re-verifying the image and
-re-cutting `release.json` and every fixture. What it would buy is host-side test
-reproducibility, mainly the Unicode version behind `str::to_lowercase` in the
-native differential runs. That is worth having and worth doing at a moment when
-re-measuring is already planned; Task 7 re-measures. The concrete change, for
-whoever does it:
+`rust-toolchain.toml` **pins the host channel to `1.97.1`**, as of Task 7:
 
 ```toml
 [toolchain]
-channel = "1.97.1"                                # was "stable"
-components = ["rustfmt", "rust-src", "clippy"]    # clippy currently comes from
+channel = "1.97.1"                                # was "stable" through Task 6
+components = ["rustfmt", "rust-src", "clippy"]    # clippy used to come from
 profile = "minimal"                               # the default-profile stable install
 ```
 
-…followed by rebuilding and checking that
-`cargo run -rp host -- --emit-release` still reports
-`75751480a7e7d6b329de6614fee99e8d2cf9a793c32e9c1e3de057f8196b0ee1`. Meanwhile the
-host compiler is *recorded* on every emit even though it is not enforced, so
-drift is visible in a diff rather than silent.
+What the pin does and does not do is worth being exact about, because it is easy
+to read as an ImageID pin and it is not one. The toolchain that determines the
+ImageID is the **guest** one, and that was already pinned outside cargo:
+`risc0-build` looks up rzup's default Rust toolchain and forces it into the
+nested guest build through `RUSTC`, after stripping `RUSTUP_TOOLCHAIN` from the
+environment (`risc0-build-3.0.6/src/lib.rs:355-383, 436`). The host channel
+cannot reach the image. What the pin buys is host-side reproducibility: the
+Unicode tables behind `str::to_lowercase` in the native differential runs (the
+third table source §2c of `VALIDATION.md` names), and a `hostRustc` field in
+`release.json` that a floating `stable` could have changed under.
+
+The pin was **verified not to move the image**, which is the check that makes the
+paragraph above a measurement rather than an argument. `rustup toolchain install
+1.97.1`, then `cargo clean` in `prover/`, `rm -rf methods/guest/target`, and a
+cold `cargo build --release -p host` (3m27s): the guest ELF came back
+byte-identical at SHA-256
+`e5fd1e0d47a2b4422c7a2c614bfaf4d752cc389362f050d38afffb5864414301` — the same
+hash Task 4 recorded — and `--emit-release` reported ImageID
+`75751480a7e7d6b329de6614fee99e8d2cf9a793c32e9c1e3de057f8196b0ee1`, unchanged,
+with `builtAt` the only field that differed. On this machine `stable` *was*
+1.97.1 already, so the pin renamed the toolchain rather than changing the
+compiler; the reproduction shows the rename cost nothing, not that a different
+compiler would have.
 
 Machine: Apple M1 Pro, 10 cores, 32 GB, macOS 26.0.1. **Proving here is CPU-only.**
 Despite what the toolchain's shape suggests, risc0 3.0.6 does not use the GPU on
@@ -107,7 +117,7 @@ Apple Silicon — see "Proving is CPU-only" below.
 prover/
   Cargo.toml            workspace: host + methods + policy-core + release-manifest
                         (verify is EXCLUDED — its own workspace, see below)
-  rust-toolchain.toml   stable, with rustfmt and rust-src
+  rust-toolchain.toml   pinned 1.97.1, with rustfmt, rust-src and clippy
   release.json          the pinned image: ImageID, policy identity, toolchains
   policy-core/          the engine, compiled twice: natively and into the guest
     src/engine.rs         evaluate / evaluate_prepared — the port of engine.ts
@@ -276,26 +286,37 @@ policy ids from the same file with nothing reporting a problem. Numbers outside
 exactly rather than nearly.
 
 None of this is asserted against a hardcoded expectation any more. Suite 6 of
-`scripts/differential-test.ts` feeds fifteen hostile manifests — combining marks
+`scripts/differential-test.ts` feeds eighteen hostile manifests — combining marks
 in keys, two keys that NFC-collide, the U+FFFD / U+D7FF / U+E000 boundaries
 against supplementary characters, `MAX_SAFE_INTEGER`, 2^53, 2^53+1, a `u64`, a
 fraction — through **both** canonicalizers and compares. A one-sided refusal by
 Rust is fail-closed and allowed but has to be declared in the probe table; a
 one-sided refusal by *TypeScript* is a failure, because that is the direction
-where the guest bakes an identity no verifier can reproduce. The suite found one
-case on its first run: `serde_json` parses `-0` as the float `-0.0` and refuses
-it, while `canonicalJson` emits `0`. It is declared, and it is the only one.
+where the guest bakes an identity no verifier can reproduce.
+
+The suite found one such case on its first run: `serde_json` parses `-0` as the
+float `-0.0` and refuses it, while `canonicalJson` emits `0`. **That instance is
+the visible member of a class**, and the class is what the probe table now
+declares. The Rust rule is a property of `serde_json`'s tokenizer rather than of
+the value: any JSON number literal that makes it choose `f64` over `i64` is
+refused, however integral the value — `1.0`, `1e2`, `0e0`, `-0`, all of which JS
+parses to ordinary safe integers. Four probes cover the class. The direction is
+the safe one (the manifest fails to build; no identity is derived), and what it
+costs is a confusing build failure for someone who writes `1.0` where they meant
+`1`. Today's manifest is ASCII integers, so nobody has.
 
 ### Reproducibility of the image
 
 `prover/methods/guest/target/` and `prover/target/riscv-guest/` deleted, then
-`cargo build --release -p host`: the guest ELF came back **byte-identical**
+`cargo build --release -p host`: the guest ELF comes back **byte-identical**
 (SHA-256 `e5fd1e0d47a2b4422c7a2c614bfaf4d752cc389362f050d38afffb5864414301`) and
-so did the ImageID. That is one machine, one toolchain, two builds — it is
-evidence that the build is not gratuitously nondeterministic, not a claim of
-cross-machine reproducibility, which nothing here has tested. `release.json`
-pins the toolchain versions; that is what makes the claim checkable by someone
-else.
+so does the ImageID. Three cold builds now — two under Task 4, and one under Task
+7 after `cargo clean` and the switch to the pinned `1.97.1` host channel, which
+is the strongest of the three because it changed something and the ELF still did
+not move. That is one machine, three builds — evidence that the build is not
+gratuitously nondeterministic, not a claim of cross-machine reproducibility,
+which nothing here has tested. `release.json` pins the toolchain versions; that
+is what makes the claim checkable by someone else.
 
 `policy-core` exposes its `policy_id` module behind a default feature, and the
 guest takes the dependency with `default-features = false`. This did **not**
@@ -347,11 +368,21 @@ Rust identifier.)
 ```bash
 cd prover
 cargo run -rp host -- --serve           # the daemon, 127.0.0.1:4500
-cargo run -rp host -- --bench           # executor + prove + verify, ALLOW and DENY
-CTN_BENCH_PROVE=0 cargo run -rp host -- --bench   # executor only (proving is minutes)
+cargo run -rp host -- --bench --fixtures            # the gate cost over all 125 fixtures (~30 s)
+cargo run -rp host -- --bench           # + three real proofs: ALLOW, DENY, adversarial (~30 min)
+cargo run -rp host -- --bench --keep-receipts /tmp/r # …and write the proved receipts out
+CTN_BENCH_PROVE=0 cargo run -rp host -- --bench     # the three cases, executor only
 cargo run -rp host -- --execute-stdin   # newline-JSON executor service
 cargo run -rp host -- --emit-release --out release.json   # regenerate the manifest
 ```
+
+`--bench --fixtures` is the one to run first: it is the only mode that finishes
+in under a minute, it runs the *whole* labelled corpus rather than three chosen
+prompts, and it fails if the guest disagrees with any corpus label — so it is a
+correctness check as much as a benchmark. `--bench` on its own is three fixture
+prompts proved four times each (one warmup, three timed) and is half an hour.
+The receipts `--keep-receipts` writes are ordinary receipts: hand one to
+`prover-verify` and it checks out.
 
 ### The daemon (`--serve`)
 
@@ -386,6 +417,27 @@ slower than the 57 ms below.
 - Logs go to **stderr** at `host=info` unless `RUST_LOG` says otherwise, and
   carry job ids, byte counts, wall times, digests and decisions — never canonical
   bytes, never scores, never the caller's proof nonce (its length instead).
+- The two malformed-body reasons split on *why* serde stopped, not on how broken
+  the body looks, and one case reads oddly enough to write down: an unterminated
+  **array** (`[1,2`) answers `request body does not match the expected schema`,
+  not `request body is not valid JSON`, because the leading `[` already rules out
+  the struct and serde reports the type error before it ever reaches the
+  truncation. An unterminated **object** (`{"protocolVersion":1`) does answer
+  `not valid JSON`. Both are 400 with a fixed reason and neither leaks a byte, so
+  this is a labelling curiosity rather than a defect — but a caller debugging
+  against the first message would look in the wrong place.
+- Startup **refuses a non-local prover backend and a non-local `RISC0_EXECUTOR`**,
+  because the frame either would ship contains the plaintext prompt. Worth
+  knowing how that refusal looks in the one case a reader is most likely to try:
+  `RISC0_PROVER=bonsai host --serve` does not print the daemon's one-line reason.
+  It **panics inside risc0** — `bonsai` is compiled out (`default-features =
+  false`), so `default_prover` hits `not implemented: Unsupported prover: bonsai`
+  at `risc0-zkvm-3.0.6/src/host/client/prove/mod.rs:193` before the daemon's
+  check ever runs, and what a user sees is a panic. Fail-closed, and ugly:
+  the prompt does not leave the machine, but the message does not explain
+  itself. Left as it is because the alternative is re-implementing risc0's
+  backend selection to produce a nicer error for a variable nobody here should
+  set.
 
 `--execute-stdin` is what `scripts/differential-test.ts` drives: one JSON request
 per line, one response per line, until EOF.
@@ -445,7 +497,7 @@ prover-verify
   release manifest: prover/release.json
   receipt:          prover/verify/tests/fixtures/allow-real.receipt.bin (537794 bytes)
 
-[ ok ] manifest                   pins imageId 75751480a7e7d6b329de6614fee99e8d2cf9a793c32e9c1e3de057f8196b0ee1, journalVersion 1, risc0 3.0.6, built 2026-08-14T09:09:59Z
+[ ok ] manifest                   pins imageId 75751480a7e7d6b329de6614fee99e8d2cf9a793c32e9c1e3de057f8196b0ee1, journalVersion 1, risc0 3.0.6, built 2026-08-14T11:11:39Z
 [ ok ] receipt-codec              bincode-v1
 [ ok ] receipt-decodes            537794 bytes, all of them decoded
 [ ok ] image-id                   the receipt claims 75751480a7e7d6b329de6614fee99e8d2cf9a793c32e9c1e3de057f8196b0ee1
@@ -683,17 +735,20 @@ type, all encode with bincode 1.3, and `Receipt::verify` handles all three — s
 the verifier is kind-agnostic, and `tests/fixtures/allow-succinct.receipt.bin`
 is the fixture that keeps that from being an unchecked claim.
 
-Measured on this machine (M1 Pro, 32 GB, release, CPU-only, **one run each**),
-starting from the committed ALLOW receipt:
+Measured on this machine (M1 Pro, 32 GB, release, CPU-only), starting from the
+committed ALLOW receipt. The succinct row is **one run**; the composite row's
+verify is the three-run median from the table further down:
 
-| kind | bytes | to produce | verify |
+| kind | bytes | to produce | verify (in-process) |
 |---|---|---|---|
-| composite | 537,794 | 124.57 s (the prove itself) | ~30 ms † |
+| composite | 537,794 | 124.57 s (the prove itself) | 29.1 ms |
 | succinct | 223,744 | +29.52 s compressing the composite | 12.5 ms |
 | Groth16 | — | **not measurable here** | — |
 
-† the composite verify number is still the previous image's; Task 7 owns
-re-measuring it.
+Both verify numbers are at the current image; the composite one is the
+`allow-001` median from the three-proof table above. **Compressing halves the
+verify cost as well as shrinking the artifact 2.4×** — one recursive seal to
+check instead of two segments' worth.
 
 **Groth16 was not measured, and that is a limitation of this machine, not an
 omission.** risc0 3.0.6's STARK-to-SNARK step shells out to a Docker image
@@ -724,115 +779,152 @@ without a second image ever existing inside this repository.
 
 ## Measured on this machine
 
-Three timed runs per measurement after one discarded warmup, `--release`, dev
-mode off, in-process prover (backend `local`, enforced). Reproduce with
-`cargo run -rp host -- --bench`.
+Apple M1 Pro, 10 cores, 32 GB, macOS 26.0.1. `--release`, dev mode off (refused
+outright), in-process prover (backend `local`, enforced), host toolchain pinned
+1.97.1. Guest image
+`75751480a7e7d6b329de6614fee99e8d2cf9a793c32e9c1e3de057f8196b0ee1`, policy id
+`0x1f74ba4f2353012cd26f5d3279625c3b45e927eeb341f0ee4b72124b056a7db2`, rules digest
+`0x9f85ba59fd1429f10c373efc56d69aefa255a01a08df3ab6bd8e1ccecd3f93ea`. The policy
+id and the rules digest have not moved since Task 4's first image — `policy/v1/`
+has not been touched since — and **every number in this section was taken at the
+ImageID above.** There is no longer a table here quoting a previous image.
 
-### Task 4 — the policy guest
+```bash
+cargo run -rp host -- --bench --fixtures                 # the corpus table
+cargo run -rp host -- --bench --keep-receipts /tmp/r     # the three proofs
+```
 
-Guest image id `75751480a7e7d6b329de6614fee99e8d2cf9a793c32e9c1e3de057f8196b0ee1`,
-policy id `0x1f74ba4f2353012cd26f5d3279625c3b45e927eeb341f0ee4b72124b056a7db2`,
-rules digest `0x9f85ba59fd1429f10c373efc56d69aefa255a01a08df3ab6bd8e1ccecd3f93ea`.
-The policy id and the rules digest are unchanged from Task 4's first image —
-`policy/v1/` was not touched — and the ImageID moved because the guest code did.
-Two fixture requests: `allow-001` (a haiku prompt, 45 characters) and `deny-001`
-(a phishing prompt, 71 characters).
+### The gate, over the whole fixture corpus
 
-> **Two images are quoted in this section, and the difference is stated rather
-> than smoothed over.** Task 4's first fix round changed the guest — a bounded
-> `proofNonce`, fixed-string refusals, the rules digest forced into `.rodata` —
-> so the ImageID above is **not** the one the prove, receipt and verify numbers
-> were taken on. Those were measured at image
-> `4a05b4e9c27a79faa0a6989129d2436c910b02cc6222bdde0f8d2ba103ec8ace`, which
-> differs from this one by **+8,353 user cycles** on ALLOW (+0.76%) at the same
-> segment count and the same max po2, and they are **not re-measured here**: a
-> full `--bench` is ~30 minutes, and the honest expectation is that the change is
-> invisible underneath the ±20% run-to-run prove noise documented below. Task 7's
-> fixture-corpus bench owns the re-measurement. Executor time and cycle counts —
-> the reproducible quantities — *were* re-measured at the current image and are
-> the ones in the tables.
+All **125** fixtures in `policy/v1/fixtures` (50 allow, 50 deny, 25 adversarial),
+executor only, three timed runs per fixture after one discarded warmup, on an
+otherwise-idle machine. The run aborts if the guest's decision disagrees with any
+corpus label, so it is a correctness check as much as a benchmark. The
+distribution is over the 125 per-fixture medians. **p95 is nearest-rank** —
+`ceil(0.95 × 125)`, sample 119 of 125 sorted, no interpolation — because at this
+sample size the estimator moves the answer, and a p95 quoted without its
+estimator is not reproducible.
 
-Medians:
+| bucket | n | min | median | p95 | max |
+|---|---|---|---|---|---|
+| allow | 50 | 50.9 ms | 56.4 ms | 56.7 ms | 59.5 ms |
+| deny | 50 | 50.5 ms | 56.4 ms | 58.3 ms | 59.6 ms |
+| adversarial | 25 | 50.4 ms | 56.4 ms | 57.2 ms | 59.2 ms |
+| **all** | **125** | **50.4 ms** | **56.4 ms** | **58.1 ms** | **59.6 ms** |
 
-| Case | Executor only (this image) | Composite prove † | Receipt (bincode) † | Verify † |
+| | min | median | p95 | max |
 |---|---|---|---|---|
-| ALLOW | 57.0 ms | 137.69 s | 525.1 KB (537,736 B) | 29.4 ms |
-| DENY | 56.3 ms | 126.14 s | 525.1 KB (537,734 B) | 30.1 ms |
+| user cycles | 468,795 | 1,114,823 | 1,204,208 | 1,696,862 |
 
-† measured at image `4a05b4e9…`, +8,353 user cycles below this one. See the note
-above.
+Segments across the corpus: `[1, 2]`. Max po2: **20, for all 125 of them.**
+
+The extremes, from the same run:
+
+| | fixture | prompt bytes | median | user cycles |
+|---|---|---|---|---|
+| slowest | `deny-027` | 55 | 59.6 ms | 1,054,214 |
+| fastest | `adv-020` (empty prompt) | 0 | 50.4 ms | 468,795 |
+| most cycles | `allow-050` | 244 | 59.5 ms | 1,696,862 |
+| longest prompt | `adv-022` | 300 | 57.2 ms | 1,255,930 |
+
+**Cycles vary 3.6×; wall time varies 1.18×.** That gap is the useful fact. Fitting
+a line through the two ends of the range gives roughly **47 ms of fixed session
+setup plus ~7.4 ms per million user cycles** — a two-point estimate off the
+extremes, not a regression, and quoted as an order of magnitude. It says the gate
+is very nearly a constant per-request cost: about 50 ms of it happens whatever the
+request is, and the entire labelled corpus fits in a 9 ms band on top of that.
+
+**Prompt length is not the lever either.** The longest prompt in the corpus sits
+mid-distribution and the empty one sits at the floor, but `allow-050` at 244 bytes
+burns more cycles than `adv-022` at 300. What moves cycles is how much of the
+ruleset a prompt makes the matcher touch. Phase 2b should budget a flat **60 ms**
+per `/execute` and should not expect to recover any of it by shrinking inputs.
+
+### Three proofs, end to end
+
+Three fixture prompts, chosen so the set is not two near-identical ALLOWs:
+`allow-001` (a haiku), `deny-001` (a P1 phishing request), and `adv-004` — the
+adversarial one, picked over the other 24 because its DENY exists *only* if the
+§23 normalizer folds the fullwidth `ｂｏｍｂ` back to `bomb` **inside the zkVM**. A
+verified receipt for that journal is evidence that the Unicode half of the policy
+ran in the image, which is the part of this design a reader is most entitled to
+doubt. `--bench` refuses to start if any of the three has drifted from the file in
+`policy/v1/fixtures`.
+
+Three timed runs each after one discarded warmup. Medians:
+
+| Case | Executor | Composite prove | Receipt (bincode) | Verify, in-process | Verify, `prover-verify` |
+|---|---|---|---|---|---|
+| `allow-001` ALLOW | 58.3 ms | 124.10 s | 525.2 KB (537,794 B) | 29.1 ms | 31.3 ms |
+| `deny-001` DENY | 56.4 ms | 122.85 s | 525.2 KB (537,792 B) | 29.4 ms | 31.9 ms |
+| `adv-004` DENY | 57.3 ms | 113.37 s | 513.8 KB (526,080 B) | 29.7 ms | 30.5 ms |
 
 Spread (min / median / max):
 
-| Case | Executor ms (this image) | Prove ms † | Verify ms † |
+| Case | Executor ms | Prove ms | Verify ms (in-process) |
 |---|---|---|---|
-| ALLOW | 56.3 / 57.0 / 57.4 | 127,275.0 / 137,693.6 / 166,816.3 | 29.4 / 29.4 / 30.3 |
-| DENY | 56.2 / 56.3 / 56.3 | 122,718.5 / 126,139.9 / 126,205.3 | 29.0 / 30.1 / 30.2 |
+| `allow-001` | 57.0 / 58.3 / 58.6 | 120,343.7 / 124,100.5 / 126,405.4 | 29.0 / 29.1 / 29.1 |
+| `deny-001` | 56.4 / 56.4 / 56.5 | 122,517.2 / 122,854.7 / 129,804.9 | 29.0 / 29.4 / 29.7 |
+| `adv-004` | 56.5 / 57.3 / 57.8 | 111,029.9 / 113,371.3 / 114,039.2 | 28.6 / 29.7 / 29.7 |
 
-The executor rows are one `CTN_BENCH_PROVE=0` run. A second run of the same
-binary gave 56.1 / 56.3 / 57.8 (ALLOW) and 56.3 / 56.3 / 56.3 (DENY) — a 1.2%
-median drift on ALLOW, well inside the ±6% band Task 1 recorded. Both runs
-reported byte-identical cycle counts.
-
-| Case | Segments | Max po2 | User cyc | Total cyc † | Paging cyc † | Reserved cyc † |
+| Case | Segments | Max po2 | User cyc | Total cyc | Paging cyc | Reserved cyc |
 |---|---|---|---|---|---|---|
-| ALLOW | 2 | 20 | 1,109,291 | 1,310,720 | 125,995 | 83,787 |
-| DENY | 2 | 20 | 1,090,549 | 1,310,720 | 127,296 | 101,203 |
+| `allow-001` | 2 | 20 | 1,109,291 | 1,310,720 | 127,270 | 74,159 |
+| `deny-001` | 2 | 20 | 1,090,549 | 1,310,720 | 128,223 | 91,948 |
+| `adv-004` | 2 | 20 | 1,005,773 | 1,179,648 | 129,514 | 44,361 |
 
-`total_cycles`, `paging_cycles` and `reserved_cycles` only come out of a prove
-run, so they are the `4a05b4e9…` numbers. Segments and max po2 are identical
-across the two images, and 8,353 extra user cycles cannot move a 2^20 + 2^18
-padding total, but that is an argument rather than a measurement and is labelled
-as one.
+`total = user + paging + reserved` exactly, in all three rows.
 
-Five things in there are worth stating plainly, because three of them are worse
-than Task 1 predicted.
+**Two different verify numbers, and they are two different questions.** The
+in-process column is `Receipt::verify` called immediately after proving, on a
+receipt still in memory — ~29 ms, and it is the cost of the cryptography alone.
+The `prover-verify` column is wall time for the **whole process**: exec the
+binary, read the receipt off disk, parse `release.json`, re-derive the rules
+digest from `policy/v1/`, run all 13 checks, print the report. Five timed runs
+after a warmup; the spread was 31.2–34.7 ms (`allow-001`), 31.6–32.7
+(`deny-001`), 30.4–30.5 (`adv-004`). So an independent verifier pays about
+**31 ms**, of which roughly 29 is the seal. That is the number that matters: it is
+what a third party spends to check a proof that cost two minutes to make.
 
-**The executor gate costs ~56 ms, not ~20 ms.** The spike's floor was 16.9–18.3 ms
-and this file told Phase 2b to budget ~20 ms per execution regardless of prompt
-size. That was a floor, and the policy guest sits about 38 ms above it. This is
-the number `tee-sim` will pay synchronously on every request once Phase 2b wires
-`/execute` in; it does not go away by shrinking the prompt, because it is
-dominated by the ruleset, not the request. (`POST /execute` now exists and costs
-the same — see the Task 5 section below — but nothing calls it yet; the
-`tee-sim` wiring is Phase 2b.)
+**The three receipts verify.** All three were written out with `--keep-receipts`
+and handed to the release `prover-verify` binary: 13/13 checks, `VERIFIED`,
+exit 0, and the `adv-004` one reports `journal-decision DENY` on a journal whose
+DENY depends on the in-image Unicode fold.
 
-**Proving is a little over two minutes per request, and the timing is noisy at
-the ±20% level.** Within this run, ALLOW ranged 127.3–166.8 s. Between runs it is
-worse: an earlier full bench of an image differing by 228 user cycles (the
-trailing-bytes check, added after it) gave medians of 164.88 s ALLOW and
-159.42 s DENY on the same otherwise-idle laptop — 20% and 26% above the table
-above. Both runs had the enforced local backend, dev mode off, and nothing else
-running; the difference is thermal or scheduling and is not characterised here.
-Do not quote 138 s as a constant. Quote **"two to three minutes on an idle M1
-Pro, CPU-only"**, and treat cycle counts — which were identical across repeated
-runs of a given image — as the reproducible quantity.
+**The executor pays 2–4 ms more while a prove is in flight in the same process.**
+The medians above are from a separate executor-only pass on an idle machine
+(`CTN_BENCH_PROVE=0`). Inside the full 24-minute `--bench` run, the same three
+fixtures measured 60.3 / 57.6 / 61.6 ms — +2.0, +1.2 and +4.3 ms. Three samples,
+one machine, thermal state uncontrolled; report it, do not model it.
 
-**Task 1's linear-in-padded-rows extrapolation under-predicted by ~10–30%.** It
-put po2 20 at ~105 s, from a rate of 0.087–0.096 ms per padded row. The rate here
-is 137.69 s / 1,310,720 rows = **0.105 ms per row** (0.126 in the slower run). The
-rule is the right shape — cost tracks padded rows — but its constant came from a
-one-segment session and this is a two-segment one, and continuations are not
-free. Task 7 should re-derive the constant from these rows rather than the
-spike's, and should state it as a range.
+**Prove cost tracks padded rows, and the constant is stable.** 124.10 s over
+1,310,720 rows, 122.85 s over 1,310,720, 113.37 s over 1,179,648 — that is
+**0.0937, 0.0947 and 0.0961 ms per padded row**, a 2.5% band across three
+measurements of two different row counts. The cheapest of the three is cheapest
+because it pads to `2^20 + 2^17` rather than `2^20 + 2^18`, not because it does
+less policy work (it is within 10% of the others on user cycles).
 
-**`total_cycles` is a sum of segment po2s, not one of them.** 1,310,720 =
-2^20 + 2^18, which is what two segments of unequal size look like. The Task 1
-planning rule — `po2 ≥ ceil(log2(user + paging))` — reads as "one segment of that
-po2" and would have predicted 2^21 = 2,097,152 padded rows here; the real total is
-1.31M, i.e. **cheaper** than that rule says, because segmentation packs the tail
-into a smaller block. Read the rule as an upper bound on padded rows once a
-session spans segments.
+**Prove wall time is still noisy at the ±20% level between runs, and the ±20% is
+not visible in this table.** Within this run the widest case is `deny-001` at
+122.5–129.8 s. Between runs it has been much worse: an earlier full bench of an
+image differing by 228 user cycles gave medians of 164.88 s and 159.42 s on the
+same idle laptop, 20–26% above these, and Task 5's daemon runs gave 134.70 s,
+122.58 s and 121.21 s for `allow-001`. Three runs inside one process share a
+thermal state and a warm allocator, so a tight within-run spread is the *weaker*
+evidence. Do not quote 124 s as a constant. Quote **"two to three minutes on an
+idle M1 Pro, CPU-only"**, and treat cycle counts — byte-identical across every
+run of a given image — as the reproducible quantity.
 
-The receipt doubled with the segment count (525 KB against the spike's ~250 KB at
-one segment) and verification roughly doubled with it (~30 ms against ~13 ms).
-Both are per-receipt costs and both are still small next to proving.
+### Where the user cycles go
 
-Where the user cycles go, measured in-guest with `env::cycle_count()` on the
-ALLOW case with `emitScores` off (1,089,150 cycles between the first and last
-reading, against 1,100,938 for the whole session at image `4a05b4e9…`; the
-breakdown has not been re-instrumented at the current image, which is 8,353
-cycles heavier in total):
+Measured in-guest with `env::cycle_count()` on the ALLOW case with `emitScores`
+off: 1,089,150 cycles between the first and last reading, against 1,100,938 for
+the whole session. **These are the only numbers in this section not taken at the
+current image, and they cannot be** — reading a cycle counter at six points
+inside the guest requires a guest with six extra readings in it, which is by
+construction a different image. The instrumented image was the prior `4a05b4e9…`
+one, 8,353 user cycles (0.76%) lighter in total. Read the proportions, not the
+counts:
 
 | Phase | Cycles |
 |---|---|
@@ -843,19 +935,16 @@ cycles heavier in total):
 | parsing the canonical request | 5,728 |
 | decoding the input frame | 3,481 |
 
-Nothing was optimized beyond the two hoists described above. If a later task
-needs a po2 back, those first two rows are the entire conversation — and note
-that the second one is *already* the cheap version: normalizing the needles
-in-guest instead of at build time costs 2,264,222 cycles.
+Nothing was optimized beyond the two hoists described above. If a later task needs
+a po2 back, those first two rows are the entire conversation — and note that the
+second one is *already* the cheap version: normalizing the needles in-guest
+instead of at build time costs 2,264,222 cycles.
 
-### Task 5 — the daemon (two runs, current image)
+### The daemon, under a prove in flight
 
-Same machine (Apple M1 Pro, 10 cores, 32 GB, macOS 26.0.1), `--release`, dev mode
-off, backend `local`, **image `75751480…`** — the image the tables above describe
-with a `†` on their prove column. Produced by the gated end-to-end test, which
-enqueues one `POST /prove` for the `allow-001` fixture, fires one `POST /execute`
-while it is running, then verifies the returned receipt against the baked
-ImageID:
+Same machine and image, through the gated end-to-end test, which enqueues one
+`POST /prove` for the `allow-001` fixture, fires one `POST /execute` while it is
+running, then verifies the returned receipt against the baked ImageID:
 
 ```bash
 CTN_PROVE_TEST=1 cargo test -rp host --test api -- --ignored --nocapture
@@ -865,28 +954,21 @@ CTN_PROVE_TEST=1 cargo test -rp host --test api -- --ignored --nocapture
 |---|---|---|---|---|
 | 1 | 134.70 s | 525.3 KB | 66 ms | a release build + the differential suite were running |
 | 2 | 122.58 s | 525.3 KB | 90 ms | otherwise idle |
+| 3 (reviewer's) | 121.21 s | 525.3 KB | 88 ms | otherwise idle |
 
-**One run each, and they disagree by 10%.** That is the same ±20% prove noise the
-Task 4 section documents, and run 1 was not on an idle machine — it is reported
-rather than dropped because dropping the inconvenient run is how a ±20% number
-becomes a ±0% claim. Expect ±20% and quote **"two to three minutes on an idle
-M1 Pro, CPU-only"**, not either number.
+**`/execute` is not starved by a prove in flight — and these three samples do not
+order the way load says they should.** 66 ms came off the *loaded* run; 90 ms and
+88 ms came off the idle ones, against a ~57 ms idle median. The reading that fits
+is that a single `/execute` under a single concurrent prove is dominated by
+scheduling luck at this sample size rather than by machine load: the prove worker
+is its own OS thread, the tokio runtime keeps its own, and ten cores absorb both.
+(The in-process measurement above, where the executor did pay a consistent
+2–4 ms under proving, is a different arrangement: same process, same thread pool,
+no HTTP.) What these three establish is the weak claim the test asserts — an
+`/execute` under a prove answers in well under 2 s — and nothing about the daemon
+under real concurrency.
 
-What this **does** retire from the `†` list: prove wall time and receipt size are
-now measured at the current image, and they land inside the previous image's band
-(126.14–137.69 s prove, 525.1 KB receipt). What it does **not** retire: verify
-wall time, `total_cycles`, `paging_cycles` and `reserved_cycles` still come only
-from `--bench`, are still the `4a05b4e9…` image's, and are still marked `†`. Task
-7 owns those, and owns re-measuring all of it properly rather than one run at a
-time.
-
-**`/execute` is not starved by a prove in flight, on this one probe.** 66 ms and
-90 ms against a ~57 ms idle median — the prove worker is a separate OS thread and
-the tokio runtime keeps its own. Two samples of one concurrent request is not a
-load characterisation; the test's assertion is the weak one it can defend
-(under 2 s), and the numbers above are the observation.
-
-### Task 1 — the spike guest (a different, much smaller program)
+### The Task 1 spike guest — the floor, kept for contrast
 
 Kept because the two together are the only honest way to read the policy-guest
 numbers: the spike hashed its input and nothing else, so its executor floor and
@@ -932,7 +1014,7 @@ should be.
 Spike guest image id
 `d094ec7bbac59857234c8c316573b591e5830ed9656fec4cf332440a0e19ff50` — it changes
 whenever the guest or its dependency graph does, which is the point, and it did:
-the policy guest's id is in the Task 4 table above.
+the policy guest's id is at the top of this section.
 
 | Input | Segments | po2 | User cyc | Total cyc | Paging cyc | Reserved cyc |
 |---|---|---|---|---|---|---|
@@ -947,8 +1029,14 @@ between the medians is smaller than the run-to-run spread at 256 B, which alone
 covers 15.5–22.4 ms — so the marginal cost of 240,000 extra user cycles is real
 but sits below this sample's noise floor rather than being separable from it.
 What the number is made of is fixed setup: ELF load, page-in, session start.
-Phase 2b should budget ~20 ms per execution regardless of prompt size, and should
-not expect to recover it by shrinking the input.
+
+This file then told Phase 2b to budget **~20 ms per execution regardless of
+prompt size**, and that prediction was **wrong by 3×**. The policy guest's corpus
+run says 50–60 ms. The *shape* of the claim survived — the cost is dominated by
+fixed setup and does not track prompt size, which the 125-fixture distribution
+above establishes far better than two spike points ever did — but the constant
+belonged to a guest that did nothing. Budget 60 ms; the corpus table is the one
+to read.
 
 An earlier version of this file reported 23 ms at 256 B and called the resulting
 *inversion* — the small input measuring slower than the large one — evidence for
@@ -969,8 +1057,8 @@ work is **user + paging**, and reserved is the filler:
 | 256 B | 49,797 | 65,536 = 2^16 | 15,739 |
 | 4096 B | 292,352 | 524,288 = 2^19 | 231,936 |
 
-That gives a usable planning rule for Tasks 4 and 7:
-**po2 ≥ ceil(log2(user_cycles + paging_cycles))**, and cost follows from po2.
+That gave a planning rule: **po2 ≥ ceil(log2(user_cycles + paging_cycles))**, and
+cost follows from po2.
 
 It is a lower bound rather than an equality, and the two rows above are why: they
 are consistent with `reserved` being *pure* padding, but they cannot prove it. If
@@ -978,6 +1066,18 @@ the proof system also needs some fixed non-padding allocation inside `reserved`,
 the 256 B row caps it at 15,739 cycles — so the rule can under-predict by one po2
 for a guest landing within roughly 15k cycles below a boundary. Plan against the
 next po2 up when a guest lands that close.
+
+**The policy guest showed the rule needs a second correction, in the other
+direction: it is per *segment*, and cost follows padded rows, not po2.** Applied
+whole-session to `allow-001` (1,109,291 user + 127,270 paging) the rule predicts
+2^21 = 2,097,152 padded rows. The real total is 1,310,720 = 2^20 + 2^18, because a
+session that spans segments pads each segment separately and packs the tail into
+a smaller block — 37% *cheaper* than the whole-session reading. `adv-004` pads to
+2^20 + 2^17 = 1,179,648 and costs 9% less than `allow-001` for the same reason,
+on 9% fewer user cycles. So: a lower bound on the po2 of any single segment, an
+upper bound on the padded total once a session segments, and never a cost
+prediction on its own. `total_cycles` — which is a sum, not a power of two — is
+the quantity to multiply by the per-row rate.
 
 Two things fall out of it. Paging is half the real work at 256 B (24,870 against
 24,927 user cycles), so the policy guest's memory access pattern will move its po2
@@ -987,56 +1087,73 @@ would both fit po2 16. They would not: 65,535 user cycles plus even this spike's
 modest ~25,000 paging cycles is ~90,000, which rounds to po2 17.
 
 Time then scales near-linearly with padded rows: 8× the rows cost 8.85× the time
-(po2 16 → 19), roughly 0.087–0.096 ms per row. Extrapolating: **~105 s at po2 20,
-~210 s at po2 21.** Expect the policy guest a po2 or two above this spike at equal
-input size — affordable off the request path, nowhere near affordable on it.
-(Task 4 measured it: see the policy-guest table above for what actually
-happened.)
+(po2 16 → 19), roughly **0.087–0.096 ms per row**. This file extrapolated from
+that to **~105 s at po2 20** and ~210 s at po2 21.
 
-**Composite receipts are ~250 KB and grow with execution length.** That is a
-storage and transport cost per receipt, not per policy. Compressing to Groth16
-yields a constant-size receipt of a few hundred bytes at the cost of extra
-proving time; neither the compression time nor the resulting size has been
-measured here, and Task 6 should measure both before the release manifest
-commits to a receipt format.
+**The rate held; the extrapolation did not, and it is worth being precise about
+which half was wrong.** The policy guest's three proofs come out at 0.0937,
+0.0947 and 0.0961 ms per padded row — inside the spike's band, across two
+different row counts, on a guest a hundred times larger. What the extrapolation
+got wrong was the *row count*: "po2 20" was read as 2^20 = 1,048,576 rows, and the
+real sessions pad to 1,310,720 and 1,179,648 because they span two segments. At
+the measured rate those predict 123 s and 111 s, against 124.10 s and 113.37 s
+measured. So the near-linear-in-padded-rows model is in good shape and the way to
+misuse it is to guess the rows.
+
+**Composite receipts are ~250 KB at one segment and ~525 KB at two.** That is a
+storage and transport cost per receipt, not per policy. Compressing to succinct
+gives 223,744 bytes for +29.52 s (measured); Groth16 would give a constant-size
+receipt of a few hundred bytes, and its cost is **unmeasured** because the
+compression step needs Docker — see "Which receipt kind", where the manifest's
+`receiptCodec` decision is recorded.
 
 ### What is not established
 
-Everything above is one laptop, one toolchain, a handful of runs, and two fixture
-prompts. Specifically **not** shown:
+Everything above is one laptop, one toolchain, and — for the expensive half — a
+handful of runs. Specifically **not** shown:
 
-- **A stable prove time.** The two full benches of near-identical images differ by
-  20–26% at the median, and the within-run ALLOW spread is 127–167 s. There is a
-  central tendency of roughly two to three minutes and no evidence for anything
-  tighter. The cause of the between-run drift was not investigated.
-- **A full set of prove numbers for the current image.** Task 5 measured *prove
-  wall time and receipt size* at image `75751480…` (two single runs, below), which
-  retires the `†` on those two quantities only. Verify time, `total_cycles`,
-  `paging_cycles` and `reserved_cycles` are still the previous image's — they come
-  out of `--bench`, not out of the daemon, and Task 7 owns re-measuring them.
+- **A stable prove time.** Two full benches of near-identical images differ by
+  20–26% at the median; three daemon runs of one fixture gave 134.70 s, 122.58 s
+  and 121.21 s; `--bench` gave a 124.10 s median for that same fixture with a
+  120.3–126.4 s within-run spread. There is a central tendency of
+  roughly two to three minutes and no evidence for anything tighter. The cause of
+  the between-run drift was never investigated.
+- **A latency tail under load.** The corpus p95 is a distribution over *125
+  different fixtures*, each measured on an idle machine — it says the gate costs
+  about the same whatever the request is. It is not a p95 over repeated runs of
+  one request, and it says nothing about what `/execute` costs while the machine
+  is busy. The only concurrency samples here are three single `/execute` calls
+  fired under one in-flight prove, and they do not even order correctly against
+  load.
+- **Cost as a function of prompt size, beyond this corpus.** All 125 fixtures are
+  a single user message and the longest is 300 bytes. The daemon accepts up to
+  10 MiB and per-request executor work is linear in canonical bytes — Task 5's
+  review measured 1 MB at **34.2 s** — so there is a régime this section does not
+  describe at all, and Phase 2b needs a real input bound rather than a body cap.
+  Nothing here measures a multi-turn conversation either.
 - **Anything about GPUs.** Proving here is CPU-only (next section). A risc0 that
   re-enables the Metal path invalidates every prove number on this page, by an
   unmeasured amount.
 - **How receipt size scales.** Two data points at one segment (spike, ~250 KB)
-  and two at two segments (policy guest, ~525 KB) are consistent with "roughly
+  and three at two segments (policy guest, ~525 KB) are consistent with "roughly
   linear in segments" and do not establish it. Nothing here measured a
   three-segment session.
-- **Anything about Groth16.** Task 6 measured succinct (223,744 bytes, +29.52 s
-  from the composite, 12.5 ms to verify) but Groth16 proving needs Docker, which
-  this machine does not have — see "Which receipt kind". Any Groth16 number in
-  this repository is unmeasured.
-- **Cost as a function of the prompt.** Both fixtures are one short user message.
-  The executor cost is dominated by the ruleset, which is why the two agree to
-  0.4% — but that is an argument from two similar inputs, not a curve. Task 7's
-  fixture corpus is where the distribution comes from.
-- **Cross-machine reproducibility of the image.** Two builds on one machine with
-  one toolchain, as the section above says.
-- **Concurrency, beyond one probe.** Task 5 measured a single `/execute` fired
-  during a single in-flight prove (66 ms and 90 ms, two runs) — enough to show
-  the executor is not starved, not enough to characterise the daemon under load.
-  Nothing here measures several concurrent `/execute` calls, a full queue, or
-  what a second prove would do; the prove worker is one thread partly because
-  that is unmeasured.
+- **Anything about Groth16.** Succinct is measured (223,744 bytes, +29.52 s from
+  the composite, 12.5 ms to verify); Groth16 proving needs Docker, which this
+  machine does not have — see "Which receipt kind". Any Groth16 number in this
+  repository is unmeasured.
+- **Cross-machine reproducibility of the image.** Three cold builds on one
+  machine, and the third of them under a newly pinned host toolchain, all
+  returned a byte-identical guest ELF. That is evidence the build is not
+  gratuitously nondeterministic. Nobody has built this image on a second machine.
+- **Concurrency, beyond one probe.** Three single `/execute` calls under a single
+  in-flight prove — enough to show the executor is not starved, not enough to
+  characterise the daemon under load. Nothing here measures several concurrent
+  `/execute` calls, a full queue, or what a second prove would do; the prove
+  worker is one thread partly because that is unmeasured.
+- **The in-guest cycle breakdown at this image.** It comes from an instrumented
+  guest, which is by construction a different image; see "Where the user cycles
+  go".
 
 ### Proving is CPU-only
 
@@ -1153,6 +1270,17 @@ RUSTFLAGS='-C passes=lower-atomic -C panic=abort --cfg getrandom_backend="custom
   cargo +risc0 clippy --target riscv32im-risc0-zkvm-elf -- -D warnings
 ```
 
+One more, whenever anything under `policy-core/`, `methods/` or `policy/v1/` has
+been touched — including a comment, for the reason in "Reproducibility of the
+image":
+
+```bash
+# builtAt is the only field allowed to move; anything else means the image or a
+# toolchain changed and release.json plus the verify fixtures have to be re-cut
+diff <(grep -v builtAt release.json) \
+     <(cargo run -qrp host -- --emit-release | grep -v builtAt)
+```
+
 The guest lint needs both halves of that incantation and neither is optional.
 `cargo +risc0` because the stock `clippy-driver` has no `core`/`std` for
 `riscv32im-risc0-zkvm-elf` (it fails on the first `no_std` dependency); the
@@ -1171,8 +1299,12 @@ CTN_PROVE_TEST=1 cargo test -rp host --test api -- --ignored --nocapture
 `cargo test` is otherwise executor-only and stays fast. `host/tests/api.rs`
 spawns the real binary and drives it over a socket: `/health` against the baked
 identities, `/execute` for ALLOW and DENY (determinism on identical input,
-scores present only when asked), eleven malformed-request shapes against both
-POST endpoints with a marker planted in every caller-controlled field, a body
+scores present only when asked), eleven malformed-request shapes — nine of them
+against **both** POST endpoints and two against `/execute` only: the wrong-type
+`emitScores` body, because that field is not part of the `/prove` body at all,
+and the decodes-but-not-canonical request, because only the guest can say so and
+`/prove` deliberately reports that through the job rather than paying an executor
+run on the enqueue path — with a marker planted in every caller-controlled field, a body
 over the 10 MiB cap, the job lifecycle end to end in dev mode, the dev-mode
 startup refusal (the process must exit non-zero *before* it binds), and a
 log-capture assertion that reads the daemon's stdout and stderr and finds
@@ -1186,8 +1318,9 @@ accepted; six out-of-bound shapes are refused with the taxonomy constant), and
 the leak probes, which plant a marker in six positions `serde_json` used to quote
 back and assert it reaches neither the caller nor the process's stderr, plus the
 `CTN_UNSAFE_GUEST_DIAGNOSTICS` predicate (`=0` must mean off, with `=1` as the
-positive control). A full `--bench`, at these po2s, is a **~30 minute** command;
-use `CTN_BENCH_PROVE=0` while iterating.
+positive control). A full `--bench` — twelve proofs at these po2s — measured
+**24 minutes**; `--bench --fixtures` is 28 seconds for all 125, and
+`CTN_BENCH_PROVE=0` is a second, for iterating.
 
 ### Three workspaces, on purpose
 

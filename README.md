@@ -51,10 +51,9 @@ afterwards so the enclave re-provisions its vault, then `pnpm seed` again.
 
 ### Building the prover
 
-`prover/` holds the real RISC Zero prover, which is being built in Phase 2a and is
-not yet wired into `pnpm dev` — the running demo still uses the simulated prover.
-Nothing above requires Rust. Building `prover/` does, and it is a separate
-toolchain:
+**Nothing above requires Rust.** `prover/` does, and it is two toolchains rather
+than one — an ordinary Rust toolchain for the host, and a second one that `rzup`
+fetches for the zkVM target:
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
@@ -64,9 +63,40 @@ export PATH="$HOME/.risc0/bin:$PATH"
 rzup install        # fetches a Rust toolchain for the zkVM target; takes a few minutes
 ```
 
-Then `cd prover && cargo run -rp host -- --bench`. See
-[prover/README.md](prover/README.md) for versions, measured timings and the
-dev-mode policy.
+`prover/rust-toolchain.toml` pins the host channel to `1.97.1`, so the first
+`cargo` command inside `prover/` installs that exact compiler if rustup does not
+already have it. Both installers write outside the working tree (`~/.cargo`,
+`~/.rustup`, `~/.risc0`). A cold `cargo build --release -p host` takes about
+three and a half minutes on an M1 Pro, most of it compiling the guest.
+
+```bash
+cd prover
+cargo run -rp host -- --bench --fixtures    # the gate cost, over all 125 fixtures (~30 s)
+cargo run -rp host -- --bench               # + three real proofs (~25 minutes)
+cargo run -p prover-verify --release --manifest-path verify/Cargo.toml -- \
+  --receipt verify/tests/fixtures/allow-real.receipt.bin
+```
+
+**What `prover/` is, and what it is not.** It *is* a real RISC Zero zkVM program
+whose guest image is Safety Policy v1 — the ruleset is compiled into the image,
+the request commitment is recomputed inside the zkVM, and the journal it commits
+is a fixed five-field allowlist — plus a local daemon that executes and proves
+against it and a standalone offline verifier (`prover-verify`) that checks a
+receipt against a pinned `release.json` with no network access and no trust in
+whoever produced the receipt. Every proof and every number in
+[prover/README.md](prover/README.md) is real: dev mode is refused outright, the
+prover backend is enforced local, and a composite proof of one policy evaluation
+takes two to three minutes of CPU on an M1 Pro.
+
+It is **not** wired into the demo. Nothing in `services/`, `apps/` or `scripts/`
+calls it; `pnpm dev` never starts it; no request that goes through this prototype
+produces a RISC Zero receipt. Every proof artifact the running demo shows is
+still `simulated-reexec` — the enclave re-executes the policy from the witness
+and signs the journal, which is not a zero-knowledge proof and is labelled that
+way in the UI, the API and `VALIDATION.md`. Connecting the two is Phase 2b. Until
+that lands, the correct summary is "the repository contains a real prover, and
+the demo does not use it", and any reading of the form "the demo now has real ZK
+proofs" is wrong.
 
 ---
 
@@ -114,7 +144,7 @@ identical to `packages/policy` (the engine the gateway enforces). Per run it com
 125 fixtures and 500 generated Unicode adversarial cases field for field, sweeps all
 1,112,064 Unicode code points for normalizer divergence, puts 6 requests end to end
 through the compiled guest, and cross-checks the manifest canonicalizer — half of
-`POLICY_ID_V2` — against the TypeScript one on 15 hostile documents.
+`POLICY_ID_V2` — against the TypeScript one on 18 hostile documents.
 
 That sweep finds 133 code points where the two engines disagree, because Node's ICU
 is Unicode 16.0 and Rust's tables are 17.0. **The disagreement is bidirectional**: at
@@ -290,7 +320,7 @@ Each of these is a substitution of infrastructure, not of architecture.
 | PostgreSQL | `node:sqlite` | Same schema, table for table. Keeps `pnpm dev` dependency-free. Swapping back is a driver change. |
 | Neo4j | SQLite `graph_nodes` / `graph_links` | The graph is still a **projection** built from the outbox, never on the inference path (§42), so Rule 9 holds. The projection logic is the spec's `MERGE` statements; only the adapter differs. |
 | Cosmograph | custom canvas renderer | §48 asks for a fixed lane layout with requests animating across it. A force layout rescrambles that on every update. Cosmograph is also CC-BY-NC and pins React 18. |
-| RISC Zero zkVM | `simulated-reexec` prover | No Rust toolchain in this environment. The verification path checks the same journal, image id and commitment bindings a risc0 receipt needs, so the proof system is swappable without touching callers. Labelled honestly everywhere. |
+| RISC Zero zkVM | `simulated-reexec` prover **on the request path** | The reason used to be "no Rust toolchain here"; since Phase 2a that is no longer true — `prover/` holds a real zkVM prover and a real offline verifier. What remains is that nothing calls them: the request path still produces `simulated-reexec` artifacts, and the wiring is Phase 2b. The verification path checks the same journal, image id and commitment bindings a risc0 receipt needs, so the proof system is swappable without touching callers. Labelled honestly everywhere. |
 | AWS Nitro Enclaves | `SimulatedTEE` | §38 explicitly provides for this. Only the attestation and vault-unseal modules differ; `TrustedEnvironment` is the seam. |
 | `docker compose up` | `pnpm dev` | Four Node processes, one command, nothing to install. |
 
@@ -328,11 +358,15 @@ Live numbers are on the Trust Model page and `GET /v1/stats`. The proof cost is
 modelled (`CTN_SIMULATED_PROVING_MS`, default 2400 ms) and labelled as such —
 everything else is measured.
 
-The model is optimistic. A real RISC Zero proof of a guest that merely hashes 4 KB
-takes **50.5 s** on an M1 Pro, not 2.9 s (`prover/`, VALIDATION.md §2c). The
-architecture survives that — the proof is an audit artifact, not a gate, so the
-caller still waits ~490 ms — but "concurrent with the request" is the wrong mental
-picture. Receipts land seconds to minutes after the answer does.
+The model is optimistic by roughly **50×**. Phase 2a measured the real thing: a
+composite RISC Zero proof of one Safety Policy v1 evaluation takes **two to three
+minutes** of CPU on an M1 Pro, and the executor-only gate — the part a live
+request would actually wait for — costs **56 ms** at the median across all 125
+fixtures (`prover/README.md`, `VALIDATION.md` §2c). The architecture survives
+that; the proof is an audit artifact, not a gate, so the caller still waits
+~490 ms. But "concurrent with the request" is the wrong mental picture. Receipts
+land **minutes** after the answer does, and anything that waits on one has to be
+built for an artifact that is not there yet.
 
 ---
 
