@@ -439,6 +439,17 @@ also the reason the default cannot simply be deleted: OpenAI's own schema makes
 SDKs that never ask it. Making it required means choosing a default *there* instead,
 which relocates this paragraph rather than retiring it.
 
+The ceiling is also not policy-capped in the other direction: a caller may *pass*
+a large `max_tokens`, and the only clamp applied is the model's own output ceiling
+(64,000 for the pinned Anthropic model — `providers.ts`), not anything the
+contributor chose. Since `max_tokens` is the ceiling in the assumed-spend bound,
+a caller sending 128,000 makes a single unknown outcome book roughly 60× more
+assumed spend against the contributor's daily cap than the 1,024 default would.
+The cap still cannot be *exceeded* — the bound stays finite and is enforced
+atomically — but how much of it one wedged request consumes is caller-chosen,
+not contributor-chosen. A real per-credential output-token cap would close this;
+until then it is labelled here.
+
 ---
 
 ## 2c. Phase 2a addendum — what proving actually costs (§66)
