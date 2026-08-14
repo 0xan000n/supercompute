@@ -27,9 +27,10 @@
 //! `undefined`-valued keys dropped (not representable in parsed JSON, so
 //! nothing to drop here).
 //!
-//! Two details of that mirror are asymmetries in the TypeScript, reproduced
-//! rather than corrected, because the point of this file is to compute the same
-//! number the TypeScript computes:
+//! Three places where JS and Rust do not agree by default. The first two are
+//! asymmetries in the TypeScript, reproduced rather than corrected, because the
+//! point of this file is to compute the same number the TypeScript computes. The
+//! third cannot be reproduced, so it is refused instead.
 //!
 //! * **Keys are not NFC-normalized.** index.ts:36 normalizes a string *value*;
 //!   index.ts:43 emits a key as plain `JSON.stringify(k)`. So a decomposed key
@@ -41,6 +42,17 @@
 //!   U+E000..U+FFFF sorts *after* a key outside the BMP in JS and *before* it in
 //!   Rust. Today's manifest is ASCII and the two agree, which is precisely why
 //!   this has to be written down rather than discovered later.
+//! * **Numbers are only portable inside ±`Number.MAX_SAFE_INTEGER`.**
+//!   index.ts:35 is `String(value)`, and a JS `Number` is an IEEE-754 double:
+//!   fractional values are a different float-to-string algorithm from Rust's,
+//!   and large *integers* are not representable at all.
+//!   `JSON.parse("9007199254740993")` gives `9007199254740992`, so JS would
+//!   canonicalize to `"9007199254740992"` where `serde_json` — which keeps it as
+//!   an exact `i64` — canonicalizes to `"9007199254740993"`, and the two sides
+//!   silently derive different policy ids from the same file. Both cases are an
+//!   error here rather than a guess; see [`canonical_value`]. This one is not an
+//!   asymmetry that could be mirrored: index.ts's private `canonical()` has no
+//!   guard at all, so mirroring it would mean reproducing a silent wrong answer.
 
 use std::cmp::Ordering;
 
@@ -49,6 +61,17 @@ use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::input::hex_lower;
+
+/// `Number.MAX_SAFE_INTEGER` = 2^53 − 1, and the bound
+/// `canonicalJson` (`packages/protocol/src/canonical.ts:86`) already enforces
+/// through `Number.isSafeInteger`.
+///
+/// 2^53 itself *is* exactly representable as a double, so a rule of "reject
+/// above 2^53" would be defensible — but it would leave one integer,
+/// 9007199254740992, that this canonicalizer accepts and the TypeScript one
+/// throws on, and the differential harness compares the two. Matching
+/// `Number.isSafeInteger` exactly costs one value and buys an equality.
+const JS_SAFE_INTEGER_LIMIT: i128 = (1i128 << 53) - 1;
 
 /// JS string ordering: lexicographic over UTF-16 code units.
 fn js_str_cmp(a: &str, b: &str) -> Ordering {
@@ -61,17 +84,39 @@ fn canonical_value(value: &Value, out: &mut String) -> Result<(), String> {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Number(n) => {
-            // index.ts:35 is `String(value)`. For integers, JS and Rust agree
-            // exactly. For anything else they are two different float-to-string
-            // algorithms and a policy identity may not rest on that, so a
-            // non-integer in the manifest is an error rather than a guess.
-            if n.is_i64() || n.is_u64() {
-                out.push_str(&n.to_string());
-            } else {
-                return Err(format!(
-                    "manifest contains the non-integer number {n}; canonical form is \
-                     `String(value)` in JS (index.ts:35) and that is not portable for floats"
-                ));
+            // index.ts:35 is `String(value)`. Two ways that can disagree with
+            // Rust, and both are refused rather than guessed at, because a
+            // policy identity that differs between the two sides is worse than
+            // a manifest that will not build.
+            //
+            //  * A non-integer: two different float-to-string algorithms.
+            //  * An integer outside ±2^53: exact in `serde_json` (an `i64`),
+            //    already rounded by the time JS has parsed it. `JSON.parse` of
+            //    9007199254740993 yields 9007199254740992, so the two sides
+            //    canonicalize the same file to different bytes with no error on
+            //    either. Fail closed.
+            let integral = match (n.as_i64(), n.as_u64()) {
+                (Some(v), _) => Some(i128::from(v)),
+                (None, Some(v)) => Some(i128::from(v)),
+                (None, None) => None,
+            };
+            match integral {
+                Some(v) if v.abs() <= JS_SAFE_INTEGER_LIMIT => out.push_str(&v.to_string()),
+                Some(v) => {
+                    return Err(format!(
+                        "manifest contains the integer {v}, outside \
+                         ±Number.MAX_SAFE_INTEGER ({JS_SAFE_INTEGER_LIMIT}); a JS Number cannot \
+                         hold it exactly, so `String(value)` (index.ts:35) would canonicalize a \
+                         different number than this does and the two policy ids would differ \
+                         silently"
+                    ))
+                }
+                None => {
+                    return Err(format!(
+                        "manifest contains the non-integer number {n}; canonical form is \
+                         `String(value)` in JS (index.ts:35) and that is not portable for floats"
+                    ))
+                }
             }
         }
         Value::String(s) => {
@@ -208,6 +253,32 @@ mod tests {
     fn a_fractional_number_in_the_manifest_is_an_error() {
         assert!(canonical_manifest_bytes(r#"{"x":1.5}"#).is_err());
         assert!(canonical_manifest_bytes(r#"{"x":-7}"#).is_ok());
+    }
+
+    /// The third divergence, and the one that used to pass silently: an integer
+    /// JS cannot hold. `serde_json` keeps 9007199254740993 as an exact `i64` and
+    /// would have emitted it verbatim; `JSON.parse` in Node rounds it to
+    /// ...992 before `String(value)` ever sees it, so the two sides would have
+    /// hashed different bytes and produced different policy ids from the same
+    /// manifest, with nothing anywhere reporting a problem. Check it in Node:
+    /// `JSON.parse("9007199254740993") === 9007199254740992` is `true`.
+    #[test]
+    fn an_integer_javascript_cannot_represent_is_an_error() {
+        // Number.MAX_SAFE_INTEGER = 2^53 - 1, the last one both sides accept.
+        assert!(canonical_manifest_bytes(r#"{"x":9007199254740991}"#).is_ok());
+        assert!(canonical_manifest_bytes(r#"{"x":-9007199254740991}"#).is_ok());
+        // 2^53. Representable as a double, but `Number.isSafeInteger` says no
+        // and `canonicalJson` throws, so this side refuses too.
+        assert!(canonical_manifest_bytes(r#"{"x":9007199254740992}"#).is_err());
+        // 2^53 + 1 — the first integer a double cannot hold at all. `serde_json`
+        // keeps it exactly; `JSON.parse` has already rounded it to ...992.
+        assert!(canonical_manifest_bytes(r#"{"x":9007199254740993}"#).is_err());
+        assert!(canonical_manifest_bytes(r#"{"x":-9007199254740993}"#).is_err());
+        // i64::MAX and u64 territory, which `is_u64()` used to wave through.
+        assert!(canonical_manifest_bytes(r#"{"x":9223372036854775807}"#).is_err());
+        assert!(canonical_manifest_bytes(r#"{"x":18446744073709551615}"#).is_err());
+        // Nested, so the check is not just a top-level one.
+        assert!(canonical_manifest_bytes(r#"{"a":[1,{"b":9007199254740993}]}"#).is_err());
     }
 
     /// Both identities are over the raw file bytes, so a whitespace-only edit to

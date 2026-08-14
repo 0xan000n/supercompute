@@ -106,11 +106,15 @@ pnpm privacy-test                          # canary sweep across every persisted
 pnpm verify-receipt <requestId>            # independent receipt + proof + binding check
 ```
 
-`pnpm test:differential` needs the Rust toolchain and will **fail loudly** without it
-rather than skip — it is the only thing keeping `prover/policy-core` (the engine a
-proof is about) identical to `packages/policy` (the engine the gateway enforces). Per
-run it compares 125 fixtures and 500 generated Unicode adversarial cases field for
-field, then sweeps all 1,112,064 Unicode code points for normalizer divergence.
+`pnpm test:differential` needs the **RISC Zero** toolchain, not just Rust: since the
+guest suite landed it builds the zkVM guest ELF and runs the real image, so a cold
+cache costs ~1m40s (a warm one is a no-op) and it fails loudly rather than skip. It
+is the only thing keeping `prover/policy-core` (the engine a proof is about)
+identical to `packages/policy` (the engine the gateway enforces). Per run it compares
+125 fixtures and 500 generated Unicode adversarial cases field for field, sweeps all
+1,112,064 Unicode code points for normalizer divergence, puts 6 requests end to end
+through the compiled guest, and cross-checks the manifest canonicalizer — half of
+`POLICY_ID_V2` — against the TypeScript one on 15 hostile documents.
 
 That sweep finds 133 code points where the two engines disagree, because Node's ICU
 is Unicode 16.0 and Rust's tables are 17.0. **The disagreement is bidirectional**: at

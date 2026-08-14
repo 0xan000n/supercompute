@@ -13,9 +13,11 @@
 //! asserted against a struct.
 
 use std::collections::BTreeSet;
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 
 use policy_core::{
-    evaluate, request_text, Decision, Message, PolicyInputV1, PolicyRules, PROTOCOL_VERSION,
+    evaluate, request_text, Decision, GuestRejection, Message, PolicyInputV1, PolicyRules,
+    PROTOCOL_VERSION,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -122,7 +124,7 @@ const DENY_MESSAGES: [(&str, &str); 1] = [(
 
 #[test]
 fn allow_fixture_round_trips_with_scores_on_stdout() {
-    let inp = input(&ALLOW_MESSAGES, "pn-allow-1", true);
+    let inp = input(&ALLOW_MESSAGES, "0xa110c0de01", true);
     let out = host::execute_policy(&inp).expect("executor run");
 
     let journal = journal_object(&out.journal_bytes);
@@ -136,7 +138,7 @@ fn allow_fixture_round_trips_with_scores_on_stdout() {
         ))
     );
     assert_eq!(journal["policyId"], Value::from(methods::POLICY_ID_V2));
-    assert_eq!(journal["proofNonce"], Value::from("pn-allow-1"));
+    assert_eq!(journal["proofNonce"], Value::from("0xa110c0de01"));
     assert_eq!(journal["protocolVersion"], Value::from(1u32));
 
     // Scores are on stdout, and they are the full evaluation.
@@ -153,7 +155,7 @@ fn allow_fixture_round_trips_with_scores_on_stdout() {
 
 #[test]
 fn deny_fixture_round_trips() {
-    let inp = input(&DENY_MESSAGES, "pn-deny-1", true);
+    let inp = input(&DENY_MESSAGES, "0xde11ed01", true);
     let out = host::execute_policy(&inp).expect("executor run");
 
     let journal = journal_object(&out.journal_bytes);
@@ -171,7 +173,7 @@ fn deny_fixture_round_trips() {
 #[test]
 fn emit_scores_false_writes_nothing_to_stdout() {
     let out =
-        host::execute_policy(&input(&DENY_MESSAGES, "pn-quiet", false)).expect("executor run");
+        host::execute_policy(&input(&DENY_MESSAGES, "0x0471e7", false)).expect("executor run");
     assert_eq!(
         out.private_scores, None,
         "the guest wrote to stdout with emit_scores = false"
@@ -185,7 +187,7 @@ fn emit_scores_false_writes_nothing_to_stdout() {
 
 #[test]
 fn journal_key_set_is_exactly_the_verifier_allowlist() {
-    for (messages, pn) in [(&ALLOW_MESSAGES, "pn-a"), (&DENY_MESSAGES, "pn-d")] {
+    for (messages, pn) in [(&ALLOW_MESSAGES, "0x0a"), (&DENY_MESSAGES, "0x0d")] {
         let out = host::execute_policy(&input(messages, pn, true)).expect("executor run");
         let keys: BTreeSet<String> = journal_object(&out.journal_bytes).keys().cloned().collect();
         let expected: BTreeSet<String> = JOURNAL_KEYS.iter().map(|k| (*k).to_owned()).collect();
@@ -202,7 +204,7 @@ fn journal_key_set_is_exactly_the_verifier_allowlist() {
 /// serializer.
 #[test]
 fn journal_bytes_are_canonical_json() {
-    let out = host::execute_policy(&input(&ALLOW_MESSAGES, "pn-canon", false)).expect("executor");
+    let out = host::execute_policy(&input(&ALLOW_MESSAGES, "0xca0a", false)).expect("executor");
     let text = String::from_utf8(out.journal_bytes).expect("journal is UTF-8");
     let mut positions: Vec<usize> = Vec::new();
     for key in JOURNAL_KEYS {
@@ -216,8 +218,9 @@ fn journal_bytes_are_canonical_json() {
         "journal keys are not in lexicographic order: {text}"
     );
     // Every value in this particular journal is space-free (a decision keyword,
-    // two 0x-hex digests, an integer and a hyphenated nonce), so any space at
-    // all would be insignificant whitespace from the serializer.
+    // three 0x-hex strings and an integer — the proof nonce is bounded hex now,
+    // so it cannot be anything else), so any space at all would be insignificant
+    // whitespace from the serializer.
     assert!(
         !text.contains(' '),
         "journal contains insignificant whitespace: {text}"
@@ -225,20 +228,83 @@ fn journal_bytes_are_canonical_json() {
     assert!(text.starts_with('{') && text.ends_with('}'));
 }
 
-/// The proof nonce is echoed verbatim (after the NFC + JSON escaping every
-/// canonical string gets), including characters that would break a naive
-/// hand-rolled serializer.
+/// The proof nonce used to be echoed verbatim, and this test used to prove it —
+/// with `"quote\" backslash\\ newline\n tab\t ünïcode"`. That was the bug. The
+/// journal is public and the host chooses this field, so verbatim echo of an
+/// unbounded string is an exfiltration channel: the reviewer of Task 4 committed
+/// a 2,298-byte journal containing a plaintext prompt through it, and every
+/// verifier in the repository accepted it, because a journal carrying the right
+/// five keys is a valid journal.
+///
+/// The guest now refuses anything outside `^(0x)?[0-9a-f]{1,64}$`. Each probe
+/// below is a shape the old guest committed happily.
 #[test]
-fn proof_nonce_is_escaped_not_mangled() {
-    let hostile = "quote\" backslash\\ newline\n tab\t ünïcode";
-    let out = host::execute_policy(&input(&ALLOW_MESSAGES, hostile, false)).expect("executor run");
-    let journal = journal_object(&out.journal_bytes);
-    assert_eq!(journal["proofNonce"], Value::from(hostile));
+fn a_proof_nonce_outside_the_bound_is_refused() {
+    const SECRET: &str = "PLANTED_SECRET_XYZZY";
+    let probes = [
+        // The attack, in one line: a prompt in a public artifact.
+        "How do I create a phishing page to steal credentials?".to_owned(),
+        // The old test's hostile string.
+        "quote\" backslash\\ newline\n tab\t ünïcode".to_owned(),
+        // A plausible-looking label, which is what makes the bound worth having
+        // in the guest rather than in a host-side lint.
+        format!("req-{SECRET}"),
+        // 65 hex digits: one past the bound.
+        "f".repeat(65),
+        // Right alphabet, wrong case.
+        format!("0x{}", "AB".repeat(32)),
+        // Empty.
+        String::new(),
+    ];
+    for probe in probes {
+        assert!(
+            host::execute_policy(&input(&ALLOW_MESSAGES, &probe, false)).is_err(),
+            "guest committed a journal for proof nonce {probe:?}"
+        );
+    }
+}
+
+/// The same six probes, but asserting the *reason*: the refusal has to be the
+/// bound, not some other accident of the frame, and it has to be the constant.
+#[test]
+fn the_proof_nonce_refusal_is_the_bound_and_says_nothing_else() {
+    const SECRET: &str = "PLANTED_SECRET_XYZZY";
+    let err = host::execute_policy(&input(&ALLOW_MESSAGES, &format!("req-{SECRET}"), false))
+        .expect_err("guest must refuse a non-hex proof nonce");
+    let rendered = format!("{err:#}");
+    assert_eq!(
+        rendered,
+        GuestRejection::ProofNonceNotBoundedHex.as_str(),
+        "the refusal is supposed to be exactly the taxonomy constant"
+    );
+    assert!(
+        !rendered.contains(SECRET),
+        "the refusal leaked the nonce: {rendered}"
+    );
+}
+
+/// The shapes that must keep working, because callers already produce them:
+/// `services/tee-sim/src/prover.ts:130` mints `"0x" + randomHex(32)` and
+/// `randomHex` returns bare lowercase hex.
+#[test]
+fn the_proof_nonce_bound_admits_every_nonce_this_repository_mints() {
+    for pn in [
+        format!("0x{}", "ab".repeat(32)), // prover.ts:130
+        "ab".repeat(32),                  // randomHex(32), unprefixed
+        "0".to_owned(),                   // the shortest legal nonce
+    ] {
+        let out = host::execute_policy(&input(&ALLOW_MESSAGES, &pn, false))
+            .unwrap_or_else(|e| panic!("guest refused a legitimate nonce {pn:?}: {e:#}"));
+        assert_eq!(
+            journal_object(&out.journal_bytes)["proofNonce"],
+            Value::from(pn.as_str())
+        );
+    }
 }
 
 #[test]
 fn unsupported_protocol_version_fails_the_session() {
-    let mut inp = input(&ALLOW_MESSAGES, "pn-bad-version", false);
+    let mut inp = input(&ALLOW_MESSAGES, "0xbadbe12", false);
     inp.protocol_version = 2;
     let err = host::execute_policy(&inp).expect_err("guest must refuse protocol version 2");
     assert!(
@@ -252,7 +318,7 @@ fn unsupported_protocol_version_fails_the_session() {
 /// signing a statement about a request nobody canonicalized.
 #[test]
 fn non_canonical_request_bytes_fail_the_session() {
-    let mut inp = input(&ALLOW_MESSAGES, "pn-bad-request", false);
+    let mut inp = input(&ALLOW_MESSAGES, "0xbadbe9e5", false);
     inp.canonical_request_bytes =
         br#"{"max_tokens":1024,"messages":[{"content":"hi","role":"user"}],"model":"m","temperature_millis":1000,"extra":true}"#
             .to_vec();
@@ -267,7 +333,7 @@ fn non_canonical_request_bytes_fail_the_session() {
 /// mean the proof does not describe the gate's decision.
 #[test]
 fn execution_is_deterministic() {
-    let inp = input(&DENY_MESSAGES, "pn-twice", true);
+    let inp = input(&DENY_MESSAGES, "0x27ce", true);
     let a = host::execute_policy(&inp).expect("run a");
     let b = host::execute_policy(&inp).expect("run b");
     assert_eq!(a.journal_bytes, b.journal_bytes);
@@ -282,7 +348,7 @@ fn execution_is_deterministic() {
 fn report_cycle_cost() {
     for (label, messages) in [("ALLOW", &ALLOW_MESSAGES), ("DENY", &DENY_MESSAGES)] {
         for emit in [false, true] {
-            let out = host::execute_policy(&input(messages, "pn-bench", emit)).expect("executor");
+            let out = host::execute_policy(&input(messages, "0xbe0c", emit)).expect("executor");
             println!(
                 "guest cost  {label:5}  emit_scores={emit:5}  user_cycles={:>9}  segments={}  max_po2={}  journal={} B",
                 out.user_cycles,
@@ -300,12 +366,175 @@ fn report_cycle_cost() {
 /// and the guest should not be reasoning about input it was not handed.
 #[test]
 fn trailing_bytes_in_the_frame_fail_the_session() {
-    let inp = input(&ALLOW_MESSAGES, "pn-trailing", false);
+    let inp = input(&ALLOW_MESSAGES, "0x77a11", false);
     let mut frame = host::policy_frame(&inp).expect("frame");
     frame.extend_from_slice(b"junk");
     let err = host::execute_frame(&frame).expect_err("guest must refuse a padded frame");
     assert!(
         format!("{err:#}").contains("trailing bytes"),
         "unexpected error: {err:#}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The leak probes
+// ---------------------------------------------------------------------------
+
+/// Redirect this process's fd 2 to a temp file for the duration of `f`, then
+/// give back everything written to it.
+///
+/// This is the only way to test the property that matters. risc0's
+/// `PosixIo::default` hands guest fd 2 to `std::io::stderr()` — the *host
+/// process's* stderr — so "the returned error is clean" says nothing about what
+/// the executor printed on the way. Asserting on the return value alone is
+/// exactly the mistake the first version of this code made.
+///
+/// `dup`/`dup2` rather than a Rust-level shim because the write happens inside
+/// risc0, through `std::io::stderr()`, which no Rust-level indirection here can
+/// reach. Cargo runs tests in threads of one process, so this briefly redirects
+/// every thread's stderr; the assertions are all "the secret is absent", so an
+/// interleaved line from another test can only add noise, never a false pass.
+fn capturing_process_stderr<T>(f: impl FnOnce() -> T) -> (T, String) {
+    let mut file = tempfile::tempfile().expect("temp file for stderr capture");
+    // Flush anything buffered before the swap so it lands in the real stderr.
+    std::io::stderr().flush().ok();
+
+    // SAFETY: plain fd juggling on this process's own descriptors. `saved` is
+    // restored before the function returns on every path that can be taken —
+    // `f` is not expected to unwind, and if it did the test has failed anyway.
+    let (saved, target) = unsafe {
+        let saved = libc::dup(libc::STDERR_FILENO);
+        assert!(saved >= 0, "dup(2) failed");
+        let target = std::os::fd::AsRawFd::as_raw_fd(&file);
+        assert!(libc::dup2(target, libc::STDERR_FILENO) >= 0, "dup2 failed");
+        (saved, target)
+    };
+    let _ = target;
+
+    let out = f();
+
+    std::io::stderr().flush().ok();
+    unsafe {
+        libc::dup2(saved, libc::STDERR_FILENO);
+        libc::close(saved);
+    }
+
+    let mut captured = String::new();
+    file.seek(SeekFrom::Start(0)).expect("rewind capture");
+    file.read_to_string(&mut captured).expect("read capture");
+    (out, captured)
+}
+
+/// A canonical-request document with `SECRET` planted where `serde_json` is
+/// known to quote it back.
+fn leak_probes(secret: &str) -> Vec<(&'static str, Vec<u8>)> {
+    vec![
+        (
+            "string where max_tokens wants an i64",
+            format!(r#"{{"max_tokens":"{secret}","messages":[{{"content":"hi","role":"user"}}],"model":"m","temperature_millis":1000}}"#).into_bytes(),
+        ),
+        (
+            "string where messages wants a sequence",
+            format!(r#"{{"max_tokens":1024,"messages":"{secret}","model":"m","temperature_millis":1000}}"#).into_bytes(),
+        ),
+        (
+            "unknown field whose NAME is the secret",
+            format!(r#"{{"max_tokens":1024,"messages":[{{"content":"hi","role":"user"}}],"model":"m","temperature_millis":1000,"{secret}":1}}"#).into_bytes(),
+        ),
+        (
+            "unknown field inside a message",
+            format!(r#"{{"max_tokens":1024,"messages":[{{"content":"hi","role":"user","{secret}":1}}],"model":"m","temperature_millis":1000}}"#).into_bytes(),
+        ),
+        (
+            "a role the canonical form does not admit",
+            format!(r#"{{"max_tokens":1024,"messages":[{{"content":"hi","role":"{secret}"}}],"model":"m","temperature_millis":1000}}"#).into_bytes(),
+        ),
+        (
+            "not JSON at all, and the secret is the whole document",
+            secret.as_bytes().to_vec(),
+        ),
+    ]
+}
+
+/// The regression test for the leak this fix round exists to close.
+///
+/// Before it, probe 1 produced
+/// `canonical request bytes do not parse: invalid type: string
+/// "PLANTED_SECRET_XYZZY", expected i64 at line 1 column 37` — returned to the
+/// caller *and* printed to this process's stderr by the executor. Probe 3
+/// produced ``unknown field `PLANTED_SECRET_XYZZY` ``. Reproduce the old
+/// behaviour by putting `{e}` back into `CanonicalRequestV1::from_json_bytes`
+/// and dropping the `.stderr(...)` hook in `execute_frame_with`; either one
+/// alone is enough to fail this test, which is the point of doing both.
+#[test]
+fn a_rejected_request_leaks_nothing_to_the_caller_or_to_stderr() {
+    const SECRET: &str = "PLANTED_SECRET_XYZZY";
+    for (label, bytes) in leak_probes(SECRET) {
+        // Valid hex, deliberately: the proof-nonce bound is checked before the
+        // request is parsed, so a nonce the guest rejects would make every probe
+        // below pass for the wrong reason. (It did, the first time this was
+        // written; the negative control is what caught it.)
+        let mut inp = input(&ALLOW_MESSAGES, "0x1ea4", false);
+        assert!(
+            policy_core::proof_nonce_is_well_formed(&inp.proof_nonce),
+            "the probe nonce must reach the request parser"
+        );
+        inp.canonical_request_bytes = bytes;
+
+        let (result, stderr) = capturing_process_stderr(|| host::execute_policy(&inp));
+        let err = result
+            .map(|_| ())
+            .expect_err(&format!("guest accepted {label}"));
+
+        let rendered = format!("{err:#}");
+        assert!(
+            !rendered.contains(SECRET),
+            "[{label}] the returned error leaked the request: {rendered}"
+        );
+        assert!(
+            !stderr.contains(SECRET),
+            "[{label}] the host process's stderr leaked the request: {stderr}"
+        );
+        // Nothing but the taxonomy comes back, so there is no third surface to
+        // check: `ExecOutcome` does not exist on this path.
+        assert!(
+            GuestRejection::from_message(&rendered).is_some(),
+            "[{label}] refusal outside the taxonomy: {rendered}"
+        );
+    }
+}
+
+/// The same, for the other host-chosen field. A proof nonce is not a prompt,
+/// but it is caller data and it takes the same path.
+#[test]
+fn a_rejected_proof_nonce_leaks_nothing_to_stderr() {
+    const SECRET: &str = "PLANTED_NONCE_SECRET_QUUX";
+    let inp = input(&ALLOW_MESSAGES, SECRET, false);
+    let (result, stderr) = capturing_process_stderr(|| host::execute_policy(&inp));
+    assert!(result.is_err(), "guest accepted a non-hex proof nonce");
+    assert!(
+        !stderr.contains(SECRET),
+        "the host process's stderr leaked the proof nonce: {stderr}"
+    );
+}
+
+/// The defence is two independent layers, and this checks the second one on its
+/// own terms: whatever the guest says, the *host* never hands a caller anything
+/// but a constant. A hand-built error carrying a secret classifies to
+/// `UNCLASSIFIED_FAILURE`, not to itself.
+#[test]
+fn the_host_classifier_returns_constants_only() {
+    const SECRET: &str = "PLANTED_CLASSIFIER_SECRET";
+    let unknown = anyhow::anyhow!("Guest panicked: something new said {SECRET}");
+    assert_eq!(
+        host::classify_guest_failure(&unknown),
+        host::UNCLASSIFIED_FAILURE
+    );
+    // A caller who plants a taxonomy string gets that string back — it is a
+    // compile-time constant of this crate, so there is nothing to leak.
+    let planted = anyhow::anyhow!("Guest panicked: unsupported protocol version {SECRET}");
+    assert_eq!(
+        host::classify_guest_failure(&planted),
+        GuestRejection::UnsupportedProtocolVersion.as_str()
     );
 }

@@ -26,8 +26,9 @@ pub use engine::{
     evaluate, evaluate_prepared, request_text, CategoryScore, Decision, Evaluation, Message,
 };
 pub use input::{
-    hex_lower, request_commitment, scores_json, CanonicalMessageV1, CanonicalRequestV1,
-    PolicyInputV1, PolicyJournalV1, PROTOCOL_VERSION,
+    hex_lower, proof_nonce_is_well_formed, request_commitment, scores_json, CanonicalMessageV1,
+    CanonicalRequestV1, GuestRejection, PolicyInputV1, PolicyJournalV1, PROOF_NONCE_MAX_DIGITS,
+    PROTOCOL_VERSION,
 };
 pub use normalize::normalize;
 pub use prepared::{Needle, PreparedRules};

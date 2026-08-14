@@ -12,14 +12,41 @@
 //! **Nothing here may log its input.** `PolicyInputV1::canonical_request_bytes`
 //! *is* the plaintext prompt; the same redaction discipline that applies to
 //! `enclave-log` applies to every line of this crate.
+//!
+//! That discipline is not enough on its own, which is the lesson of Task 4's
+//! first fix round: the executor writes the guest's stderr to the *host
+//! process's* stderr unless told otherwise, so "this crate never logs" said
+//! nothing about what got printed. [`execute_frame_with`] now names an explicit
+//! sink for guest stderr, and every value that leaves this module on a failure
+//! path is one of the constants in `policy_core::GuestRejection` or
+//! [`UNCLASSIFIED_FAILURE`].
 
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use methods::{POLICY_GUEST_ELF, POLICY_GUEST_ID};
-use policy_core::PolicyInputV1;
+use policy_core::{GuestRejection, PolicyInputV1};
 use risc0_zkvm::{default_executor, Executor, ExecutorEnv};
+
+/// The reason returned when an executor failure matches no [`GuestRejection`].
+///
+/// A host-side failure (a session limit, an ELF that will not load) lands here,
+/// and so would a guest panic from code that forgot the taxonomy. Deliberately
+/// contentless: "we do not recognise this" is the honest thing to say to a
+/// caller, and the underlying error is available to an operator through
+/// [`UNSAFE_DIAGNOSTICS_ENV`].
+pub const UNCLASSIFIED_FAILURE: &str = "policy guest execution failed for an unclassified reason";
+
+/// Set this to any value and [`execute_frame_with`] prints the raw executor
+/// error and the guest's stderr to the host's stderr on failure.
+///
+/// **This defeats the leak defence and is named to say so.** The raw error and
+/// the guest's stderr can both contain fragments of the canonical request, which
+/// is the plaintext prompt. It exists for someone debugging the guest on their
+/// own laptop with their own input. Nothing in CI, in `pnpm test`, or in Task
+/// 5's daemon may set it.
+pub const UNSAFE_DIAGNOSTICS_ENV: &str = "CTN_UNSAFE_GUEST_DIAGNOSTICS";
 
 /// One executor run.
 pub struct ExecOutcome {
@@ -96,27 +123,68 @@ pub fn execute_frame(frame: &[u8]) -> Result<ExecOutcome> {
     execute_frame_with(&default_executor(), frame)
 }
 
+/// Reduce an executor failure to a fixed string.
+///
+/// The rendered error carries the guest's panic message, and the guest's panic
+/// messages are `GuestRejection` constants — but *only* the guest's are. An
+/// executor error can also come from risc0 itself, and neither this crate nor
+/// its callers can enumerate what risc0 might put in one. So the rule is not
+/// "sanitise the message"; it is **never return the message**. Match it against
+/// the closed taxonomy and return the constant that matched, or say nothing.
+///
+/// Matching on a substring of caller-influenced text is safe here because the
+/// output is one of nine compile-time constants. A caller who plants
+/// `"unsupported protocol version"` in their prompt and then sends a malformed
+/// frame gets that string back; they wrote it.
+pub fn classify_guest_failure(err: &anyhow::Error) -> &'static str {
+    GuestRejection::from_message(&format!("{err:#}"))
+        .map(GuestRejection::as_str)
+        .unwrap_or(UNCLASSIFIED_FAILURE)
+}
+
 pub fn execute_frame_with(executor: &Rc<dyn Executor>, frame: &[u8]) -> Result<ExecOutcome> {
-    // The guest's stdout is captured into this buffer. The borrow has to end
-    // before the buffer is read, hence the block: `env` holds it for as long as
-    // it lives, and `execute` consumes `env`.
+    // The guest's stdout and stderr are captured into these buffers. The borrow
+    // has to end before either is read, hence the block: `env` holds them for as
+    // long as it lives, and `execute` consumes `env`.
+    //
+    // The stderr hook is not optional and not cosmetic. `PosixIo::default`
+    // (risc0-zkvm-3.0.6/src/host/client/posix_io.rs:36-43) wires guest fd 2 to
+    // `std::io::stderr()` — the *host process's* stderr — so without this line
+    // the guest's panic message is printed by the executor, into whatever
+    // captures this process's output, before any code here can decide whether it
+    // should be. That is a channel no amount of care about return values closes.
+    // The guest's messages are constants (`GuestRejection`), so this is the
+    // second of two independent defences rather than the only one.
     let mut stdout_buf: Vec<u8> = Vec::new();
+    let mut stderr_buf: Vec<u8> = Vec::new();
     let start = Instant::now();
-    let session = {
+    let result = {
         let env = ExecutorEnv::builder()
             .write_frame(frame)
             .stdout(&mut stdout_buf)
+            .stderr(&mut stderr_buf)
             .build()
             .context("building executor env")?;
-        executor
-            .execute(env, POLICY_GUEST_ELF)
-            // The guest's panic message rides on this error. It can name a
-            // rejected field but never a value (see
-            // `CanonicalRequestV1::from_json_bytes`), so it is safe to return —
-            // and still not safe to log.
-            .context("policy guest execution failed")?
+        executor.execute(env, POLICY_GUEST_ELF)
     };
     let exec_wall = start.elapsed();
+
+    let session = match result {
+        Ok(session) => session,
+        Err(err) => {
+            if std::env::var_os(UNSAFE_DIAGNOSTICS_ENV).is_some() {
+                eprintln!(
+                    "{UNSAFE_DIAGNOSTICS_ENV} is set — the two lines below MAY CONTAIN PROMPT TEXT\n\
+                       executor error: {err:#}\n\
+                       guest stderr:   {}",
+                    String::from_utf8_lossy(&stderr_buf).trim_end()
+                );
+            }
+            // Not `.context(err)`: the rendered error is exactly what must not
+            // escape. `stderr_buf` is dropped here, unread.
+            return Err(anyhow!("{}", classify_guest_failure(&err)));
+        }
+    };
 
     let private_scores = if stdout_buf.is_empty() {
         None

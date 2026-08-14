@@ -1447,6 +1447,7 @@ dependencies = [
  "anyhow",
  "base64",
  "bincode",
+ "libc",
  "methods",
  "policy-core",
  "postcard",
@@ -1454,6 +1455,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tracing-subscriber 0.3.23",
 ]
 

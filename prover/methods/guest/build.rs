@@ -76,12 +76,14 @@ fn main() {
              \n\
              /// \"0x\" + hex(sha256(rules_bytes)).\n\
              ///\n\
-             /// Nothing in the guest reads this. It is baked in anyway, and\n\
-             /// deliberately: it puts the digest of the exact rules bytes into\n\
-             /// the measured image, where an auditor disassembling the ELF can\n\
-             /// find it, and it is a second reason a one-byte rules edit moves\n\
-             /// the ImageID.\n\
-             #[allow(dead_code)]\n\
+             /// The guest reads this exactly once, through a\n\
+             /// `core::hint::black_box` in `main`, and that read is the whole\n\
+             /// point: an unreferenced `const &str` is not emitted into the\n\
+             /// binary at all, so the digest would not be in the measured image\n\
+             /// and an auditor running `strings` over the ELF would not find\n\
+             /// it. With the barrier it is in `.rodata`, checkable without\n\
+             /// trusting a build log, and it is a second reason a one-byte\n\
+             /// rules edit moves the ImageID.\n\
              const RULES_DIGEST: &str = {rules_digest:?};\n"
         ),
     )

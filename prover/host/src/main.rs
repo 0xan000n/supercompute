@@ -80,7 +80,9 @@ fn bench_input(content: &str) -> PolicyInputV1 {
         // A fixed nonce so the benchmark is reproducible. Live requests use a
         // random one; the guest hashes it either way, so the cost is the same.
         request_nonce: [0x5a; 32],
-        proof_nonce: "bench".to_owned(),
+        // Bounded lowercase hex, like every other proof nonce: the guest refuses
+        // anything else, so "bench" (which this used to be) no longer runs.
+        proof_nonce: "0xbe0c0000000000000000000000000000".to_owned(),
         emit_scores: false,
     }
 }
@@ -201,10 +203,21 @@ fn bench_case(
     let mut paging_cycles = 0u64;
     let mut reserved_cycles = 0u64;
     for i in 0..(WARMUP + RUNS) {
-        // No stdout hook: on the prove path the guest is never asked for scores
-        // and nothing captures them.
+        // Explicit sinks for both guest streams. The earlier version of this
+        // loop passed neither and explained that as "no stdout hook: nothing
+        // captures them", which had the default backwards — risc0's
+        // `PosixIo::default` wires guest stdout and stderr to the *host
+        // process's* stdout and stderr, so "no hook" means "printed". Today
+        // `bench_input` hardcodes `emit_scores: false` and the guest is not
+        // asked for scores, so nothing would be printed anyway; that is a
+        // property of one line in `bench_input`, and this is the structural
+        // version of the same claim.
+        let mut guest_stdout: Vec<u8> = Vec::new();
+        let mut guest_stderr: Vec<u8> = Vec::new();
         let env = ExecutorEnv::builder()
             .write_frame(&frame)
+            .stdout(&mut guest_stdout)
+            .stderr(&mut guest_stderr)
             .build()
             .context("building executor env")?;
         let start = Instant::now();
@@ -212,6 +225,10 @@ fn bench_case(
             .prove_with_opts(env, POLICY_GUEST_ELF, opts)
             .context("composite prove")?;
         let prove_elapsed = start.elapsed();
+        assert!(
+            guest_stdout.is_empty() && guest_stderr.is_empty(),
+            "the guest wrote to a standard stream on the prove path"
+        );
 
         let receipt = info.receipt;
         stats_user_cycles = info.stats.user_cycles;
@@ -513,9 +530,11 @@ fn handle_stdin(req: StdinRequest, executor: &Rc<dyn risc0_zkvm::Executor>) -> S
                         error: format!("journal is not UTF-8: {e}"),
                     },
                 },
-                // The guest's panic message. It can name a rejected field but
-                // never a value, so returning it does not leak prompt text —
-                // and it is still never written to a log here.
+                // Already reduced to a `GuestRejection` constant (or
+                // `UNCLASSIFIED_FAILURE`) by `execute_frame_with`, which is
+                // where the reasoning lives: the guest's raw panic message and
+                // the executor's own error can both quote the request, so
+                // neither reaches this point.
                 Err(e) => StdinResponse::Failed {
                     error: format!("{e:#}"),
                 },

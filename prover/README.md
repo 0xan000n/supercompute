@@ -91,6 +91,7 @@ program produced a receipt — so the wiring is load-bearing, not boilerplate.
 `{ protocolVersion, canonicalRequestBytes, requestNonce[32], proofNonce,
 emitScores }`. `canonicalRequestBytes` is the signed canonical request verbatim;
 it is the plaintext prompt, and nothing in this workspace may log it.
+`proofNonce` must match `^(0x)?[0-9a-f]{1,64}$` — see below.
 
 **Journal** — canonical JSON (JCS: keys sorted, no whitespace, strings NFC),
 with the key set **exactly**
@@ -117,6 +118,70 @@ Three properties are the point of the design and each is one line of code:
    parsed with `deny_unknown_fields` and its roles are checked; anything else
    panics the guest and produces no journal.
 
+Two more were added in Task 4's first fix round, and both are about the guest
+not trusting the *host*.
+
+### The journal's only variable-length field is bounded
+
+`proofNonce` must match `^(0x)?[0-9a-f]{1,64}$`, checked **in the guest** before
+anything is committed. Violations panic with a fixed string.
+
+The journal is public. It is the one artifact this design promises carries no
+prompt-derived data, and every verifier in the repository enforces that promise
+by checking the *key set*. `proofNonce` was an unbounded, host-chosen string
+echoed into that key set verbatim — so the promise held for the keys and not for
+the bytes. Task 4's reviewer put a 2,298-byte journal containing a plaintext
+prompt through it, and `services/tee-sim/src/verify.ts` accepted it, correctly:
+the keys were right.
+
+A key-set allowlist cannot close that. A bound can, and it has to be in the
+guest, because the host is the party the bound is defending against — a
+host-side check is advice, and the image is what the proof is about.
+
+The shape is the tightest one every existing caller already satisfies:
+`services/tee-sim/src/prover.ts:130` mints `"0x" + randomHex(32)`, and
+`randomHex` (`packages/protocol/src/crypto.ts:121`) is lowercase hex. 66
+characters is the longest legitimate nonce there is. Uppercase is rejected
+rather than folded, because a guest that rewrote a caller's nonce would produce
+a journal the caller cannot predict, and the journal is compared byte for byte.
+
+### Every refusal is a constant
+
+`policy_core::GuestRejection` is the closed set of reasons the guest stops, and
+each renders to a `&'static str` with nothing interpolated. The host reduces any
+executor failure to one of them (`host::classify_guest_failure`) or to
+`UNCLASSIFIED_FAILURE`, and **never** returns the underlying error.
+
+This is two independent defences because the channel needs two. risc0's
+`PosixIo::default` wires guest fd 2 to the **host process's** `std::io::stderr()`
+(`risc0-zkvm-3.0.6/src/host/client/posix_io.rs:36-43`), so a guest panic is
+printed by the executor before any host code can decide whether it should be.
+`execute_frame_with` now names an explicit in-memory sink for guest stderr, and
+the guest's messages are constants, so neither the sink nor the taxonomy is
+load-bearing alone.
+
+The bug this closes was real and is reproducible on the previous commit: the
+guest panicked with `serde_json`'s message, which quotes the offending value, so
+
+```text
+{"max_tokens":"<secret>", …}
+  → canonical request bytes do not parse: invalid type: string "<secret>", expected i64
+```
+
+went back to the caller *and* to the host's stderr. `deny_unknown_fields` did the
+same with the field name. The code comment asserting that serde errors "never
+contain a fragment of a string value" was simply wrong.
+
+`host/tests/guest_io.rs` plants a marker in six such positions and asserts it
+appears in neither the returned error nor the process's stderr (captured via
+`dup2`, because that write happens inside risc0 and no Rust-level shim can see
+it). Both halves were negative-controlled: reintroducing the interpolation fails
+the returned-error assertion, and additionally dropping the stderr sink fails the
+stderr assertion.
+
+`CTN_UNSAFE_GUEST_DIAGNOSTICS=1` prints the raw error and the guest's stderr on
+failure. It is named to say what it is; nothing in CI may set it.
+
 ### `policyId` v2 differs from the TypeScript `policyId` — on purpose
 
 The guest bakes
@@ -139,14 +204,34 @@ better one: object **keys are not NFC-normalized** (index.ts:36 normalizes a
 string value, index.ts:43 emits a key as plain `JSON.stringify(k)`), and keys
 **sort by UTF-16 code unit**, which is what JS does and which differs from
 Rust's code-point ordering for a BMP key above U+E000 against a supplementary
-one. Today's manifest is ASCII, so neither bites; both are unit-tested against
-output captured from the real `canonicalJson`.
+one. Today's manifest is ASCII, so neither bites.
+
+There is a **third** divergence, and it cannot be mirrored, so it fails closed:
+a JS `Number` is an IEEE-754 double, and `JSON.parse("9007199254740993")` is
+already `9007199254740992` by the time `String(value)` sees it, while
+`serde_json` keeps the exact `i64`. The two sides would have derived different
+policy ids from the same file with nothing reporting a problem. Numbers outside
+±`Number.MAX_SAFE_INTEGER`, and non-integers, are now an error in
+`canonical_manifest_bytes` — the same bound `canonicalJson` enforces through
+`Number.isSafeInteger`, chosen over the looser "±2^53" so the two sides agree
+exactly rather than nearly.
+
+None of this is asserted against a hardcoded expectation any more. Suite 6 of
+`scripts/differential-test.ts` feeds fifteen hostile manifests — combining marks
+in keys, two keys that NFC-collide, the U+FFFD / U+D7FF / U+E000 boundaries
+against supplementary characters, `MAX_SAFE_INTEGER`, 2^53, 2^53+1, a `u64`, a
+fraction — through **both** canonicalizers and compares. A one-sided refusal by
+Rust is fail-closed and allowed but has to be declared in the probe table; a
+one-sided refusal by *TypeScript* is a failure, because that is the direction
+where the guest bakes an identity no verifier can reproduce. The suite found one
+case on its first run: `serde_json` parses `-0` as the float `-0.0` and refuses
+it, while `canonicalJson` emits `0`. It is declared, and it is the only one.
 
 ### Reproducibility of the image
 
 `prover/methods/guest/target/` and `prover/target/riscv-guest/` deleted, then
 `cargo build --release -p host`: the guest ELF came back **byte-identical**
-(SHA-256 `ad7b530fcd74b4288ee8347c1c7ef12d595bc2c9c8e5d0b0f32cf13bff723a0d`) and
+(SHA-256 `e5fd1e0d47a2b4422c7a2c614bfaf4d752cc389362f050d38afffb5864414301`) and
 so did the ImageID. That is one machine, one toolchain, two builds — it is
 evidence that the build is not gratuitously nondeterministic, not a claim of
 cross-machine reproducibility, which nothing here has tested. Task 6 pins the
@@ -239,37 +324,67 @@ mode off, in-process prover (backend `local`, enforced). Reproduce with
 
 ### Task 4 — the policy guest
 
-Guest image id `4a05b4e9c27a79faa0a6989129d2436c910b02cc6222bdde0f8d2ba103ec8ace`,
+Guest image id `75751480a7e7d6b329de6614fee99e8d2cf9a793c32e9c1e3de057f8196b0ee1`,
 policy id `0x1f74ba4f2353012cd26f5d3279625c3b45e927eeb341f0ee4b72124b056a7db2`,
 rules digest `0x9f85ba59fd1429f10c373efc56d69aefa255a01a08df3ab6bd8e1ccecd3f93ea`.
+The policy id and the rules digest are unchanged from Task 4's first image —
+`policy/v1/` was not touched — and the ImageID moved because the guest code did.
 Two fixture requests: `allow-001` (a haiku prompt, 45 characters) and `deny-001`
 (a phishing prompt, 71 characters).
 
+> **Two images are quoted in this section, and the difference is stated rather
+> than smoothed over.** Task 4's first fix round changed the guest — a bounded
+> `proofNonce`, fixed-string refusals, the rules digest forced into `.rodata` —
+> so the ImageID above is **not** the one the prove, receipt and verify numbers
+> were taken on. Those were measured at image
+> `4a05b4e9c27a79faa0a6989129d2436c910b02cc6222bdde0f8d2ba103ec8ace`, which
+> differs from this one by **+8,353 user cycles** on ALLOW (+0.76%) at the same
+> segment count and the same max po2, and they are **not re-measured here**: a
+> full `--bench` is ~30 minutes, and the honest expectation is that the change is
+> invisible underneath the ±20% run-to-run prove noise documented below. Task 7's
+> fixture-corpus bench owns the re-measurement. Executor time and cycle counts —
+> the reproducible quantities — *were* re-measured at the current image and are
+> the ones in the tables.
+
 Medians:
 
-| Case | Executor only | Composite prove | Receipt (bincode) | Verify |
+| Case | Executor only (this image) | Composite prove † | Receipt (bincode) † | Verify † |
 |---|---|---|---|---|
-| ALLOW | 57.6 ms | 137.69 s | 525.1 KB (537,736 B) | 29.4 ms |
-| DENY | 58.1 ms | 126.14 s | 525.1 KB (537,734 B) | 30.1 ms |
+| ALLOW | 57.0 ms | 137.69 s | 525.1 KB (537,736 B) | 29.4 ms |
+| DENY | 56.3 ms | 126.14 s | 525.1 KB (537,734 B) | 30.1 ms |
+
+† measured at image `4a05b4e9…`, +8,353 user cycles below this one. See the note
+above.
 
 Spread (min / median / max):
 
-| Case | Executor ms | Prove ms | Verify ms |
+| Case | Executor ms (this image) | Prove ms † | Verify ms † |
 |---|---|---|---|
-| ALLOW | 57.5 / 57.6 / 58.9 | 127,275.0 / 137,693.6 / 166,816.3 | 29.4 / 29.4 / 30.3 |
-| DENY | 57.9 / 58.1 / 58.1 | 122,718.5 / 126,139.9 / 126,205.3 | 29.0 / 30.1 / 30.2 |
+| ALLOW | 56.3 / 57.0 / 57.4 | 127,275.0 / 137,693.6 / 166,816.3 | 29.4 / 29.4 / 30.3 |
+| DENY | 56.2 / 56.3 / 56.3 | 122,718.5 / 126,139.9 / 126,205.3 | 29.0 / 30.1 / 30.2 |
 
-| Case | Segments | Max po2 | User cyc | Total cyc | Paging cyc | Reserved cyc |
+The executor rows are one `CTN_BENCH_PROVE=0` run. A second run of the same
+binary gave 56.1 / 56.3 / 57.8 (ALLOW) and 56.3 / 56.3 / 56.3 (DENY) — a 1.2%
+median drift on ALLOW, well inside the ±6% band Task 1 recorded. Both runs
+reported byte-identical cycle counts.
+
+| Case | Segments | Max po2 | User cyc | Total cyc † | Paging cyc † | Reserved cyc † |
 |---|---|---|---|---|---|---|
-| ALLOW | 2 | 20 | 1,100,938 | 1,310,720 | 125,995 | 83,787 |
-| DENY | 2 | 20 | 1,082,221 | 1,310,720 | 127,296 | 101,203 |
+| ALLOW | 2 | 20 | 1,109,291 | 1,310,720 | 125,995 | 83,787 |
+| DENY | 2 | 20 | 1,090,549 | 1,310,720 | 127,296 | 101,203 |
+
+`total_cycles`, `paging_cycles` and `reserved_cycles` only come out of a prove
+run, so they are the `4a05b4e9…` numbers. Segments and max po2 are identical
+across the two images, and 8,353 extra user cycles cannot move a 2^20 + 2^18
+padding total, but that is an argument rather than a measurement and is labelled
+as one.
 
 Five things in there are worth stating plainly, because three of them are worse
 than Task 1 predicted.
 
-**The executor gate costs ~58 ms, not ~20 ms.** The spike's floor was 16.9–18.3 ms
+**The executor gate costs ~56 ms, not ~20 ms.** The spike's floor was 16.9–18.3 ms
 and this file told Phase 2b to budget ~20 ms per execution regardless of prompt
-size. That was a floor, and the policy guest sits about 40 ms above it. This is
+size. That was a floor, and the policy guest sits about 38 ms above it. This is
 the number `tee-sim` will pay synchronously on every request once Task 5 wires
 `/execute` in; it does not go away by shrinking the prompt, because it is
 dominated by the ruleset, not the request.
@@ -307,7 +422,9 @@ Both are per-receipt costs and both are still small next to proving.
 
 Where the user cycles go, measured in-guest with `env::cycle_count()` on the
 ALLOW case with `emitScores` off (1,089,150 cycles between the first and last
-reading, against 1,100,938 for the whole session):
+reading, against 1,100,938 for the whole session at image `4a05b4e9…`; the
+breakdown has not been re-instrumented at the current image, which is 8,353
+cycles heavier in total):
 
 | Phase | Cycles |
 |---|---|
@@ -439,6 +556,35 @@ commits to a receipt format.
 
 ### What is not established
 
+Everything above is one laptop, one toolchain, a handful of runs, and two fixture
+prompts. Specifically **not** shown:
+
+- **A stable prove time.** The two full benches of near-identical images differ by
+  20–26% at the median, and the within-run ALLOW spread is 127–167 s. There is a
+  central tendency of roughly two to three minutes and no evidence for anything
+  tighter. The cause of the between-run drift was not investigated.
+- **Prove numbers for the current image.** They are the previous image's, marked
+  `†` above. The delta is +0.76% user cycles; whether that is visible at all is
+  an expectation, not a measurement. Task 7 owns it.
+- **Anything about GPUs.** Proving here is CPU-only (next section). A risc0 that
+  re-enables the Metal path invalidates every prove number on this page, by an
+  unmeasured amount.
+- **How receipt size scales.** Two data points at one segment (spike, ~250 KB)
+  and two at two segments (policy guest, ~525 KB) are consistent with "roughly
+  linear in segments" and do not establish it. Nothing here measured a
+  three-segment session, and nothing measured a succinct or Groth16 receipt at
+  all — Task 6 must, before `release.json` pins a receipt codec.
+- **Cost as a function of the prompt.** Both fixtures are one short user message.
+  The executor cost is dominated by the ruleset, which is why the two agree to
+  0.4% — but that is an argument from two similar inputs, not a curve. Task 7's
+  fixture corpus is where the distribution comes from.
+- **Cross-machine reproducibility of the image.** Two builds on one machine with
+  one toolchain, as the section above says.
+- **Concurrency.** Every number is a single request on an otherwise idle laptop.
+  What happens when the Task 5 daemon executes and proves at the same time is
+  unmeasured, and the prove worker is deliberately one thread partly because that
+  is unmeasured.
+
 ### Proving is CPU-only
 
 The 50 s figure is a **CPU** number. Nothing here is GPU-accelerated, despite the
@@ -555,11 +701,14 @@ values are copied from `risc0-build-3.0.6/src/lib.rs:455-503`; `-Ttext` and the
 link args are omitted because `clippy` does not link.
 
 `cargo test` is executor-only and stays fast. `host/tests/guest_io.rs` runs the
-real image eleven ways — ALLOW and DENY journals against independently
-recomputed commitments, the allowlist key set, canonical-JSON ordering, hostile
-proof nonces, `emitScores: false` writing nothing, a rejected protocol version, a
-rejected non-canonical request, a rejected padded frame, and determinism across
-two runs. Nothing in the test suite proves, because proving belongs in `--bench`
+real image sixteen ways — ALLOW and DENY journals against independently
+recomputed commitments, the allowlist key set, canonical-JSON ordering,
+`emitScores: false` writing nothing, a rejected protocol version, a rejected
+non-canonical request, a rejected padded frame, determinism across two runs, the
+`proofNonce` bound in both directions (every nonce this repository mints is
+accepted; six out-of-bound shapes are refused with the taxonomy constant), and
+the leak probes, which plant a marker in six positions `serde_json` used to quote
+back and assert it reaches neither the caller nor the process's stderr. Nothing in the test suite proves, because proving belongs in `--bench`
 — which, at these po2s, is a **~30 minute** command. Use `CTN_BENCH_PROVE=0`
 while iterating.
 

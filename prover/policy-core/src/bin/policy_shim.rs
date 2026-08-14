@@ -20,6 +20,8 @@
 //! -> {"op":"evaluate","rulesPath":"…","messages":[…]}     <- {"evaluation":{…}}
 //! -> {"op":"evaluateBatch","rulesPath":"…","requests":[[…],…]}
 //!                                                          <- {"evaluations":[{…},…]}
+//! -> {"op":"canonicalizeManifestBatch","manifests":["…",…]}
+//!                                     <- {"canonical":[{"ok":"…"}|{"rejected":"…"},…]}
 //! ```
 //!
 //! A message is `{"role":…,"content":…}`. `evaluate` runs
@@ -66,6 +68,25 @@ enum Request {
         rules_path: String,
         requests: Vec<Vec<Message>>,
     },
+    /// `policy_id::canonical_manifest_bytes` over each manifest document, so
+    /// the harness can compare it against `canonicalJson` from `@ctn/protocol`
+    /// on hostile input rather than on the one ASCII manifest that ships.
+    ///
+    /// A rejection is a *result*, not an error: "this manifest is refused" is
+    /// something the TypeScript side must agree with, so it has to come back on
+    /// the same channel as a success instead of desyncing the stream.
+    CanonicalizeManifestBatch {
+        manifests: Vec<String>,
+    },
+}
+
+/// One canonicalization outcome. Exactly one field is present.
+#[derive(Serialize)]
+struct Canonicalized {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ok: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rejected: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -75,6 +96,7 @@ enum Response {
     NormalizedBatch { normalized: Vec<String> },
     Evaluated { evaluation: Box<Evaluation> },
     EvaluatedBatch { evaluations: Vec<Evaluation> },
+    CanonicalizedBatch { canonical: Vec<Canonicalized> },
     Failed { error: String },
 }
 
@@ -130,6 +152,26 @@ fn handle(req: Request, cache: &mut RulesCache) -> Response {
                     .collect(),
             },
             Err(error) => Response::Failed { error },
+        },
+        Request::CanonicalizeManifestBatch { manifests } => Response::CanonicalizedBatch {
+            canonical: manifests
+                .iter()
+                .map(
+                    |m| match policy_core::policy_id::canonical_manifest_bytes(m) {
+                        // Canonical output is UTF-8 by construction: it is built as
+                        // a `String`. `from_utf8` cannot fail, and saying so here is
+                        // cheaper than an `unwrap` a reader has to reason about.
+                        Ok(bytes) => Canonicalized {
+                            ok: Some(String::from_utf8_lossy(&bytes).into_owned()),
+                            rejected: None,
+                        },
+                        Err(why) => Canonicalized {
+                            ok: None,
+                            rejected: Some(why),
+                        },
+                    },
+                )
+                .collect(),
         },
     }
 }

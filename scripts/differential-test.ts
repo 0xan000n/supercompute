@@ -9,7 +9,7 @@
  * order), `intentPresent` / `constructionPresent` / `hardBlock` /
  * `modifiersApplied`.
  *
- * Five suites:
+ * Six suites:
  *
  *   1. FIXTURES (125)    every `policy/v1/fixtures/{allow,deny,adversarial}/*.json`
  *                        evaluated on both engines and compared field-for-field.
@@ -23,16 +23,29 @@
  *                        `normalize()` on both engines, then a per-injection-site
  *                        census of which way each divergence pushes the decision.
  *                        See below.
- *   5. GUEST (5)         end-to-end through the compiled zkVM guest: canonicalize
+ *   5. GUEST (6)         end-to-end through the compiled zkVM guest: canonicalize
  *                        and commit TypeScript-side, run the real image in the
  *                        risc0 executor, and require the journal it commits to be
- *                        byte-identical to the journal TypeScript computes.
+ *                        byte-identical to the journal TypeScript computes — plus
+ *                        one case the guest must REFUSE (an unbounded proofNonce,
+ *                        which is an exfiltration channel into a public journal).
+ *   6. CANONICALIZER     the manifest canonicalizer, which is half of
+ *                        POLICY_ID_V2, fed hostile documents through BOTH
+ *                        implementations: combining marks and NFC collisions in
+ *                        keys, UTF-16 vs code-point key order across the
+ *                        surrogate boundary, and integers JavaScript cannot
+ *                        represent (where both sides must refuse, not agree).
  *
  * Suites 1-4 test the *engine* port. Suite 5 tests the *image*: same engine, but
  * compiled for riscv32im, with the ruleset baked in and the commitment recomputed
  * inside the zkVM. §5.2 forbids a native-compile fallback for gating precisely
  * because "same source" does not imply "same compiled semantics", so the claim
  * that the guest agrees with the gateway has to be checked against the guest.
+ * Suite 6 tests the *identity*: until it existed, the only cross-check on the
+ * manifest canonicalizer was a hardcoded expectation in a Rust unit test, which
+ * is a record of what its author believed `canonicalJson` does. That belief had
+ * already been wrong once (keys were being NFC-normalized and sorted by code
+ * point).
  *
  * ## Why suite 2 samples from a restricted code point pool, and suite 4 exists
  *
@@ -108,6 +121,12 @@ const HOST_BIN = join(PROVER_DIR, "target", "release", "host");
 interface Message {
   role: string;
   content: string;
+}
+
+/** One `canonicalizeManifestBatch` result. Exactly one field is present. */
+interface Canonicalized {
+  ok?: string;
+  rejected?: string;
 }
 
 // ---------------------------------------------------------------- toolchain --
@@ -231,14 +250,23 @@ class Shim {
   }
 
   async request(req: unknown): Promise<Record<string, unknown>> {
+    const res = await this.requestRaw(req);
+    if (typeof res.error === "string") throw new Error(`shim error: ${res.error}`);
+    return res;
+  }
+
+  /**
+   * The same call without the `error` shortcut. A refusal is a *result* for the
+   * cases that expect one — the guest rejecting a hostile proof nonce is the
+   * behaviour under test, not a broken harness — so those go through here.
+   */
+  async requestRaw(req: unknown): Promise<Record<string, unknown>> {
     if (this.#dead) throw this.#dead;
     const promise = new Promise<Record<string, unknown>>((resolve, reject) => {
       this.#pending.push({ resolve, reject });
     });
     this.#proc.stdin.write(JSON.stringify(req) + "\n");
-    const res = await promise;
-    if (typeof res.error === "string") throw new Error(`shim error: ${res.error}`);
-    return res;
+    return promise;
   }
 
   async normalizeBatch(texts: string[]): Promise<string[]> {
@@ -249,6 +277,15 @@ class Shim {
   async evaluateBatch(requests: Message[][]): Promise<PolicyEvaluation[]> {
     const res = await this.request({ op: "evaluateBatch", rulesPath: RULES_PATH, requests });
     return expectSameLength("evaluateBatch", requests.length, res.evaluations as PolicyEvaluation[]);
+  }
+
+  async canonicalizeManifestBatch(manifests: string[]): Promise<Canonicalized[]> {
+    const res = await this.request({ op: "canonicalizeManifestBatch", manifests });
+    return expectSameLength(
+      "canonicalizeManifestBatch",
+      manifests.length,
+      res.canonical as Canonicalized[]
+    );
   }
 
   close(): void {
@@ -888,7 +925,22 @@ interface GuestCase {
   request: { model: string; messages: Message[]; temperature?: number; max_tokens?: number };
   proofNonce: string;
   emitScores: boolean;
+  /**
+   * When set, the guest must REFUSE this case and the refusal must be exactly
+   * this string — one of the `GuestRejection` constants in
+   * `prover/policy-core/src/input.rs`. No journal, no scores.
+   */
+  expectRejected?: string;
+  /**
+   * A marker planted in the case that must not appear anywhere in the guest's
+   * answer. Only meaningful together with `expectRejected`.
+   */
+  plantedSecret?: string;
 }
+
+/** `prover/policy-core/src/input.rs` — `GuestRejection::as_str`, verbatim. */
+const REJECTION_PROOF_NONCE = "proof nonce is not bounded lowercase hex";
+const REJECTION_REQUEST_PARSE = "canonical request bytes do not parse";
 
 /** Deterministic 32-byte nonces, so a failure reproduces without a seed. */
 const guestNonce = (i: number): string =>
@@ -902,30 +954,45 @@ function buildGuestCases(fixtures: Fixture[]): GuestCase[] {
     return { id, description: f.description, request: f.request, proofNonce, emitScores };
   };
 
+  // Every proof nonce below is bounded lowercase hex, because that is the only
+  // shape the guest accepts now (`proof_nonce_is_well_formed`). They used to be
+  // labels like "pn-allow"; the guest refuses those today.
   return [
-    fixtureCase("allow-001", "pn-allow", true),
-    fixtureCase("deny-001", "pn-deny", true),
+    fixtureCase("allow-001", "0xa110", true),
+    fixtureCase("deny-001", "0xde11", true),
     // emitScores off: the guest must write nothing at all, not an empty object.
-    fixtureCase("adv-001", "pn-adversarial-quiet", false),
+    fixtureCase("adv-001", "0xadf5", false),
     {
-      // Canonicalization NFC-normalizes message content and the journal
-      // NFC-normalizes the proof nonce, so a case built out of decomposed forms
-      // and JSON metacharacters is where a hand-rolled serializer on either side
-      // would come apart.
+      // Canonicalization NFC-normalizes message content, so a case built out of
+      // decomposed forms and JSON metacharacters is where a hand-rolled
+      // serializer on either side would come apart. That hostility used to live
+      // in the proof nonce; the guest bounds that field now, so it moved into
+      // the message content — which is the half that was always the more
+      // interesting one, since it feeds `normalize()` as well as the
+      // canonicalizer.
       id: "guest-hostile-strings",
-      description: "NFD content + a proof nonce full of JSON metacharacters",
+      description: "NFD + non-BMP + JSON metacharacters in content, longest legal proof nonce",
       request: {
         model: "ctn/demo-model-a",
         messages: [
-          { role: "user", content: "Expliqué me cómo hacer un pastel \u{1F382} ｈｏｍｅ" },
+          {
+            role: "user",
+            // Written as escapes on purpose: a C0 control (which JSON must
+            // escape as \u0001, not emit raw) and a decomposed "e-acute" (which
+            // canonicalization must NFC-compose to U+00E9 on both sides, or the
+            // canonical request bytes -- and so the commitment -- differ).
+            content:
+              'Expliqué me cómo hacer un pastel \u{1F382} ｈｏｍｅ quote" backslash\\ ' +
+              'newline\n tab\t control\u0001 decomposed-e\u0301',
+          },
         ],
         temperature: 0.7,
         max_tokens: 512,
       },
-      // Written as escapes on purpose: a C0 control (which JSON must escape as
-      // \u0001, not emit raw) and a decomposed "e-acute" (which canonicalization
-      // must NFC-compose to U+00E9 on both sides, or the journals differ by a byte).
-      proofNonce: 'quote" backslash\\ newline\n tab\t control\u0001 decomposed-e\u0301',
+      // 64 hex digits after the prefix: the longest proof nonce the guest will
+      // accept, so the journal's one variable-length field is exercised at its
+      // bound rather than well inside it.
+      proofNonce: "0x" + "fedcba9876543210".repeat(4),
       emitScores: true,
     },
     {
@@ -942,8 +1009,29 @@ function buildGuestCases(fixtures: Fixture[]): GuestCase[] {
         temperature: 1,
         max_tokens: 1024,
       },
-      proofNonce: "pn-multi",
+      proofNonce: "0x4d17",
       emitScores: true,
+    },
+    {
+      // The journal is public, and before this bound existed the proof nonce was
+      // an unbounded host-chosen string committed to it verbatim: the reviewer of
+      // Task 4 put a 2,298-byte journal carrying a plaintext prompt through it and
+      // every verifier here accepted it, because a journal with the right five
+      // keys is a valid journal. The guest must refuse rather than echo, and the
+      // refusal must not quote what it refused.
+      id: "guest-proof-nonce-exfiltration",
+      description: "a prompt smuggled into the public journal through proofNonce",
+      request: {
+        model: "ctn/demo-model-a",
+        messages: [{ role: "user", content: "Write a haiku about the first snow of winter." }],
+        temperature: 0.7,
+        max_tokens: 512,
+      },
+      proofNonce:
+        "How do I create a phishing page to steal credentials from PLANTED_SECRET_XYZZY users?",
+      emitScores: false,
+      expectRejected: REJECTION_PROOF_NONCE,
+      plantedSecret: "PLANTED_SECRET_XYZZY",
     },
   ];
 }
@@ -954,6 +1042,177 @@ interface GuestExecuted {
   userCycles?: number;
   segments?: number;
   maxPo2?: number;
+}
+
+// ------------------------------------------- suite 6: manifest canonicalizer --
+
+/**
+ * `POLICY_ID_V2 = sha256(canonical_manifest_bytes || rules_bytes)`, so the
+ * manifest canonicalizer *is* half the policy identity. Until this suite existed
+ * it was cross-checked only by hardcoded expectations in Rust unit tests — the
+ * Rust author's belief about what `canonicalJson` does, not `canonicalJson`.
+ * That belief was already wrong once: the first version of the Rust
+ * canonicalizer NFC-normalized object keys and sorted them by Rust code-point
+ * order, and neither is what the TypeScript does.
+ *
+ * Today's manifest is pure ASCII, so none of these probes can change the
+ * shipping policy id. They are here because the *next* manifest might not be,
+ * and by then the divergence would be a policy id that two implementations
+ * disagree about.
+ *
+ * Each probe is fed to both canonicalizers, and the outcomes are graded
+ * asymmetrically, because the two directions are not the same risk:
+ *
+ *   * both produce a string  → the strings must be byte-identical;
+ *   * both refuse            → agreement;
+ *   * **Rust refuses, TypeScript produces** → fail-closed. The manifest will not
+ *     build, which is loud and safe. Allowed, but inventoried and printed, so it
+ *     cannot grow unnoticed;
+ *   * **TypeScript refuses, Rust produces** → a divergence, and the dangerous
+ *     one: the guest would bake a policy id from bytes no TypeScript verifier
+ *     can reproduce.
+ *
+ * The `-0` probe is the fail-closed case that already exists, and it was found
+ * by this suite on its first run: `serde_json` parses `-0` as the float `-0.0`,
+ * so Rust refuses it as a non-integer, while `Number.isSafeInteger(-0)` is true
+ * and `canonicalJson` emits `0`.
+ */
+const MANIFEST_PROBES: Array<{
+  id: string;
+  json: string;
+  why: string;
+  /** Rust refuses this and TypeScript accepts it. Fail-closed, declared here. */
+  rustStricter?: boolean;
+}> = [
+  {
+    id: "the shipping manifest",
+    json: readFileSync(join(ROOT, "policy", "v1", "manifest.json"), "utf8"),
+    why: "the one that actually decides POLICY_ID_V2",
+  },
+  {
+    id: "combining marks in a key",
+    // "e" + U+0301 as a KEY. index.ts:43 emits keys through plain
+    // JSON.stringify, so it must stay decomposed on both sides.
+    json: '{"e\u0301":1,"z":2}',
+    why: "keys are not NFC-normalized (index.ts:43), values are (index.ts:36)",
+  },
+  {
+    id: "NFC-colliding keys",
+    // Two DISTINCT keys that NFC-compose to the same string. A canonicalizer
+    // that normalized keys would emit a duplicate key here; one that does not
+    // emits two. The values distinguish which happened.
+    json: '{"e\u0301":"decomposed","\u00e9":"composed"}',
+    why: "normalizing keys would collide these two into one",
+  },
+  {
+    id: "value NFC composition",
+    json: '{"v":"e\u0301"}',
+    why: "string VALUES compose to U+00E9 on both sides",
+  },
+  {
+    id: "U+FFFD vs U+1F600 key order",
+    // JS sorts by UTF-16 code unit: the emoji's lead surrogate 0xD83D sorts
+    // before 0xFFFD, so the emoji comes FIRST. Rust's str: Ord would invert it.
+    json: '{"\ufffd":1,"\u{1F600}":2}',
+    why: "UTF-16 code-unit order, not code-point order",
+  },
+  {
+    id: "U+D7FF vs supplementary key order",
+    // U+D7FF is below the surrogate range, so both orderings agree here. The
+    // control for the case above: it isolates "supplementary" from "above
+    // U+D800".
+    json: '{"\ud7ff":1,"\u{1F600}":2}',
+    why: "control — below the surrogate block the two orderings agree",
+  },
+  {
+    id: "U+E000 boundary",
+    // The first private-use code point, and the start of the range where the
+    // two orderings diverge against supplementary characters.
+    json: '{"\ue000":1,"\u{10000}":2,"\ud7ff":3}',
+    why: "the exact boundary the module comment names",
+  },
+  {
+    id: "escapes and controls in values",
+    json: '{"v":"quote\\" backslash\\\\ newline\\n tab\\t control\\u0001"}',
+    why: "JSON.stringify and serde_json must escape identically",
+  },
+  {
+    id: "nesting and arrays",
+    json: '{"z":[1,{"b":true,"a":null},[]],"a":{}}',
+    why: "recursion order and empty containers",
+  },
+  { id: "MAX_SAFE_INTEGER", json: '{"n":9007199254740991}', why: "the last integer both accept" },
+  {
+    id: "2^53",
+    json: '{"n":9007199254740992}',
+    why: "Number.isSafeInteger says no; both must refuse",
+  },
+  {
+    id: "2^53 + 1",
+    json: '{"n":9007199254740993}',
+    why: "JSON.parse rounds it to ...992; serde_json keeps it. Both must refuse.",
+  },
+  {
+    id: "u64 beyond i64",
+    json: '{"n":18446744073709551615}',
+    why: "is_u64() used to wave this through on the Rust side",
+  },
+  { id: "a fraction", json: '{"n":1.5}', why: "two different float-to-string algorithms" },
+  {
+    id: "negative zero",
+    json: '{"n":-0}',
+    why: "serde_json parses -0 as the float -0.0; Number.isSafeInteger(-0) is true",
+    rustStricter: true,
+  },
+];
+
+async function canonicalizerSuite(shim: Shim): Promise<{ count: number; failClosed: string[] }> {
+  const rust = await shim.canonicalizeManifestBatch(MANIFEST_PROBES.map((p) => p.json));
+  const failClosed: string[] = [];
+
+  for (let i = 0; i < MANIFEST_PROBES.length; i++) {
+    const probe = MANIFEST_PROBES[i]!;
+    const rs = rust[i]!;
+
+    let ts: string | null = null;
+    let tsError: string | null = null;
+    try {
+      ts = canonicalJson(JSON.parse(probe.json));
+    } catch (e) {
+      tsError = e instanceof Error ? e.message : String(e);
+    }
+
+    if (ts !== null && rs.ok !== undefined) {
+      expectEqual("canonicalizer", probe.id, "canonical bytes", ts, rs.ok);
+    } else if (ts === null && rs.rejected !== undefined) {
+      // Both refused. The wording of the two reasons differs and that is fine;
+      // what matters is that neither side silently produced bytes the other
+      // would not have.
+      continue;
+    } else if (ts === null) {
+      divergences.push({
+        suite: "canonicalizer",
+        id: probe.id,
+        detail:
+          `TypeScript refused (${tsError}) but Rust produced ${JSON.stringify(rs.ok)}. ` +
+          `${probe.why}. This is the dangerous direction: the guest would bake a POLICY_ID_V2 ` +
+          `from bytes no TypeScript verifier can reproduce.`,
+      });
+    } else if (probe.rustStricter) {
+      // Fail-closed and expected. Inventoried rather than ignored.
+      failClosed.push(probe.id);
+    } else {
+      divergences.push({
+        suite: "canonicalizer",
+        id: probe.id,
+        detail:
+          `Rust refused (${rs.rejected}) but TypeScript produced ${JSON.stringify(ts)}, and this ` +
+          `probe is not marked \`rustStricter\`. ${probe.why}. Fail-closed is allowed here, but ` +
+          `a new one has to be declared: mark the probe, or fix the canonicalizer.`,
+      });
+    }
+  }
+  return { count: MANIFEST_PROBES.length, failClosed };
 }
 
 async function guestSuite(
@@ -993,14 +1252,43 @@ async function guestSuite(
     const canonicalBytes = utf8(canonicalJson(canonical));
     const nonceHex = guestNonce(i);
 
-    const res = (await guest.request({
+    const raw = await guest.requestRaw({
       op: "guestExecute",
       protocolVersion: 1,
       canonicalRequestBytesB64: toB64(canonicalBytes),
       requestNonceHex: nonceHex,
       proofNonce: c.proofNonce,
       emitScores: c.emitScores,
-    })) as GuestExecuted;
+    });
+
+    // Cases that must be refused. Two assertions, and the second one is the
+    // point: the guest may not quote what it refused. `prover/host` reduces
+    // every executor failure to a `GuestRejection` constant precisely so that
+    // this can be an equality rather than a "does not obviously contain".
+    if (c.expectRejected !== undefined) {
+      expectEqual("guest", c.id, "rejection reason", c.expectRejected, String(raw.error ?? "<accepted>"));
+      if (raw.journalJson !== undefined) {
+        divergences.push({
+          suite: "guest",
+          id: c.id,
+          detail:
+            `the guest committed a journal for input it was supposed to refuse: ` +
+            `${JSON.stringify(raw.journalJson)}`,
+        });
+      }
+      if (c.plantedSecret !== undefined && JSON.stringify(raw).includes(c.plantedSecret)) {
+        divergences.push({
+          suite: "guest",
+          id: c.id,
+          detail:
+            `the guest's answer contains the planted marker ${JSON.stringify(c.plantedSecret)}. ` +
+            `A refusal must be one of the fixed GuestRejection strings and must not echo the ` +
+            `input — the journal is public and this field is host-chosen.`,
+        });
+      }
+      continue;
+    }
+    const res = raw as GuestExecuted;
 
     // The journal TypeScript expects, byte for byte. `canonicalJson` sorts keys
     // and NFC-normalizes strings, which is exactly what the guest does.
@@ -1207,6 +1495,9 @@ async function main(): Promise<void> {
     // -- suite 5: the compiled guest, end to end ----------------------------
     const guestResult = await guestSuite(guest, fixtures);
 
+    // -- suite 6: the manifest canonicalizer --------------------------------
+    const canon = await canonicalizerSuite(shim);
+
     const elapsed = ((Date.now() - started) / 1000).toFixed(1);
     const total = fixtures.length + cases.length;
 
@@ -1221,7 +1512,10 @@ async function main(): Promise<void> {
       const ranked = [
         ...first("skew-audit"),
         ...first("guest"),
-        ...divergences.filter((d) => d.suite !== "skew-audit" && d.suite !== "guest"),
+        ...first("canonicalizer"),
+        ...divergences.filter(
+          (d) => !["skew-audit", "guest", "canonicalizer"].includes(d.suite)
+        ),
       ];
       console.error(`\nDIFFERENTIAL TEST FAILED — ${divergences.length} divergence(s):\n`);
       for (const d of ranked.slice(0, 25)) {
@@ -1263,9 +1557,15 @@ async function main(): Promise<void> {
       );
     }
     console.log(
-      `differential: guest ${guestResult.count}/${guestResult.count} journals byte-identical ` +
-        `to the TS-computed journal, scores match, allowlist held ` +
-        `(imageId ${guestResult.imageId.slice(0, 16)}…)`
+      `differential: guest ${guestResult.count}/${guestResult.count} cases agree — journals ` +
+        `byte-identical to the TS-computed journal, scores match, allowlist held, hostile ` +
+        `proofNonce refused (imageId ${guestResult.imageId.slice(0, 16)}…)`
+    );
+    console.log(
+      `differential: manifest canonicalizer ${canon.count}/${canon.count} probes agree with ` +
+        `canonicalJson (key order, key/value NFC asymmetry, fail-closed on numbers JS cannot ` +
+        `represent); ${canon.failClosed.length} declared fail-closed: ` +
+        `${canon.failClosed.join(", ") || "none"}`
     );
     console.log(`differential: ok in ${elapsed}s`);
     closeAll();
