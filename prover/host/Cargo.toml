@@ -34,3 +34,11 @@ bincode = "1.3"
 # Same crate and version as the guest, so a host/guest digest disagreement is a
 # real bug rather than a library difference.
 sha2 = "0.10"
+# The wire types the guest reads and writes. The host frames input and parses
+# journals with the same definitions the guest was compiled against.
+policy-core = { path = "../policy-core" }
+# Same codec as the guest's frame reader.
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+base64 = "0.22"
+# The `--execute-stdin` protocol and the journal-shape tests.
+serde_json = "1.0"

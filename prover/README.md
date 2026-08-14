@@ -1,14 +1,18 @@
 # prover
 
 The real RISC Zero prover for Safety Policy v1. Phase 2a builds it; this
-directory is currently at **Task 1 — toolchain and spike**, which means the
-workspace builds, proves and verifies, but the guest hashes its input rather
-than evaluating policy. The policy engine arrives in Tasks 2–4.
+directory is currently at **Task 4 — the policy guest**, which means the guest
+image now *is* Safety Policy v1: the ruleset is compiled in, the request
+commitment is recomputed inside the zkVM, and the journal it commits is the
+verifier's allowlist and nothing else. The `:4500` daemon is Task 5 and the
+offline verifier is Task 6; neither exists yet, and nothing in `services/` calls
+any of this.
 
-What Task 1 is actually for is the numbers at the bottom of this file. Phase 1
-modelled the cost of proving (`CTN_SIMULATED_PROVING_MS`, default 2400 ms) and
-labelled it as modelled. Everything after this task gets to use measurements
-instead.
+Phase 1 modelled the cost of proving (`CTN_SIMULATED_PROVING_MS`, default
+2400 ms) and labelled it as modelled. Everything from Task 1 on uses
+measurements instead — see "Measured on this machine" below, which now carries
+both the Task 1 spike numbers (a guest that only hashed its input) and the Task 4
+policy-guest numbers. They are different guests and the difference is large.
 
 ---
 
@@ -54,19 +58,122 @@ Apple Silicon — see "Proving is CPU-only" below.
 
 ```
 prover/
-  Cargo.toml            workspace: host + methods
+  Cargo.toml            workspace: host + methods + policy-core
   rust-toolchain.toml   stable, with rustfmt and rust-src
+  policy-core/          the engine, compiled twice: natively and into the guest
+    src/engine.rs         evaluate / evaluate_prepared — the port of engine.ts
+    src/normalize.rs      the §23 normalizer
+    src/prepared.rs       needles normalized once, at build time (see below)
+    src/input.rs          PolicyInputV1, PolicyJournalV1, the commitment
+    src/policy_id.rs      POLICY_ID_V2 / RULES_DIGEST derivation
+    src/bin/policy_shim   the differential harness's Rust side
   methods/
-    build.rs            risc0_build::embed_methods() — compiles the guest, emits ELF + image id
-    src/lib.rs          include!(OUT_DIR/methods.rs)
+    build.rs            embed_methods() + POLICY_ID_V2/RULES_DIGEST for host code
+    src/lib.rs          include!(OUT_DIR/{methods.rs,policy_consts.rs})
+    guest/build.rs      bakes policy/v1/{rules,manifest}.json INTO the image
     guest/src/main.rs   the guest: runs inside the zkVM
-  host/src/main.rs      the host: builds input, executes, proves, verifies
+  host/
+    src/lib.rs          execute_policy — run the image in the executor
+    src/main.rs         --bench and --execute-stdin
+    tests/guest_io.rs   executor round-trip tests against the real image
 ```
 
 This is the layout `cargo risczero new` generates, kept deliberately. The
 `methods` build-script indirection is what produces `POLICY_GUEST_ELF` and
-`POLICY_GUEST_ID`, and the image id is what Phase 1 already hashes into
-`policy_id` — so the wiring is load-bearing, not boilerplate.
+`POLICY_GUEST_ID`, and the image id is the measurement that says which policy
+program produced a receipt — so the wiring is load-bearing, not boilerplate.
+
+---
+
+## What the guest commits, and what it does not
+
+**Input** — one postcard frame, `PolicyInputV1`:
+`{ protocolVersion, canonicalRequestBytes, requestNonce[32], proofNonce,
+emitScores }`. `canonicalRequestBytes` is the signed canonical request verbatim;
+it is the plaintext prompt, and nothing in this workspace may log it.
+
+**Journal** — canonical JSON (JCS: keys sorted, no whitespace, strings NFC),
+with the key set **exactly**
+`{decision, policyId, proofNonce, protocolVersion, requestCommitment}` — the
+allowlist `services/tee-sim/src/verify.ts` already enforces. Category scores are
+prompt-derived and are never in it.
+
+**Private scores** — when `emitScores` is set, the guest writes the full
+evaluation as one JSON line to *stdout*, which only the executor host reads. The
+prove path sends `emitScores: false` and captures nothing.
+
+Three properties are the point of the design and each is one line of code:
+
+1. **The ruleset is in the image.** `methods/guest/build.rs` reads
+   `policy/v1/{rules,manifest}.json`, validates them with `policy-core`'s own
+   types, and embeds them. A host-supplied ruleset could omit the rule that
+   denies a prompt and the proof would still verify. A one-byte edit to either
+   file changes the ImageID.
+2. **The commitment is recomputed in the guest**:
+   `"0x" + hex(SHA256("CTN_REQUEST_V1" ‖ canonicalRequestBytes ‖ nonce))`,
+   matching `packages/protocol/src/crypto.ts:54`. It is never read from the
+   frame.
+3. **Non-canonical input is refused, not interpreted.** The request document is
+   parsed with `deny_unknown_fields` and its roles are checked; anything else
+   panics the guest and produces no journal.
+
+### `policyId` v2 differs from the TypeScript `policyId` — on purpose
+
+The guest bakes
+`POLICY_ID_V2 = "0x" + hex(SHA256(canonical_manifest_bytes ‖ rules_bytes))`.
+
+`packages/policy/src/index.ts:67` computes something else: it folds a *simulated*
+`guestImageId` into the hash. That definition is self-referential once the guest
+is a real compiled image — the image would have to contain its own measurement —
+so Phase 2a splits the two: `POLICY_ID_V2` names the policy, the ImageID names
+the code, and `prover/release.json` (Task 6) links them. **The TypeScript side is
+deliberately untouched**; reconciling it is Phase 2b, and doing it now would
+change every artifact Phase 1 already signed.
+
+`scripts/differential-test.ts` recomputes `POLICY_ID_V2` in TypeScript and
+asserts the image agrees, so the two derivations cannot drift silently.
+
+`policy-core`'s canonicalizer mirrors two asymmetries in the TypeScript rather
+than correcting them, because the identity has to be the same number, not a
+better one: object **keys are not NFC-normalized** (index.ts:36 normalizes a
+string value, index.ts:43 emits a key as plain `JSON.stringify(k)`), and keys
+**sort by UTF-16 code unit**, which is what JS does and which differs from
+Rust's code-point ordering for a BMP key above U+E000 against a supplementary
+one. Today's manifest is ASCII, so neither bites; both are unit-tested against
+output captured from the real `canonicalJson`.
+
+### Reproducibility of the image
+
+`prover/methods/guest/target/` and `prover/target/riscv-guest/` deleted, then
+`cargo build --release -p host`: the guest ELF came back **byte-identical**
+(SHA-256 `ad7b530fcd74b4288ee8347c1c7ef12d595bc2c9c8e5d0b0f32cf13bff723a0d`) and
+so did the ImageID. That is one machine, one toolchain, two builds — it is
+evidence that the build is not gratuitously nondeterministic, not a claim of
+cross-machine reproducibility, which nothing here has tested. Task 6 pins the
+toolchain versions in `release.json`; that is what makes the claim checkable by
+someone else.
+
+`policy-core` exposes its `policy_id` module behind a default feature, and the
+guest takes the dependency with `default-features = false`. This did **not**
+shrink the ELF — the linker was already dropping the unused code, measured — so
+it buys intent rather than bytes: an edit to the canonicalizer cannot move the
+ImageID, and an auditor reading the crate graph does not have to ask why a JSON
+canonicalizer is inside a measured policy image.
+
+### Needles are normalized at build time
+
+`normalize()` — NFKC, full-Unicode lowercase, a character walk — is the most
+expensive thing the engine does, and it runs over every phrase in `rules.json` on
+every evaluation. None of that work depends on the request, so `PreparedRules`
+does it once, in `build.rs`, and the image carries the *prepared* form.
+
+Measured in-guest with `env::cycle_count()`, ALLOW fixture, this machine:
+preparing the needles inside the zkVM costs **2,264,222 cycles** (plus 202,190 to
+parse `rules.json`); postcard-decoding the prepared form costs **358,084**. The
+hoist is worth ~1.9M user cycles per execution, which is the difference between a
+5-segment session and a 2-segment one. It is a pure hoist —
+`policy_core::evaluate` still takes a `PolicyRules` and prepares it eagerly — and
+the differential suite is what keeps that claim honest.
 
 Generated with:
 
@@ -83,10 +190,25 @@ Rust identifier.)
 
 ```bash
 cd prover
-cargo run -rp host -- --bench
+cargo run -rp host -- --bench           # executor + prove + verify, ALLOW and DENY
+CTN_BENCH_PROVE=0 cargo run -rp host -- --bench   # executor only (proving is minutes)
+cargo run -rp host -- --execute-stdin   # newline-JSON executor service
 ```
 
-`--bench` is the only mode implemented. The proving daemon is Task 5.
+`--execute-stdin` is what `scripts/differential-test.ts` drives: one JSON request
+per line, one response per line, until EOF.
+
+```text
+-> {"op":"identity"}
+<- {"imageId":"…","policyId":"0x…","rulesDigest":"0x…","protocolVersion":1}
+-> {"op":"guestExecute","protocolVersion":1,"canonicalRequestBytesB64":"…",
+    "requestNonceHex":"…","proofNonce":"…","emitScores":true}
+<- {"journalJson":"{…}","privateScores":"{…}"|null,"userCycles":…,
+    "segments":…,"maxPo2":…}
+```
+
+Field names match the `POST /execute` body Task 5 will accept, so the harness and
+the daemon speak the same vocabulary. The proving daemon itself is Task 5.
 
 ---
 
@@ -114,6 +236,100 @@ The rule for this directory:
 Three timed runs per measurement after one discarded warmup, `--release`, dev
 mode off, in-process prover (backend `local`, enforced). Reproduce with
 `cargo run -rp host -- --bench`.
+
+### Task 4 — the policy guest
+
+Guest image id `4a05b4e9c27a79faa0a6989129d2436c910b02cc6222bdde0f8d2ba103ec8ace`,
+policy id `0x1f74ba4f2353012cd26f5d3279625c3b45e927eeb341f0ee4b72124b056a7db2`,
+rules digest `0x9f85ba59fd1429f10c373efc56d69aefa255a01a08df3ab6bd8e1ccecd3f93ea`.
+Two fixture requests: `allow-001` (a haiku prompt, 45 characters) and `deny-001`
+(a phishing prompt, 71 characters).
+
+Medians:
+
+| Case | Executor only | Composite prove | Receipt (bincode) | Verify |
+|---|---|---|---|---|
+| ALLOW | 57.6 ms | 137.69 s | 525.1 KB (537,736 B) | 29.4 ms |
+| DENY | 58.1 ms | 126.14 s | 525.1 KB (537,734 B) | 30.1 ms |
+
+Spread (min / median / max):
+
+| Case | Executor ms | Prove ms | Verify ms |
+|---|---|---|---|
+| ALLOW | 57.5 / 57.6 / 58.9 | 127,275.0 / 137,693.6 / 166,816.3 | 29.4 / 29.4 / 30.3 |
+| DENY | 57.9 / 58.1 / 58.1 | 122,718.5 / 126,139.9 / 126,205.3 | 29.0 / 30.1 / 30.2 |
+
+| Case | Segments | Max po2 | User cyc | Total cyc | Paging cyc | Reserved cyc |
+|---|---|---|---|---|---|---|
+| ALLOW | 2 | 20 | 1,100,938 | 1,310,720 | 125,995 | 83,787 |
+| DENY | 2 | 20 | 1,082,221 | 1,310,720 | 127,296 | 101,203 |
+
+Five things in there are worth stating plainly, because three of them are worse
+than Task 1 predicted.
+
+**The executor gate costs ~58 ms, not ~20 ms.** The spike's floor was 16.9–18.3 ms
+and this file told Phase 2b to budget ~20 ms per execution regardless of prompt
+size. That was a floor, and the policy guest sits about 40 ms above it. This is
+the number `tee-sim` will pay synchronously on every request once Task 5 wires
+`/execute` in; it does not go away by shrinking the prompt, because it is
+dominated by the ruleset, not the request.
+
+**Proving is a little over two minutes per request, and the timing is noisy at
+the ±20% level.** Within this run, ALLOW ranged 127.3–166.8 s. Between runs it is
+worse: an earlier full bench of an image differing by 228 user cycles (the
+trailing-bytes check, added after it) gave medians of 164.88 s ALLOW and
+159.42 s DENY on the same otherwise-idle laptop — 20% and 26% above the table
+above. Both runs had the enforced local backend, dev mode off, and nothing else
+running; the difference is thermal or scheduling and is not characterised here.
+Do not quote 138 s as a constant. Quote **"two to three minutes on an idle M1
+Pro, CPU-only"**, and treat cycle counts — which were identical across repeated
+runs of a given image — as the reproducible quantity.
+
+**Task 1's linear-in-padded-rows extrapolation under-predicted by ~10–30%.** It
+put po2 20 at ~105 s, from a rate of 0.087–0.096 ms per padded row. The rate here
+is 137.69 s / 1,310,720 rows = **0.105 ms per row** (0.126 in the slower run). The
+rule is the right shape — cost tracks padded rows — but its constant came from a
+one-segment session and this is a two-segment one, and continuations are not
+free. Task 7 should re-derive the constant from these rows rather than the
+spike's, and should state it as a range.
+
+**`total_cycles` is a sum of segment po2s, not one of them.** 1,310,720 =
+2^20 + 2^18, which is what two segments of unequal size look like. The Task 1
+planning rule — `po2 ≥ ceil(log2(user + paging))` — reads as "one segment of that
+po2" and would have predicted 2^21 = 2,097,152 padded rows here; the real total is
+1.31M, i.e. **cheaper** than that rule says, because segmentation packs the tail
+into a smaller block. Read the rule as an upper bound on padded rows once a
+session spans segments.
+
+The receipt doubled with the segment count (525 KB against the spike's ~250 KB at
+one segment) and verification roughly doubled with it (~30 ms against ~13 ms).
+Both are per-receipt costs and both are still small next to proving.
+
+Where the user cycles go, measured in-guest with `env::cycle_count()` on the
+ALLOW case with `emitScores` off (1,089,150 cycles between the first and last
+reading, against 1,100,938 for the whole session):
+
+| Phase | Cycles |
+|---|---|
+| `evaluate_prepared` | 661,275 |
+| postcard-decoding the embedded ruleset | 358,084 |
+| building and committing the journal | 41,148 |
+| the SHA-256 commitment | 19,434 |
+| parsing the canonical request | 5,728 |
+| decoding the input frame | 3,481 |
+
+Nothing was optimized beyond the two hoists described above. If a later task
+needs a po2 back, those first two rows are the entire conversation — and note
+that the second one is *already* the cheap version: normalizing the needles
+in-guest instead of at build time costs 2,264,222 cycles.
+
+### Task 1 — the spike guest (a different, much smaller program)
+
+Kept because the two together are the only honest way to read the policy-guest
+numbers: the spike hashed its input and nothing else, so its executor floor and
+its po2 are what the zkVM costs *before* any policy work. The `--bench` harness
+no longer produces these — the spike guest is gone — so they cannot be
+re-measured without checking out the Task 1 commit.
 
 Medians:
 
@@ -150,8 +366,10 @@ constants; between-run drift exceeds the within-run spread at 4096 B. Cycle
 counts, po2 and receipt sizes were byte-identical across both runs, as they
 should be.
 
-Guest image id `d094ec7bbac59857234c8c316573b591e5830ed9656fec4cf332440a0e19ff50`
-— it changes whenever the guest or its dependency graph does, which is the point.
+Spike guest image id
+`d094ec7bbac59857234c8c316573b591e5830ed9656fec4cf332440a0e19ff50` — it changes
+whenever the guest or its dependency graph does, which is the point, and it did:
+the policy guest's id is in the Task 4 table above.
 
 | Input | Segments | po2 | User cyc | Total cyc | Paging cyc | Reserved cyc |
 |---|---|---|---|---|---|---|
@@ -209,6 +427,8 @@ Time then scales near-linearly with padded rows: 8× the rows cost 8.85× the ti
 (po2 16 → 19), roughly 0.087–0.096 ms per row. Extrapolating: **~105 s at po2 20,
 ~210 s at po2 21.** Expect the policy guest a po2 or two above this spike at equal
 input size — affordable off the request path, nowhere near affordable on it.
+(Task 4 measured it: see the policy-guest table above for what actually
+happened.)
 
 **Composite receipts are ~250 KB and grow with execution length.** That is a
 storage and transport cost per receipt, not per policy. Compressing to Groth16
@@ -296,18 +516,18 @@ below working unmodified.
 
 ## sha2, not a precompile
 
-The spike guest hashes with the ordinary `sha2` crate. risc0 ships accelerated
-patches for the RustCrypto hashes (wired in via `[patch.crates-io]`, pointing
-`sha2` at `risc0/RustCrypto-hashes`), and they would cut the guest's cycle count
-substantially for hash-heavy work.
+The guest hashes the commitment with the ordinary `sha2` crate. risc0 ships
+accelerated patches for the RustCrypto hashes (wired in via `[patch.crates-io]`,
+pointing `sha2` at `risc0/RustCrypto-hashes`), which would cut the cycle count
+for hash-heavy work.
 
-They are deliberately not used yet. The policy guest has to hash exactly the
-bytes the TypeScript engine hashes, and Task 3's differential tests are the
-thing that proves it does. Keeping one unpatched crate on both sides means a
-digest disagreement is a real bug rather than a library difference. The patch is
-worth revisiting in Task 7 once the differential corpus is green — the digests
-are identical by construction, so it is a performance change, not a semantic
-one.
+They are deliberately not used yet. The guest has to hash exactly the bytes
+`packages/protocol/src/crypto.ts` hashes, and the differential suite is the thing
+that proves it does. Keeping one unpatched crate on both sides means a digest
+disagreement is a real bug rather than a library difference. It is also not where
+the cycles are: the commitment costs ~19k of ~1.09M user cycles, measured, so the
+precompile is worth at most ~1.5% here. The two places worth looking are
+`evaluate` (~660k) and decoding the embedded ruleset (~360k).
 
 ---
 
@@ -316,15 +536,33 @@ one.
 ```bash
 cd prover
 cargo fmt --check
-cargo clippy -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test
+
+# the guest is its own workspace and the line above never reaches it
+cd methods/guest
+cargo fmt --check
+RUSTFLAGS='-C passes=lower-atomic -C panic=abort --cfg getrandom_backend="custom"' \
+  cargo +risc0 clippy --target riscv32im-risc0-zkvm-elf -- -D warnings
 ```
 
-`cargo test` is executor-only and stays fast; it pins the contract the policy
-guest inherits — one frame in, the sha256 of exactly those bytes out, agreeing
-with the host's `sha2` at 0, 1, 256 and 4096 bytes. Nothing in the test suite
-proves, because proving belongs in `--bench`.
+The guest lint needs both halves of that incantation and neither is optional.
+`cargo +risc0` because the stock `clippy-driver` has no `core`/`std` for
+`riscv32im-risc0-zkvm-elf` (it fails on the first `no_std` dependency); the
+`RUSTFLAGS` because `risc0-build` normally supplies them and without
+`getrandom_backend="custom"` the `getrandom` build emits a `compile_error!`. The
+values are copied from `risc0-build-3.0.6/src/lib.rs:455-503`; `-Ttext` and the
+link args are omitted because `clippy` does not link.
 
-`prover/target/` is the only thing gitignored here. `Cargo.lock` is committed on
-purpose: the guest image id depends on the exact dependency graph, and Phase 1
-already treats that id as part of `policy_id`.
+`cargo test` is executor-only and stays fast. `host/tests/guest_io.rs` runs the
+real image eleven ways — ALLOW and DENY journals against independently
+recomputed commitments, the allowlist key set, canonical-JSON ordering, hostile
+proof nonces, `emitScores: false` writing nothing, a rejected protocol version, a
+rejected non-canonical request, a rejected padded frame, and determinism across
+two runs. Nothing in the test suite proves, because proving belongs in `--bench`
+— which, at these po2s, is a **~30 minute** command. Use `CTN_BENCH_PROVE=0`
+while iterating.
+
+`prover/target/` and `prover/methods/guest/target/` (both matched by `target/`)
+are the only gitignored paths here. Both `Cargo.lock` files are committed on
+purpose: the guest image id depends on the exact dependency graph.

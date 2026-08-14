@@ -9,6 +9,14 @@ description = "Safety Policy v1 engine — Rust port of packages/policy/src/engi
 # the host and once, unchanged, into the guest — so a host-only dependency here
 # would be a guest-side compile failure later, and a guest-only one would stop
 # the differential tests from running natively.
+[features]
+# `policy_id` derives the build-time policy identity. It is used by the two
+# build scripts and by host code; the guest never calls it, and dead code in a
+# *measured* image is a question an auditor should not have to ask. The guest
+# therefore depends on this crate with `default-features = false`.
+default = ["policy-id"]
+policy-id = []
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -21,6 +29,10 @@ serde_json = "1.0"
 # binary), which is a behaviour change we neither need nor want to audit.
 indexmap = { version = "2", features = ["serde"] }
 unicode-normalization = "0.1"
+# The commitment the guest recomputes (crypto.ts:54) and the build-time policy
+# identity. Same crate and version as the host's, so a host/guest digest
+# disagreement is a real bug rather than a library difference.
+sha2 = "0.10"
 unicode-properties = { version = "0.1", default-features = false, features = [
     "general-category",
 ] }

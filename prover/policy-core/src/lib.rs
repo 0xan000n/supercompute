@@ -14,11 +14,23 @@
 //! same commit, and bumping the policy version.
 
 mod engine;
+mod input;
 mod normalize;
+/// Off in the guest — see the `policy-id` feature in Cargo.toml.
+#[cfg(feature = "policy-id")]
+pub mod policy_id;
+mod prepared;
 mod rules;
 
-pub use engine::{evaluate, request_text, CategoryScore, Decision, Evaluation, Message};
+pub use engine::{
+    evaluate, evaluate_prepared, request_text, CategoryScore, Decision, Evaluation, Message,
+};
+pub use input::{
+    hex_lower, request_commitment, scores_json, CanonicalMessageV1, CanonicalRequestV1,
+    PolicyInputV1, PolicyJournalV1, PROTOCOL_VERSION,
+};
 pub use normalize::normalize;
+pub use prepared::{Needle, PreparedRules};
 pub use rules::{CategoryMeta, HardBlock, Modifier, PolicyRules, Target};
 
 #[cfg(test)]

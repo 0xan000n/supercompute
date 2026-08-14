@@ -5,6 +5,9 @@ edition = "2021"
 
 [build-dependencies]
 risc0-build = { version = "^3.0.6" }
+# Only for the policy identity (canonical manifest + sha256). Deliberately the
+# same implementation the guest's own build.rs uses, so the two cannot drift.
+policy-core = { path = "../policy-core" }
 
 [package.metadata.risc0]
 methods = ["guest"]

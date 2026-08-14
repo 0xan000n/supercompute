@@ -223,3 +223,87 @@ fn request_text_joins_all_contents_with_newline() {
     );
     assert_eq!(request_text(&[]), "");
 }
+
+/// `any_token_starts_with` seeks to the first token `>= needle` and tests only
+/// that one, instead of scanning every token the way engine.ts:126 does. The
+/// argument for why one element is enough is in that function's doc comment;
+/// this is the argument checked against the thing it replaced, over token sets
+/// built to sit either side of every ordering edge the argument turns on —
+/// proper prefixes, one-past-the-end successors, shared prefixes, and tokens
+/// that sort between the needle and its extensions.
+#[test]
+fn prefix_range_scan_agrees_with_a_full_scan() {
+    use std::collections::BTreeSet;
+
+    let tokens = [
+        "",
+        "k",
+        "ki",
+        "kil",
+        "kill",
+        "killa",
+        "kille",
+        "killer",
+        "killing",
+        "kills",
+        "kilm",
+        "kim",
+        "skill",
+        "sk",
+        "z",
+        "a",
+        "kilz",
+        "kila",
+        "killz",
+        "kill!",
+        "kil!",
+        "killerz",
+        // multi-byte, to make sure the byte-order argument is not an ASCII one
+        "kø",
+        "køll",
+        "kill\u{0301}",
+        "\u{FF4B}ill",
+    ];
+    let needles = [
+        "",
+        "k",
+        "ki",
+        "kil",
+        "kill",
+        "kille",
+        "killer",
+        "killz",
+        "kim",
+        "kn",
+        "skill",
+        "z",
+        "a",
+        "kø",
+        "kill\u{0301}",
+        "zzz",
+    ];
+
+    // Every subset would be 2^27; take a rolling window of every size instead,
+    // which still puts each token next to every other in some set.
+    for start in 0..tokens.len() {
+        for len in 1..=tokens.len() - start {
+            let set: BTreeSet<String> = tokens[start..start + len]
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect();
+            let corpus = crate::engine::Corpus {
+                padded: String::new(),
+                tokens: set.clone(),
+                squashed: String::new(),
+            };
+            for needle in needles {
+                let naive = set.iter().any(|t| t.starts_with(needle));
+                let scanned = crate::engine::any_token_starts_with(&corpus, needle);
+                assert_eq!(
+                    naive, scanned,
+                    "range scan disagreed for needle {needle:?} over {set:?}"
+                );
+            }
+        }
+    }
+}

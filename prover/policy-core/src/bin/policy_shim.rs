@@ -23,8 +23,9 @@
 //! ```
 //!
 //! A message is `{"role":…,"content":…}`. `evaluate` runs
-//! `evaluate(rules, request_text(messages))`, i.e. exactly what
-//! `evaluateRequest` does in `packages/policy/src/index.ts:85-90`. The
+//! `evaluate_prepared(prepared_rules, request_text(messages))`, i.e. exactly
+//! what `evaluateRequest` does in `packages/policy/src/index.ts:85-90` and
+//! exactly the call the zkVM guest makes on the same prepared shape. The
 //! `evaluation` object is the `Evaluation` struct's own serialization, whose
 //! field order and `hardBlock` elision were built in Task 2 to land key-for-key
 //! on the TypeScript shape.
@@ -41,7 +42,9 @@
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufWriter, Write};
 
-use policy_core::{evaluate, request_text, Evaluation, Message, PolicyRules};
+use policy_core::{
+    evaluate_prepared, request_text, Evaluation, Message, PolicyRules, PreparedRules,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -75,21 +78,25 @@ enum Response {
     Failed { error: String },
 }
 
-/// Rules are cached by path: the harness sends one path for the whole run, and
-/// re-reading + re-parsing `rules.json` per request would be the shim's own
-/// bottleneck. Caching cannot change an answer — `PolicyRules` is immutable
-/// once parsed and `evaluate` does not touch the filesystem.
+/// Rules are cached by path, in their prepared (needles pre-normalized) form:
+/// the harness sends one path for the whole run, and re-reading, re-parsing and
+/// re-normalizing `rules.json` per request would be the shim's own bottleneck.
+/// Caching cannot change an answer — `PreparedRules` is immutable once built,
+/// `PreparedRules::prepare` is a pure function of the rules document, and
+/// `evaluate_prepared` does not touch the filesystem. It is also the exact call
+/// the guest makes, on the exact same prepared shape.
 #[derive(Default)]
-struct RulesCache(HashMap<String, PolicyRules>);
+struct RulesCache(HashMap<String, PreparedRules>);
 
 impl RulesCache {
-    fn get(&mut self, path: &str) -> Result<&PolicyRules, String> {
+    fn get(&mut self, path: &str) -> Result<&PreparedRules, String> {
         if !self.0.contains_key(path) {
             let raw = std::fs::read_to_string(path)
                 .map_err(|e| format!("cannot read rules at {path}: {e}"))?;
             let rules = PolicyRules::from_json_str(&raw)
                 .map_err(|e| format!("cannot parse rules at {path}: {e}"))?;
-            self.0.insert(path.to_owned(), rules);
+            self.0
+                .insert(path.to_owned(), PreparedRules::prepare(&rules));
         }
         Ok(&self.0[path])
     }
@@ -108,7 +115,7 @@ fn handle(req: Request, cache: &mut RulesCache) -> Response {
             messages,
         } => match cache.get(&rules_path) {
             Ok(rules) => Response::Evaluated {
-                evaluation: Box::new(evaluate(rules, &request_text(&messages))),
+                evaluation: Box::new(evaluate_prepared(rules, &request_text(&messages))),
             },
             Err(error) => Response::Failed { error },
         },
@@ -119,7 +126,7 @@ fn handle(req: Request, cache: &mut RulesCache) -> Response {
             Ok(rules) => Response::EvaluatedBatch {
                 evaluations: requests
                     .iter()
-                    .map(|msgs| evaluate(rules, &request_text(msgs)))
+                    .map(|msgs| evaluate_prepared(rules, &request_text(msgs)))
                     .collect(),
             },
             Err(error) => Response::Failed { error },

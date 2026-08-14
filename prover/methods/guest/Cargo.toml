@@ -4,7 +4,22 @@ version = "0.1.0"
 edition = "2021"
 
 [workspace]
+resolver = "2"
 
 [dependencies]
 risc0-zkvm = { version = "^3.0.6", default-features = false, features = ['std'] }
-sha2 = "0.10"
+# The engine, unchanged, compiled for riscv32im. This crate must never gain a
+# risc0 dependency — see prover/policy-core/Cargo.toml.
+# `default-features = false` drops the `policy-id` module: the guest never calls
+# it, and it would otherwise be dead code inside the measured image.
+policy-core = { path = "../../policy-core", default-features = false }
+# The frame codec and the embedded-ruleset codec. `alloc` (not `use-std`)
+# because postcard's std feature buys nothing here and pulls in io traits.
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+
+[build-dependencies]
+# Same crate, compiled for the host: build.rs validates the ruleset with the
+# real types and prepares it with the real normalizer, so a rules document that
+# would not evaluate is a build failure rather than a runtime panic in the zkVM.
+policy-core = { path = "../../policy-core" }
+postcard = { version = "1", default-features = false, features = ["alloc"] }

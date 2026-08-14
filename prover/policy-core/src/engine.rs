@@ -9,10 +9,12 @@
 //! A `hardBlock` feature denies immediately regardless of context.
 
 use std::collections::BTreeSet;
+use std::ops::Bound;
 
 use serde::{Deserialize, Serialize};
 
 use crate::normalize::normalize;
+use crate::prepared::{Needle, NeedleShape, PreparedRules};
 use crate::rules::PolicyRules;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,6 +22,17 @@ use crate::rules::PolicyRules;
 pub enum Decision {
     Allow,
     Deny,
+}
+
+impl Decision {
+    /// The two strings the journal and the verifier allowlist use. Spelled here
+    /// once so the guest cannot invent a third.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Decision::Allow => "ALLOW",
+            Decision::Deny => "DENY",
+        }
+    }
 }
 
 /// engine.ts:43-49. Field order is the TS object-literal order (engine.ts:191-197)
@@ -67,7 +80,9 @@ pub(crate) struct Corpus {
     /// with this needle" — an order-independent question, so the container's
     /// order is not part of the contract. `BTreeSet` rather than `HashSet`
     /// because the guest gets no entropy for `RandomState` and this crate must
-    /// stay deterministic top to bottom.
+    /// stay deterministic top to bottom — and, given the ordering exists
+    /// anyway, because it turns that prefix question into a range seek instead
+    /// of a full scan (see `any_token_starts_with`).
     pub tokens: BTreeSet<String>,
     /// All separators removed — defeats "p i p e b o m b" style spacing attacks.
     pub squashed: String,
@@ -89,18 +104,32 @@ impl Corpus {
     }
 }
 
-/// Squashed matching is substring matching, so it is gated to long needles only
-/// (engine.ts:103).
-const SQUASH_MIN: usize = 8;
-
-/// JS `String.prototype.length` counts UTF-16 code units — not characters, and
-/// not bytes. Every needle in rules.json is ASCII, where all three agree, but
-/// the gates below are JS gates and must stay JS gates for any needle.
-fn js_length(s: &str) -> usize {
-    s.encode_utf16().count()
+/// Does any token in the corpus have `needle` as a prefix?
+///
+/// The TS scans the whole token set (engine.ts:126). `tokens` is a `BTreeSet`,
+/// so instead: seek to the first token `>= needle` and test only that one. That
+/// is sufficient, not merely a heuristic. Suppose some token starts with
+/// `needle`, and let `t0` be the smallest such. Any token `u` with
+/// `needle <= u < t0` cannot itself start with `needle` (or `t0` would not be
+/// the smallest) — but then `u` differs from `needle` at some position `i`
+/// inside `needle`, with `u[i] > needle[i]` since `u > needle`, which makes
+/// every string beginning with `needle` — `t0` included — strictly less than
+/// `u`. That contradicts `u < t0`. So no such `u` exists and `t0` is exactly
+/// the first element of the range.
+///
+/// Byte order and byte prefixes are the right comparisons here: both sides are
+/// output of the same normalizer, so a Rust `starts_with` (byte prefix) and a
+/// JS `startsWith` (UTF-16 code unit prefix) accept exactly the same pairs.
+pub(crate) fn any_token_starts_with(corpus: &Corpus, needle: &str) -> bool {
+    corpus
+        .tokens
+        .range::<str, _>((Bound::Included(needle), Bound::Unbounded))
+        .next()
+        .is_some_and(|tok| tok.starts_with(needle))
 }
 
-/// Deterministic token-aware match (engine.ts:105-134).
+/// Deterministic token-aware match (engine.ts:105-134), against a needle whose
+/// normalization was hoisted out (see [`crate::prepared`]).
 ///
 /// - Multi-word needle: whole-phrase, space-bounded (optional plural 's').
 /// - Single-word needle: exact token, or token-prefix when the needle is >= 4
@@ -109,47 +138,64 @@ fn js_length(s: &str) -> usize {
 ///   matched against the separator-free text, catching inserted separators.
 ///   Note this is a fallthrough, not an `else`: a multi-word needle that fails
 ///   the phrase test still gets the squashed test.
-pub(crate) fn match_needle(corpus: &Corpus, needle_raw: &str) -> bool {
-    let n = normalize(needle_raw);
+pub(crate) fn match_prepared(corpus: &Corpus, needle: &Needle) -> bool {
     // `n.length === 0`
-    if n.is_empty() {
+    if needle.normalized.is_empty() {
         return false;
     }
 
-    if n.contains(' ') {
-        if corpus.padded.contains(&format!(" {n} ")) {
-            return true;
+    match &needle.shape {
+        NeedleShape::Phrase {
+            padded,
+            padded_plural,
+        } => {
+            if corpus.padded.contains(padded.as_str()) {
+                return true;
+            }
+            if corpus.padded.contains(padded_plural.as_str()) {
+                return true;
+            }
         }
-        if corpus.padded.contains(&format!(" {n}s ")) {
-            return true;
-        }
-    } else {
-        if corpus.tokens.contains(&n) {
-            return true;
-        }
-        // Both sides are the output of the same normalizer, so a Rust
-        // `starts_with` (byte prefix) and a JS `startsWith` (UTF-16 code unit
-        // prefix) accept exactly the same pairs.
-        if js_length(&n) >= 4 && corpus.tokens.iter().any(|tok| tok.starts_with(&n)) {
-            return true;
+        NeedleShape::Token { prefix_eligible } => {
+            if corpus.tokens.contains(needle.normalized.as_str()) {
+                return true;
+            }
+            if *prefix_eligible && any_token_starts_with(corpus, &needle.normalized) {
+                return true;
+            }
         }
     }
 
-    let squashed_needle = n.replace(' ', "");
-    if js_length(&squashed_needle) >= SQUASH_MIN && corpus.squashed.contains(&squashed_needle) {
-        return true;
+    if let Some(squashed) = &needle.squashed {
+        if corpus.squashed.contains(squashed.as_str()) {
+            return true;
+        }
     }
     false
 }
 
-/// engine.ts:136-202.
-pub fn evaluate(rules: &PolicyRules, raw_text: &str) -> Evaluation {
+/// `match_prepared` from a raw phrase — the shape engine.ts:105 has. Used by the
+/// unit tests; the engine itself prepares once and matches many times.
+#[cfg(test)]
+pub(crate) fn match_needle(corpus: &Corpus, needle_raw: &str) -> bool {
+    match_prepared(corpus, &Needle::prepare(needle_raw))
+}
+
+fn any_match(corpus: &Corpus, needles: &[Needle]) -> bool {
+    needles.iter().any(|n| match_prepared(corpus, n))
+}
+
+/// engine.ts:136-202, on rules whose phrases are already normalized.
+///
+/// This is the entry point the guest uses: `PreparedRules` is baked into the
+/// image, so the zkVM never normalizes a rules phrase.
+pub fn evaluate_prepared(rules: &PreparedRules, raw_text: &str) -> Evaluation {
     let corpus = Corpus::build(&normalize(raw_text));
 
     // Hard blocks: immediate DENY (e.g. P5 sexual exploitation of minors).
     for hb in &rules.hard_blocks {
         for p in &hb.phrases {
-            if match_needle(&corpus, p) {
+            if match_prepared(&corpus, p) {
                 return Evaluation {
                     decision: Decision::Deny,
                     categories: Vec::new(),
@@ -162,27 +208,18 @@ pub fn evaluate(rules: &PolicyRules, raw_text: &str) -> Evaluation {
         }
     }
 
-    let intent_present = rules
-        .intent_phrases
-        .iter()
-        .any(|p| match_needle(&corpus, p));
-    let construction_present = rules
-        .construction_verbs
-        .iter()
-        .any(|p| match_needle(&corpus, p));
+    let intent_present = any_match(&corpus, &rules.intent_phrases);
+    let construction_present = any_match(&corpus, &rules.construction_verbs);
 
     // A request that demands the *real* operational detail forfeits context
     // leniency (engine.ts:158-159).
-    let suppressed = rules
-        .modifier_suppressors
-        .iter()
-        .any(|p| match_needle(&corpus, p));
+    let suppressed = any_match(&corpus, &rules.modifier_suppressors);
 
     let mut modifier_total: i64 = 0;
     let mut modifiers_applied: Vec<String> = Vec::new();
     if !suppressed {
         for m in &rules.modifiers {
-            if m.phrases.iter().any(|p| match_needle(&corpus, p)) {
+            if any_match(&corpus, &m.phrases) {
                 modifier_total += m.weight; // weights are negative
                 modifiers_applied.push(m.id.clone());
             }
@@ -202,7 +239,7 @@ pub fn evaluate(rules: &PolicyRules, raw_text: &str) -> Evaluation {
             if tgt.category != *cat {
                 continue;
             }
-            if tgt.phrases.iter().any(|p| match_needle(&corpus, p)) {
+            if any_match(&corpus, &tgt.phrases) {
                 score += tgt.weight;
                 matched_targets.push(tgt.id.clone());
             }
@@ -240,12 +277,27 @@ pub fn evaluate(rules: &PolicyRules, raw_text: &str) -> Evaluation {
     }
 }
 
+/// engine.ts:136-202, preparing the rules on the way in.
+///
+/// The native entry point: the differential shim, the fixture tests and the
+/// engine's own unit tests all call this, so the property they check is a
+/// property of the same code path the guest runs — `evaluate_prepared` — with
+/// the hoist done eagerly rather than at build time. Callers that evaluate many
+/// requests against one ruleset should prepare once and call
+/// [`evaluate_prepared`] instead.
+pub fn evaluate(rules: &PolicyRules, raw_text: &str) -> Evaluation {
+    evaluate_prepared(&PreparedRules::prepare(rules), raw_text)
+}
+
 /// Extract the text a policy evaluates: the concatenation of all message
 /// contents (`packages/policy/src/index.ts:81-83`).
 pub fn request_text(messages: &[Message]) -> String {
-    messages
-        .iter()
-        .map(|m| m.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n")
+    request_text_from(messages.iter().map(|m| m.content.as_str()))
+}
+
+/// The same join, over any iterator of contents. `CanonicalRequestV1` carries
+/// its own message type, and one implementation of "join the contents with a
+/// newline" is the only way that stays true to index.ts:81-83.
+pub(crate) fn request_text_from<'a>(contents: impl Iterator<Item = &'a str>) -> String {
+    contents.collect::<Vec<_>>().join("\n")
 }
