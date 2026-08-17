@@ -34,13 +34,27 @@ import { evaluate, type PolicyPackage } from "@ctn/policy";
 import {
   canonicalHash,
   randomHex,
+  type PolicyDecision,
   type PolicyJournal,
   type ProofBinding,
   type ProofReceipt,
   type SignedProofBinding,
 } from "@ctn/protocol";
-import type { AuthorizedRequest } from "./authorize.js";
 import type { TrustedEnvironment } from "./tee.js";
+
+/**
+ * Phase 2b — the private witness a proof is generated over, plus the guest's
+ * authoritative verdict. Decoupled from `AuthorizedRequest` on purpose: a DENY
+ * request has no `AuthorizedRequest` (that type means "policy allowed", §69), yet
+ * it is still gated and still proved — so the prover takes the raw witness and
+ * the decision rather than a type that can only exist for ALLOW.
+ */
+export interface ProofWitness {
+  canonicalRequest: string;
+  requestNonce: string;
+  requestCommitment: string;
+  decision: PolicyDecision;
+}
 
 export type ProofState =
   | { status: "PROVING"; startedAt: number }
@@ -82,10 +96,12 @@ export class Prover {
   }
 
   /**
-   * §25 branch A — kicked off the moment policy returns ALLOW and deliberately
-   * NOT awaited, so proving overlaps inference instead of serializing behind it.
+   * §25 branch A — kicked off the moment the gate returns a verdict and
+   * deliberately NOT awaited, so proving overlaps inference instead of
+   * serializing behind it. Phase 2b: enqueued for ALLOW AND DENY (and
+   * no-capacity) — every gated request is proved.
    */
-  start(requestId: string, authorized: AuthorizedRequest): void {
+  start(requestId: string, witness: ProofWitness): void {
     const startedAt = performance.now();
     this.records.set(requestId, {
       requestId,
@@ -93,29 +109,28 @@ export class Prover {
       simulatedCostMs: 0,
     });
 
-    void this.run(requestId, authorized, startedAt);
+    void this.run(requestId, witness, startedAt);
   }
 
   private async run(
     requestId: string,
-    authorized: AuthorizedRequest,
+    witness: ProofWitness,
     startedAt: number
   ): Promise<void> {
     const simulatedCostMs =
       SIMULATED_PROVING_MS + Math.floor(Math.random() * Math.max(1, PROVING_JITTER_MS));
     try {
-      const witness = authorized.witness();
-
       // Independent re-execution from the witness. If the guest's decision ever
-      // disagreed with the enclave's, that is a policy-determinism bug and the
-      // proof must fail rather than paper over it.
+      // disagreed with this re-execution, that is a policy-determinism bug and
+      // the proof must fail rather than paper over it. Both ALLOW and DENY are
+      // proved, so the check is against the guest verdict, not a hardcoded ALLOW.
       const parsed = JSON.parse(witness.canonicalRequest) as {
         messages: Array<{ role: string; content: string }>;
       };
       const reexec = evaluate(this.pkg.rules, parsed.messages.map((m) => m.content).join("\n"));
-      if (reexec.decision !== "ALLOW") {
+      if (reexec.decision !== witness.decision) {
         throw new Error(
-          "guest re-execution disagreed with enclave policy evaluation (non-determinism)"
+          "guest re-execution disagreed with the gate verdict (non-determinism)"
         );
       }
 
@@ -124,9 +139,9 @@ export class Prover {
       // §27 — public journal. Nothing prompt-derived may appear here.
       const journal: PolicyJournal = {
         protocolVersion: 1,
-        requestCommitment: authorized.requestCommitment,
+        requestCommitment: witness.requestCommitment,
         policyId: this.pkg.policyId,
-        decision: "ALLOW",
+        decision: witness.decision,
         proofNonce: "0x" + randomHex(32),
       };
 
@@ -152,7 +167,8 @@ export class Prover {
       const result = verifyProof(proof, {
         expectedGuestImageId: this.pkg.guestImageId,
         expectedPolicyId: this.pkg.policyId,
-        expectedCommitment: authorized.requestCommitment,
+        expectedCommitment: witness.requestCommitment,
+        expectedDecision: witness.decision,
         proverPublicKey: this.tee.proverPublicKey,
       });
 
@@ -175,11 +191,11 @@ export class Prover {
       const binding: ProofBinding = {
         version: "ctn-proof-binding-1",
         requestId,
-        requestCommitment: authorized.requestCommitment,
+        requestCommitment: witness.requestCommitment,
         policyId: this.pkg.policyId,
         guestImageId: this.pkg.guestImageId,
         zkReceiptDigest: digest,
-        decision: "ALLOW",
+        decision: witness.decision,
         proofVerified: true,
         issuedAt: new Date().toISOString(),
       };

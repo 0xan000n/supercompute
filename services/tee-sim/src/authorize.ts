@@ -17,6 +17,28 @@ import { evaluateRequest, type PolicyPackage, type PolicyEvaluation } from "@ctn
 
 const BRAND = Symbol("ctn.authorized");
 
+/**
+ * Phase 2b — the determinism guard. The guest executor (the authoritative gate)
+ * computes the request commitment itself, inside the zkVM, from the canonical
+ * bytes and nonce. The enclave recomputes the SAME commitment from the SAME
+ * inputs and asserts equality: if they differ, the guest evaluated bytes other
+ * than the ones the enclave is about to act on, and there is no safe decision —
+ * so this throws and the request fails closed rather than binding a verdict to a
+ * request that was never evaluated.
+ */
+export class CommitmentMismatchError extends Error {
+  readonly code = "CTN_COMMITMENT_MISMATCH";
+  constructor() {
+    super("guest journal commitment does not match the enclave recomputation");
+    this.name = "CommitmentMismatchError";
+  }
+}
+
+/** Pure, fail-closed commitment equality check (exported for the differential/e2e). */
+export function assertGuestCommitment(enclaveCommitment: string, journalCommitment: string): void {
+  if (enclaveCommitment !== journalCommitment) throw new CommitmentMismatchError();
+}
+
 export class AuthorizedRequest {
   readonly [BRAND] = true;
   private constructor(
@@ -53,6 +75,37 @@ export class AuthorizedRequest {
       evaluation,
       commitment,
       policyMs,
+    };
+  }
+
+  /**
+   * Phase 2b §3 — construct the authorized state from the GUEST verdict rather
+   * than the TypeScript engine. The guest `/execute` journal is authoritative for
+   * every request; this factory recomputes the commitment, asserts it equals the
+   * journal's (fail closed on mismatch), and returns either an AuthorizedRequest
+   * (guest said ALLOW) or a denial. The TS `evaluate` above no longer runs on the
+   * request path — it is retained only for the Policy-Lab preview.
+   */
+  static fromGuestJournal(
+    request: CanonicalRequestV1,
+    requestNonce: string,
+    journal: { requestCommitment: string; decision: "ALLOW" | "DENY"; policyId: string },
+    gateWallMs: number
+  ):
+    | { decision: "ALLOW"; authorized: AuthorizedRequest; commitment: string }
+    | { decision: "DENY"; commitment: string } {
+    const commitment = requestCommitment(canonicalBytes(request), requestNonce);
+    // Determinism guard — the guest and the enclave must agree on WHICH request
+    // was evaluated, byte for byte, before any verdict is trusted.
+    assertGuestCommitment(commitment, journal.requestCommitment);
+
+    if (journal.decision !== "ALLOW") {
+      return { decision: "DENY", commitment };
+    }
+    return {
+      decision: "ALLOW",
+      authorized: new AuthorizedRequest(request, commitment, requestNonce, journal.policyId, gateWallMs),
+      commitment,
     };
   }
 

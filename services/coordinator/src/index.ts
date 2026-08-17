@@ -462,8 +462,8 @@ async function runSecureRequest(
 
   db.prepare(
     `INSERT INTO requests (id, model, status, privacy_mode, proof_status, created_at, policy_id)
-     VALUES (?, ?, 'RECEIVED', ?, 'NOT_REQUIRED', ?, ?)`
-  ).run(requestId, model, privacyMode, nowIso(), pkg.policyId);
+     VALUES (?, ?, 'RECEIVED', ?, 'NOT_REQUIRED', ?, NULL)`
+  ).run(requestId, model, privacyMode, nowIso());
 
   emitEvent("request.received", requestId, {
     request_id: requestId,
@@ -473,59 +473,64 @@ async function runSecureRequest(
   });
   safeLog("info", "request.received", { request_id: requestId, model, privacy_mode: privacyMode });
 
-  // §16 — candidate discovery from visible metadata only.
-  const discovery = discoverCandidates(model, pkg.policyId);
-
-  if (discovery.candidates.length === 0) {
-    db.prepare(`UPDATE requests SET status = 'FAILED', error_code = 'CTN_NO_CAPACITY', completed_at = ? WHERE id = ?`)
-      .run(nowIso(), requestId);
-    emitEvent("request.failed", requestId, {
-      request_id: requestId,
-      error_code: "CTN_NO_CAPACITY",
-      attempts: 0,
-      total_ms: Math.round(performance.now() - startedAt),
-    });
-    return {
-      code: 503,
-      body: {
-        error: {
-          code: "CTN_NO_CAPACITY",
-          message: "No eligible contributed capacity is available for this model and policy.",
-          request_id: requestId,
-          excluded: discovery.excluded.map((e) => e.reason),
-        },
-      },
-    };
-  }
-
-  let result: ExecuteResult;
+  // ---- Phase 2b §3: GATE FIRST, before any capacity decision ----
+  // The guest executor is the authoritative gate for EVERY request. It runs
+  // before candidate discovery so that ALLOW, DENY, and no-capacity requests are
+  // all gated and all proved.
+  let gate;
   try {
-    result = await teeClient.execute(envelope, discovery.candidates);
+    gate = await teeClient.gate(envelope);
   } catch (err) {
-    // The enclave refused the envelope: tampered ciphertext or AAD, replayed
-    // nonce, or an unknown enclave key id. Nothing was decrypted and no policy
-    // ran, so no policy events may be emitted for it.
+    if (err instanceof EnclaveRejectionError && err.code === "PROVER_UNAVAILABLE") {
+      // §4 — a 503-class SYSTEM failure, never a policy decision. No gate ran, so
+      // no provider is called, NO PolicyDecisionReceiptV1 is manufactured, and the
+      // TypeScript engine does NOT silently take over. Recorded as status FAILED
+      // (not DENIED), so it stays out of denial metrics and the graph's denial
+      // visuals.
+      const totalMs = Math.round(performance.now() - startedAt);
+      db.prepare(
+        `UPDATE requests SET status = 'FAILED', error_code = 'CTN_PROVER_UNAVAILABLE', completed_at = ?, total_ms = ? WHERE id = ?`
+      ).run(nowIso(), totalMs, requestId);
+      emitEvent("request.failed", requestId, {
+        request_id: requestId,
+        error_code: "CTN_PROVER_UNAVAILABLE",
+        system_failure: true,
+        attempts: 0,
+        total_ms: totalMs,
+      });
+      safeLog("error", "prover.unavailable", { request_id: requestId });
+      return {
+        code: 503,
+        body: {
+          error: {
+            code: "CTN_PROVER_UNAVAILABLE",
+            message: "The policy gate is unavailable. The request was not evaluated and no provider was called.",
+            request_id: requestId,
+          },
+        },
+      };
+    }
     if (err instanceof EnclaveRejectionError) {
+      // Bad envelope, replayed nonce, unknown key id, or a determinism-guard
+      // failure (CTN_COMMITMENT_MISMATCH). Nothing was decrypted-and-acted-on.
+      const totalMs = Math.round(performance.now() - startedAt);
       db.prepare(
         `UPDATE requests SET status = 'FAILED', error_code = ?, completed_at = ?, total_ms = ? WHERE id = ?`
-      ).run(err.code, nowIso(), Math.round(performance.now() - startedAt), requestId);
+      ).run(err.code, nowIso(), totalMs, requestId);
       emitEvent("request.failed", requestId, {
         request_id: requestId,
         error_code: err.code,
         attempts: 0,
-        total_ms: Math.round(performance.now() - startedAt),
+        total_ms: totalMs,
       });
-      safeLog("warn", "envelope.rejected", {
-        request_id: requestId,
-        code: err.code,
-        http_status: err.httpStatus,
-      });
+      safeLog("warn", "gate.rejected", { request_id: requestId, code: err.code, http_status: err.httpStatus });
       return {
         code: err.httpStatus >= 400 && err.httpStatus < 500 ? err.httpStatus : 400,
         body: { error: { code: err.code, message: err.message, request_id: requestId } },
       };
     }
 
+    // The enclave itself is unreachable (distinct from the guest gate being down).
     db.prepare(
       `UPDATE requests SET status = 'FAILED', error_code = 'CTN_ENCLAVE_UNAVAILABLE', completed_at = ? WHERE id = ?`
     ).run(nowIso(), requestId);
@@ -548,15 +553,191 @@ async function runSecureRequest(
     };
   }
 
-  // Defence in depth: if the enclave ever returns a body that is neither a
-  // rejection nor a well-formed result, fail cleanly instead of reading fields
-  // off it and 500-ing halfway through the event sequence.
-  if (result?.status !== "COMPLETE" && result?.status !== "DENIED" && result?.status !== "FAILED") {
+  // The gate returned a verdict. The request-path policy identity is the GUEST's
+  // POLICY_ID_V2 (from the gate), NOT the TypeScript package's preview id.
+  const guestPolicyId = gate.policyId;
+  const gateWallMs = gate.gateWallMs ?? gate.timings?.gateWallMs ?? 0;
+  db.prepare(`UPDATE requests SET policy_id = ?, request_commitment = ? WHERE id = ?`).run(
+    guestPolicyId,
+    gate.commitment,
+    requestId
+  );
+  // §4 — persist the signed decision receipt for the verdict (ALLOW or DENY).
+  const dr = gate.decisionReceipt;
+  db.prepare(
+    `INSERT OR REPLACE INTO decision_receipts
+       (request_id, policy_id, decision, image_id, commitment, gate_wall_ms, receipt_json, signature, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    requestId,
+    dr.receipt.policyId,
+    dr.receipt.decision,
+    dr.receipt.imageId,
+    dr.receipt.requestCommitment,
+    dr.receipt.timing.gateWallMs,
+    JSON.stringify(dr.receipt),
+    dr.enclaveSignature,
+    nowIso()
+  );
+
+  // The enclave attested itself as part of handling this request.
+  const attestation = await teeClient.attestation().catch(() => null);
+  if (attestation) {
+    emitEvent("tee.verified", requestId, {
+      request_id: requestId,
+      build_id: attestation.bundle.enclaveBuildId,
+      mode: attestation.bundle.teeMode,
+      attestation_digest: attestation.attestationDigest,
+    });
+  }
+
+  emitEvent("policy.started", requestId, { request_id: requestId, policy_id: guestPolicyId });
+
+  // §4 — enqueue the proof of the verdict for EVERY gated request: ALLOW, DENY,
+  // and (below) no-capacity. The enclave already started proving at the gate;
+  // this records the coordinator-side job and watches it to a terminal state.
+  if (gate.proofStarted) {
+    db.prepare(`UPDATE requests SET proof_status = 'PROVING' WHERE id = ?`).run(requestId);
+    // The proof is still SIMULATED in this build phase, so its image is the
+    // preview `pkg.guestImageId` (Task 3 migrates it to the guest daemon image).
+    // The authoritative GATE image (`gate.imageId`) lives on the decision receipt.
+    db.prepare(
+      `INSERT INTO proofs (id, request_id, proof_system, guest_image_id, status, created_at)
+       VALUES (?, ?, 'simulated-reexec', ?, 'PROVING', ?)`
+    ).run(`proof_${requestId}`, requestId, pkg.guestImageId, nowIso());
+    emitEvent("proof.started", requestId, {
+      request_id: requestId,
+      policy_id: guestPolicyId,
+      proof_system: "simulated-reexec",
+      guest_image_id: pkg.guestImageId,
+    });
+    watchProof(requestId);
+  }
+
+  // ---- DENY: done. No credential decrypted, no provider called — but proved. ----
+  if (gate.decision === "DENY") {
+    db.prepare(
+      `UPDATE requests SET status = 'DENIED', policy_result = 'DENY',
+              policy_ms = ?, trust_status = ?, error_code = 'CTN_POLICY_DENIED', completed_at = ?, total_ms = ?
+        WHERE id = ?`
+    ).run(
+      gateWallMs,
+      privacyMode === "secure" ? "SIMULATED" : "COMPATIBILITY",
+      nowIso(),
+      Math.round(performance.now() - startedAt),
+      requestId
+    );
+    emitEvent("policy.denied", requestId, {
+      request_id: requestId,
+      commitment: gate.commitment,
+      policy_id: guestPolicyId,
+      policy_ms: gateWallMs,
+    });
+    safeLog("info", "policy.denied", { request_id: requestId, commitment: gate.commitment });
+    return {
+      code: 403,
+      body: {
+        error: {
+          code: "CTN_POLICY_DENIED",
+          message: "Request was not eligible under Safety Policy v1.",
+          request_id: requestId,
+          policy_id: guestPolicyId,
+        },
+        request_commitment: gate.commitment,
+      },
+    };
+  }
+
+  // ---- ALLOW: discover candidates, keyed on the GUEST policyId ----
+  emitEvent("policy.allowed", requestId, {
+    request_id: requestId,
+    commitment: gate.commitment,
+    policy_id: guestPolicyId,
+    policy_ms: gateWallMs,
+  });
+
+  const discovery = discoverCandidates(model, guestPolicyId);
+  if (discovery.candidates.length === 0) {
+    // The request was still gated and is still being proved (above). No capacity.
+    const totalMs = Math.round(performance.now() - startedAt);
+    db.prepare(
+      `UPDATE requests SET status = 'FAILED', policy_result = 'ALLOW', policy_ms = ?, error_code = 'CTN_NO_CAPACITY', completed_at = ?, total_ms = ? WHERE id = ?`
+    ).run(gateWallMs, nowIso(), totalMs, requestId);
+    emitEvent("request.failed", requestId, {
+      request_id: requestId,
+      commitment: gate.commitment,
+      error_code: "CTN_NO_CAPACITY",
+      attempts: 0,
+      total_ms: totalMs,
+    });
+    return {
+      code: 503,
+      body: {
+        error: {
+          code: "CTN_NO_CAPACITY",
+          message: "No eligible contributed capacity is available for this model and policy.",
+          request_id: requestId,
+          excluded: discovery.excluded.map((e) => e.reason),
+        },
+      },
+    };
+  }
+
+  // ---- Dispatch (ALLOW only). The enclave consumes the parked gate outcome. ----
+  let result: ExecuteResult;
+  try {
+    result = await teeClient.execute(envelope, discovery.candidates);
+  } catch (err) {
+    if (err instanceof EnclaveRejectionError) {
+      const totalMs = Math.round(performance.now() - startedAt);
+      db.prepare(
+        `UPDATE requests SET status = 'FAILED', error_code = ?, completed_at = ?, total_ms = ? WHERE id = ?`
+      ).run(err.code, nowIso(), totalMs, requestId);
+      emitEvent("request.failed", requestId, {
+        request_id: requestId,
+        commitment: gate.commitment,
+        error_code: err.code,
+        attempts: 0,
+        total_ms: totalMs,
+      });
+      safeLog("warn", "dispatch.rejected", { request_id: requestId, code: err.code });
+      return {
+        code: err.httpStatus >= 400 && err.httpStatus < 500 ? err.httpStatus : 400,
+        body: { error: { code: err.code, message: err.message, request_id: requestId } },
+      };
+    }
+    db.prepare(
+      `UPDATE requests SET status = 'FAILED', error_code = 'CTN_ENCLAVE_UNAVAILABLE', completed_at = ? WHERE id = ?`
+    ).run(nowIso(), requestId);
+    emitEvent("request.failed", requestId, {
+      request_id: requestId,
+      commitment: gate.commitment,
+      error_code: "CTN_ENCLAVE_UNAVAILABLE",
+      attempts: 0,
+      total_ms: Math.round(performance.now() - startedAt),
+    });
+    safeLog("error", "enclave.unavailable", { request_id: requestId });
+    return {
+      code: 503,
+      body: {
+        error: {
+          code: "CTN_ENCLAVE_UNAVAILABLE",
+          message: "The confidential service is unavailable.",
+          request_id: requestId,
+        },
+      },
+    };
+  }
+
+  // Defence in depth: dispatch should return COMPLETE or FAILED (the gate already
+  // handled DENY). Anything else is malformed.
+  if (result?.status !== "COMPLETE" && result?.status !== "FAILED") {
     db.prepare(
       `UPDATE requests SET status = 'FAILED', error_code = 'CTN_INTERNAL', completed_at = ? WHERE id = ?`
     ).run(nowIso(), requestId);
     emitEvent("request.failed", requestId, {
       request_id: requestId,
+      commitment: gate.commitment,
       error_code: "CTN_INTERNAL",
       attempts: 0,
       total_ms: Math.round(performance.now() - startedAt),
@@ -572,79 +753,6 @@ async function runSecureRequest(
         },
       },
     };
-  }
-
-  // The enclave attested itself as part of handling this request.
-  const attestation = await teeClient.attestation().catch(() => null);
-  if (attestation) {
-    emitEvent("tee.verified", requestId, {
-      request_id: requestId,
-      build_id: attestation.bundle.enclaveBuildId,
-      mode: attestation.bundle.teeMode,
-      attestation_digest: attestation.attestationDigest,
-    });
-  }
-
-  emitEvent("policy.started", requestId, { request_id: requestId, policy_id: result.policyId });
-
-  // ---- DENY path: no credential was decrypted and no provider was called ----
-  if (result.status === "DENIED") {
-    db.prepare(
-      `UPDATE requests SET status = 'DENIED', request_commitment = ?, policy_result = 'DENY',
-              policy_ms = ?, trust_status = ?, error_code = 'CTN_POLICY_DENIED', completed_at = ?, total_ms = ?
-        WHERE id = ?`
-    ).run(
-      result.commitment,
-      result.policyMs,
-      privacyMode === "secure" ? "SIMULATED" : "COMPATIBILITY",
-      nowIso(),
-      Math.round(performance.now() - startedAt),
-      requestId
-    );
-    emitEvent("policy.denied", requestId, {
-      request_id: requestId,
-      commitment: result.commitment,
-      policy_id: result.policyId,
-      policy_ms: result.policyMs,
-    });
-    safeLog("info", "policy.denied", { request_id: requestId, commitment: result.commitment });
-
-    return {
-      code: 403,
-      body: {
-        error: {
-          code: "CTN_POLICY_DENIED",
-          message: "Request was not eligible under Safety Policy v1.",
-          request_id: requestId,
-          policy_id: result.policyId,
-        },
-        request_commitment: result.commitment,
-        // §33 — debug detail is local-development only.
-        debug: CTN_ENV === "local" ? result.debug : undefined,
-      },
-    };
-  }
-
-  emitEvent("policy.allowed", requestId, {
-    request_id: requestId,
-    commitment: result.commitment,
-    policy_id: result.policyId,
-    policy_ms: result.policyMs,
-  });
-
-  if (result.proofStarted) {
-    db.prepare(`UPDATE requests SET proof_status = 'PROVING' WHERE id = ?`).run(requestId);
-    db.prepare(
-      `INSERT INTO proofs (id, request_id, proof_system, guest_image_id, status, created_at)
-       VALUES (?, ?, 'simulated-reexec', ?, 'PROVING', ?)`
-    ).run(`proof_${requestId}`, requestId, pkg.guestImageId, nowIso());
-    emitEvent("proof.started", requestId, {
-      request_id: requestId,
-      policy_id: result.policyId,
-      proof_system: "simulated-reexec",
-      guest_image_id: pkg.guestImageId,
-    });
-    watchProof(requestId);
   }
 
   // Rule 6 — persist every attempt the enclave reports, successes and failures.
@@ -1208,6 +1316,9 @@ app.get("/v1/requests/:requestId", async (request, reply) => {
   const proofRow = db.prepare(`SELECT * FROM proofs WHERE request_id = ?`).get(requestId) as
     | Record<string, unknown>
     | undefined;
+  const decisionRow = db.prepare(`SELECT * FROM decision_receipts WHERE request_id = ?`).get(requestId) as
+    | Record<string, unknown>
+    | undefined;
   const contributor = req.selected_credential_id
     ? (db
         .prepare(
@@ -1256,6 +1367,14 @@ app.get("/v1/requests/:requestId", async (request, reply) => {
           simulatedCostMs: proofRow.simulated_cost_ms,
           digest: proofRow.receipt_digest,
           error: proofRow.error,
+        }
+      : null,
+    // Phase 2b §4 — the signed gate result for this request (ALLOW or DENY). A
+    // PROVER_UNAVAILABLE system failure has none, by construction.
+    policyDecisionReceipt: decisionRow
+      ? {
+          receipt: JSON.parse(decisionRow.receipt_json as string),
+          enclaveSignature: decisionRow.signature as string,
         }
       : null,
   };

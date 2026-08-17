@@ -10,7 +10,19 @@
 import { ComputeTrustClient, PolicyDeniedError } from "@ctn/client";
 
 const BASE = process.env.CTN_COORDINATOR_URL ?? "http://127.0.0.1:4200";
+// Phase 2b §5 — the guest executor's authoritative policy identity (POLICY_ID_V2).
+// Capacity is reseeded under THIS id: the enclave resolves the sealed intent's
+// "safety-v1" label to it at ingest, and candidate discovery keys on it. A demo
+// seeded under the old preview id would find zero eligible capacity.
+const PROVER_URL = process.env.CTN_PROVER_URL ?? "http://127.0.0.1:4500";
 const client = new ComputeTrustClient(BASE);
+
+/** The guest gate's POLICY_ID_V2, read from the daemon /health. */
+async function guestPolicyId(): Promise<string> {
+  const res = await fetch(`${PROVER_URL}/health`);
+  if (!res.ok) throw new Error(`guest gate /health not reachable at ${PROVER_URL} (status ${res.status})`);
+  return ((await res.json()) as { policyId: string }).policyId;
+}
 
 const MODEL_A = "ctn/demo-model-a";
 const MODEL_B = "ctn/demo-model-b";
@@ -140,6 +152,25 @@ async function main(): Promise<void> {
       );
     }
   }
+
+  // Phase 2b §5 — assert the reseed landed under the guest identity. If a
+  // capability were still minted under the old preview id, discovery (keyed on
+  // POLICY_ID_V2) would find nothing and every request would be CTN_NO_CAPACITY,
+  // so fail loudly here rather than seed a silently-dead network.
+  const policyIdV2 = await guestPolicyId();
+  const creds = (await (await fetch(`${BASE}/v1/credentials`)).json()) as {
+    data: Array<{ id: string; status: string; capability: { allowedPolicyIds: string[] } }>;
+  };
+  const wrong = creds.data.filter(
+    (c) => c.status === "ACTIVE" && !c.capability.allowedPolicyIds.includes(policyIdV2)
+  );
+  if (wrong.length > 0) {
+    throw new Error(
+      `reseed check failed: ${wrong.length} active credential(s) are NOT under POLICY_ID_V2 (${policyIdV2.slice(0, 18)}…). ` +
+        `Run "pnpm reset" then "pnpm seed" so capacity is minted under the guest identity.`
+    );
+  }
+  console.log(`  reseed ok: ${creds.data.filter((c) => c.status === "ACTIVE").length} active credential(s) under POLICY_ID_V2 ${policyIdV2.slice(0, 18)}…`);
 
   if (!runTraffic) {
     console.log("Done (no traffic requested).");

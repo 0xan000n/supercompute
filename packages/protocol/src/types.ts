@@ -155,6 +155,33 @@ export interface CredentialCapability {
 
 export type PolicyDecision = "ALLOW" | "DENY";
 
+/**
+ * Phase 2b §4 — the gate result, signed at decision time for EVERY request
+ * (ALLOW and DENY, including no-capacity), before any capacity decision. This is
+ * the artifact a proof binds to. `decision` is ONLY ever ALLOW or DENY: a
+ * `PROVER_UNAVAILABLE` system failure is never expressed as one of these, it is a
+ * separate request/system-failure record with no decision at all.
+ *
+ * `requestCommitment` MUST equal the guest journal's commitment (the enclave
+ * asserts equality and fails closed on mismatch — the determinism guard).
+ * `policyId` is the guest's authoritative `POLICY_ID_V2` (from `/health`), NOT
+ * the TypeScript package's preview `pkg.policyId`. `imageId` is the guest image
+ * the gate actually ran.
+ */
+export interface PolicyDecisionReceiptV1 {
+  requestId: string;
+  requestCommitment: string;
+  policyId: string;
+  decision: "ALLOW" | "DENY";
+  imageId: string;
+  timing: { gateWallMs: number };
+}
+
+export interface SignedPolicyDecisionReceiptV1 {
+  receipt: PolicyDecisionReceiptV1;
+  enclaveSignature: string;
+}
+
 /** §27 — public journal of the policy proof. Never contains prompt-derived data. */
 export interface PolicyJournal {
   protocolVersion: 1;
@@ -369,6 +396,13 @@ export type CtnErrorCode =
   | "CTN_INTENT_REPLAY"
   | "CTN_ATTESTATION_REQUIRED"
   | "CTN_ENCLAVE_UNAVAILABLE"
+  /**
+   * Phase 2b §4 — the guest executor (the authoritative gate) was unreachable.
+   * A 503-class SYSTEM failure, never a policy decision: the request fails closed
+   * with no gate, no provider, no manufactured decision receipt, and is kept out
+   * of denial metrics and the graph's denial visuals.
+   */
+  | "CTN_PROVER_UNAVAILABLE"
   /** §50 — a capability is derived once from the sealed intent and never edited. */
   | "CTN_CAPABILITY_IMMUTABLE"
   /** A credential status write that is not one of the two states a caller may set. */

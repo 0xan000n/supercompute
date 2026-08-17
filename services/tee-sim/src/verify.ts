@@ -8,7 +8,7 @@
  * so replacing the proof system does not change any caller.
  */
 import { verifyCanonical, canonicalHash, verifyDigestHex } from "@ctn/protocol";
-import type { ProofReceipt, SignedComputeReceipt, SignedProofBinding } from "@ctn/protocol";
+import type { PolicyDecision, ProofReceipt, SignedComputeReceipt, SignedProofBinding } from "@ctn/protocol";
 
 export interface VerificationCheck {
   name: string;
@@ -27,6 +27,13 @@ export function verifyProof(
     expectedGuestImageId: string;
     expectedPolicyId: string;
     expectedCommitment?: string;
+    /**
+     * Phase 2b — the decision the proof is expected to carry. DENY requests are
+     * now gated and proved too (proofStarted for ALLOW AND DENY), so the verifier
+     * checks against the expected verdict rather than hardcoding ALLOW. Defaults
+     * to ALLOW so existing callers (and the tamper tests) are unchanged.
+     */
+    expectedDecision?: PolicyDecision;
     proverPublicKey: string;
   }
 ): VerificationResult {
@@ -67,7 +74,11 @@ export function verifyProof(
     });
   }
 
-  checks.push({ name: "decision is ALLOW", pass: proof.journal.decision === "ALLOW" });
+  const expectedDecision = expected.expectedDecision ?? "ALLOW";
+  checks.push({
+    name: `decision is ${expectedDecision}`,
+    pass: proof.journal.decision === expectedDecision,
+  });
 
   // §27 — the journal must not carry prompt-derived fields. Enforced, not assumed.
   const allowedKeys = new Set([

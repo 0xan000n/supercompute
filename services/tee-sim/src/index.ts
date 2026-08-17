@@ -12,16 +12,21 @@
  */
 import Fastify from "fastify";
 import {
+  canonicalBytes,
   canonicalHash,
   canonicalJson,
   intentDigest,
+  randomHex,
+  requestCommitment,
   sha256Hex,
   toCanonicalRequest,
   type ComputeReceipt,
   type CredentialIntentV1,
+  type PolicyDecisionReceiptV1,
   type SecurePayload,
   type SecureRequestEnvelope,
   type SignedComputeReceipt,
+  type SignedPolicyDecisionReceiptV1,
   type SignedProofBinding,
 } from "@ctn/protocol";
 import { hpkeSeal } from "@ctn/protocol";
@@ -29,11 +34,17 @@ import { loadPolicyPackage } from "@ctn/policy";
 import { SimulatedTEE, SIMULATION_WARNING, vaultDecrypt, vaultEncrypt } from "./tee.js";
 import { MODEL_CATALOG } from "./catalog.js";
 import { deriveCapability, InvalidIntentError, parseIntent } from "./intent.js";
-import { AuthorizedRequest, authorizeCandidate, type CandidateRecord } from "./authorize.js";
+import {
+  AuthorizedRequest,
+  authorizeCandidate,
+  CommitmentMismatchError,
+  type CandidateRecord,
+} from "./authorize.js";
 import { buildRegistry, type ProviderOutcome } from "./providers.js";
-import { Prover } from "./prover.js";
+import { Prover, type ProofWitness } from "./prover.js";
 import { verifyAttestation, verifyProof, verifyComputeReceipt } from "./verify.js";
 import { enclaveSafe } from "./enclave-log.js";
+import { ProverClient, ProverUnavailableError, type ProverHealth } from "./prover-client.js";
 import { randomUUID } from "node:crypto";
 
 const PORT = Number(process.env.TEE_PORT ?? 4400);
@@ -43,6 +54,33 @@ const tee = await SimulatedTEE.boot({ policyIds: ["safety-v1"], policyId: pkg.po
 const prover = new Prover(tee, pkg);
 const registry = buildRegistry();
 const vaultKey = tee.unsealVaultKey();
+
+// ---------------------------------------------------------------------------
+// Phase 2b §3 — the guest executor (`:4500`) is the AUTHORITATIVE gate for every
+// request. The TypeScript policy engine no longer gates anything on the request
+// path (it is retained only for the Policy-Lab preview via `/policy-test`).
+// ---------------------------------------------------------------------------
+const PROVER_URL = process.env.CTN_PROVER_URL ?? "http://127.0.0.1:4500";
+const proverClient = new ProverClient(PROVER_URL);
+
+/**
+ * The guest's authoritative identity, learned from `/health` — `POLICY_ID_V2`
+ * and the guest image the gate runs. Distinct from the TypeScript package's
+ * `pkg.policyId`/`pkg.guestImageId`, which are the Policy-Lab PREVIEW identity.
+ * Cached lazily: if the daemon is down at boot, the gate itself is unavailable
+ * (`PROVER_UNAVAILABLE`) so no decision receipt is ever built anyway.
+ */
+let guestHealth: ProverHealth | null = null;
+async function getGuestHealth(): Promise<ProverHealth> {
+  if (guestHealth) return guestHealth;
+  guestHealth = await proverClient.health(); // throws ProverUnavailableError if down
+  return guestHealth;
+}
+// Best-effort warm-up; never fatal — a down daemon must still let this process boot.
+void getGuestHealth().then(
+  (h) => console.log(`  guest gate    : ${PROVER_URL} policyId=${h.policyId.slice(0, 12)}… image=${h.imageIdHex.slice(0, 12)}…`),
+  () => console.log(`  guest gate    : ${PROVER_URL} (UNREACHABLE at boot — requests will fail closed with PROVER_UNAVAILABLE)`)
+);
 
 console.log("");
 console.log("  ┌──────────────────────────────────────────────────────────┐");
@@ -217,12 +255,26 @@ app.post("/credentials/ingest", async (request, reply) => {
   // §13 — only ciphertext leaves the enclave; the DB never sees raw material.
   const encryptedBlob = vaultEncrypt(vaultKey, intent.secret);
 
+  // Phase 2b §5 — the request-path policy identity is the GUEST's POLICY_ID_V2.
+  // Capabilities must be minted under it so candidate discovery (keyed on the
+  // guest policyId) and the enclave's per-candidate authorization both match.
+  // Requires the guest gate to be reachable to mint capacity — you cannot onboard
+  // capacity for a policy identity the gate cannot confirm.
+  let guestPolicyId: string;
+  try {
+    guestPolicyId = (await getGuestHealth()).policyId;
+  } catch {
+    return reply.code(503).send({
+      error: { code: "CTN_ENCLAVE_UNAVAILABLE", message: "the policy gate is unavailable; cannot mint capacity" },
+    });
+  }
+
   // §5.1 — derived from the DECRYPTED INTENT alone. Anything else in the HTTP
   // body is ignored by construction.
   const capability = deriveCapability({
     intent,
     blobDigest: "0x" + sha256Hex(encryptedBlob),
-    resolvePolicyId: (p) => (p === "safety-v1" ? pkg.policyId : p),
+    resolvePolicyId: (p) => (p === "safety-v1" ? guestPolicyId : p),
     now: Date.now(),
   });
   consumedIntentDigests.add(digest);
@@ -236,7 +288,7 @@ app.post("/credentials/ingest", async (request, reply) => {
     // Keyed to the enclave's private signing key AND bound to this credential
     // id, so ingestion cannot be used as a guess-checking oracle. See tee.ts.
     keyFingerprint: "0x" + tee.fingerprint(intent.credentialId, intent.secret),
-    policyId: pkg.policyId,
+    policyId: guestPolicyId,
   };
 });
 
@@ -271,112 +323,234 @@ export interface AttemptRecord {
   assumedSpendMicroUsd?: number;
 }
 
-app.post("/execute", async (request, reply) => {
-  const receivedAt = new Date().toISOString();
-  const t0 = performance.now();
-  const { envelope, candidates } = request.body as ExecuteBody;
+/** A gate refusal that maps to a fixed HTTP status + code. Never carries bytes. */
+class GateError extends Error {
+  constructor(
+    readonly httpStatus: number,
+    readonly code: string,
+    message: string
+  ) {
+    super(message);
+    this.name = "GateError";
+  }
+}
 
+/**
+ * The outcome of gating a request against the GUEST executor. `authorized` is
+ * present only for ALLOW (§69 type-state: it cannot exist for a denied request),
+ * and `decisionReceipt` is the signed PolicyDecisionReceiptV1 for the verdict.
+ */
+interface GateOutcome {
+  requestId: string;
+  canonical: ReturnType<typeof toCanonicalRequest>;
+  payload: SecurePayload;
+  commitment: string;
+  decision: "ALLOW" | "DENY";
+  authorized: AuthorizedRequest | null;
+  decisionReceipt: SignedPolicyDecisionReceiptV1;
+  gateWallMs: number;
+  decryptMs: number;
+}
+
+/**
+ * Phase 2b §3 — THE gate. Decrypts the envelope, canonicalizes, then calls the
+ * guest executor (`:4500`), which is authoritative for the verdict AND computes
+ * the request commitment itself. The enclave recomputes that commitment and
+ * asserts equality (determinism guard, fail closed), then signs a
+ * PolicyDecisionReceiptV1 for the verdict — ALLOW or DENY. Throws:
+ *   • ProverUnavailableError  → PROVER_UNAVAILABLE (system failure, no decision)
+ *   • CommitmentMismatchError → CTN_COMMITMENT_MISMATCH (fail closed)
+ *   • GateError               → the envelope/replay codes the legacy path used
+ * The TypeScript policy engine is NOT consulted here; it gates nothing.
+ */
+async function gateRequest(envelope: SecureRequestEnvelope): Promise<GateOutcome> {
   if (!envelope || envelope.version !== "ctn-1") {
-    return reply.code(400).send({ error: { code: "CTN_INVALID_ENVELOPE", message: "bad envelope version" } });
+    throw new GateError(400, "CTN_INVALID_ENVELOPE", "bad envelope version");
   }
   if (envelope.enclaveKeyId !== tee.enclaveKeyId) {
-    return reply.code(400).send({
-      error: { code: "CTN_INVALID_ENVELOPE", message: "envelope encrypted to an unknown enclave key id" },
-    });
+    throw new GateError(400, "CTN_INVALID_ENVELOPE", "envelope encrypted to an unknown enclave key id");
   }
 
   // AAD binds the non-secret envelope header to the ciphertext: flipping the
   // requested policy in transit breaks decryption instead of silently applying.
   const aad = new TextEncoder().encode(canonicalJson(envelope.aad));
-
   let payload: SecurePayload;
   let decryptMs: number;
   try {
     const d0 = performance.now();
-    const opened = await tee.openIngress(
-      { enc: envelope.enc, ciphertext: envelope.ciphertext },
-      aad
-    );
+    const opened = await tee.openIngress({ enc: envelope.enc, ciphertext: envelope.ciphertext }, aad);
     decryptMs = Math.max(1, Math.round(performance.now() - d0));
     payload = JSON.parse(new TextDecoder().decode(opened)) as SecurePayload;
   } catch {
-    return reply
-      .code(400)
-      .send({ error: { code: "CTN_INVALID_ENVELOPE", message: "envelope failed authenticated decryption" } });
+    throw new GateError(400, "CTN_INVALID_ENVELOPE", "envelope failed authenticated decryption");
   }
 
   if (!rememberNonce(payload.requestNonce)) {
-    return reply
-      .code(409)
-      .send({ error: { code: "CTN_INVALID_ENVELOPE", message: "request nonce already used (replay rejected)" } });
+    throw new GateError(409, "CTN_INVALID_ENVELOPE", "request nonce already used (replay rejected)");
   }
 
   let canonical;
   try {
     canonical = toCanonicalRequest(payload.request);
   } catch (err) {
-    return reply.code(400).send({
-      error: {
-        code: "CTN_INVALID_ENVELOPE",
-        message: err instanceof Error ? err.message : "request failed canonicalization",
-      },
-    });
+    throw new GateError(400, "CTN_INVALID_ENVELOPE", err instanceof Error ? err.message : "request failed canonicalization");
   }
 
   // The routing header must agree with the sealed request. If a coordinator
   // rewrote the header to route to different capacity, this fails closed.
   if (envelope.aad.model !== canonical.model) {
-    return reply.code(400).send({
-      error: {
-        code: "CTN_INVALID_ENVELOPE",
-        message: "routing header model does not match the sealed request model",
-      },
+    throw new GateError(400, "CTN_INVALID_ENVELOPE", "routing header model does not match the sealed request model");
+  }
+
+  // The authoritative gate. The wire shape is the JCS canonical request; the
+  // guest computes the commitment from these exact bytes and the nonce.
+  const canonicalRequestBytes = canonicalJson(canonical);
+  const proofNonce = randomHex(32);
+  const g0 = performance.now();
+  let execResult;
+  try {
+    execResult = await proverClient.execute({
+      canonicalRequestBytes,
+      requestNonceHex: payload.requestNonce,
+      proofNonce,
+      emitScores: false,
     });
+  } catch (err) {
+    if (err instanceof ProverUnavailableError) throw err; // → PROVER_UNAVAILABLE
+    // A responding daemon that faulted on well-formed bytes is our bug, not a
+    // verdict: fail closed rather than fabricate a decision.
+    throw new GateError(500, "CTN_INTERNAL", "the guest executor rejected the gate request");
   }
+  const gateWallMs = Math.max(1, Math.round(performance.now() - g0));
 
-  // §25 — the single gate. Nothing downstream can run without an AuthorizedRequest.
-  const gate = AuthorizedRequest.evaluate(canonical, payload.requestNonce, pkg);
+  // Determinism guard — assert the guest evaluated the same bytes we will act on.
+  const gate = AuthorizedRequest.fromGuestJournal(
+    canonical,
+    payload.requestNonce,
+    execResult.journal,
+    gateWallMs
+  ); // throws CommitmentMismatchError on mismatch
 
-  if (gate.decision === "DENY") {
-    // Rule 5 / §33 — no credential decryption, no provider call, no reason leaked.
-    return {
-      requestId: envelope.requestId,
-      status: "DENIED" as const,
-      commitment: gate.commitment,
-      policyId: pkg.policyId,
-      policyDecision: "DENY" as const,
-      policyMs: gate.policyMs,
-      model: canonical.model,
-      encryptedResponse: null,
-      receipt: null,
-      attempts: [] as AttemptRecord[],
-      selected: null,
-      authorizationFailures: [],
-      proofStarted: false,
-      timings: { enclaveDecryptMs: decryptMs, policyMs: gate.policyMs, totalMs: Math.round(performance.now() - t0) },
-      error: {
-        code: "CTN_POLICY_DENIED",
-        message: "Request was not eligible under Safety Policy v1.",
-      },
-      // Local development only: never returned when CTN_ENV is demo/production.
-      debug:
-        process.env.CTN_ENV === "local"
-          ? {
-              categories: gate.evaluation.categories.filter((c) => c.matchedTargets.length > 0),
-              hardBlock: gate.evaluation.hardBlock,
-              intentPresent: gate.evaluation.intentPresent,
-              modifiersApplied: gate.evaluation.modifiersApplied,
-            }
-          : undefined,
-    };
+  // A successful execute means the daemon is up, so /health is reachable for the
+  // image id. policyId comes from the journal the guest actually committed.
+  const health = await getGuestHealth();
+  const receipt: PolicyDecisionReceiptV1 = {
+    requestId: envelope.requestId,
+    requestCommitment: gate.commitment,
+    policyId: execResult.journal.policyId,
+    decision: gate.decision,
+    imageId: health.imageIdHex,
+    timing: { gateWallMs },
+  };
+  const decisionReceipt: SignedPolicyDecisionReceiptV1 = {
+    receipt,
+    enclaveSignature: tee.signReceipt(receipt),
+  };
+
+  return {
+    requestId: envelope.requestId,
+    canonical,
+    payload,
+    commitment: gate.commitment,
+    decision: gate.decision,
+    authorized: gate.decision === "ALLOW" ? gate.authorized : null,
+    decisionReceipt,
+    gateWallMs,
+    decryptMs,
+  };
+}
+
+/** The private witness a proof is generated over — ALLOW and DENY alike. */
+function witnessFor(outcome: GateOutcome): ProofWitness {
+  return {
+    canonicalRequest: canonicalJson(outcome.canonical),
+    requestNonce: outcome.payload.requestNonce,
+    requestCommitment: outcome.commitment,
+    decision: outcome.decision,
+  };
+}
+
+/**
+ * Phase 2b §3 — the gate runs BEFORE candidate discovery, so the coordinator
+ * gates (`/gate`), then discovers on the guest policyId, then dispatches
+ * (`/execute`). An ALLOW gate outcome — which holds the plaintext witness the
+ * dispatch needs — is parked here between the two calls. Bounded + TTL like the
+ * nonce window: a single-operator demo dispatches within milliseconds, and an
+ * abandoned gate (e.g. no-capacity, where the coordinator never dispatches) is
+ * evicted rather than retained.
+ */
+const pendingGates = new Map<string, { outcome: GateOutcome; at: number }>();
+const PENDING_TTL_MS = 5 * 60 * 1000;
+const PENDING_MAX = 10_000;
+function rememberGate(outcome: GateOutcome): void {
+  const now = Date.now();
+  if (pendingGates.size >= PENDING_MAX) {
+    for (const [k, v] of pendingGates) if (now - v.at > PENDING_TTL_MS) pendingGates.delete(k);
+    while (pendingGates.size >= PENDING_MAX) {
+      const oldest = pendingGates.keys().next();
+      if (oldest.done) break;
+      pendingGates.delete(oldest.value);
+    }
   }
+  pendingGates.set(outcome.requestId, { outcome, at: now });
+}
 
-  const authorized = gate.authorized;
+/** Map a gate throw onto the HTTP reply. Shared by `/gate` and `/execute`. */
+function replyGateError(reply: import("fastify").FastifyReply, err: unknown): boolean {
+  if (err instanceof ProverUnavailableError) {
+    reply.code(503).send({ error: { code: "PROVER_UNAVAILABLE", message: "the guest executor (policy gate) is unavailable" } });
+    return true;
+  }
+  if (err instanceof CommitmentMismatchError) {
+    reply.code(500).send({ error: { code: "CTN_COMMITMENT_MISMATCH", message: err.message } });
+    return true;
+  }
+  if (err instanceof GateError) {
+    reply.code(err.httpStatus).send({ error: { code: err.code, message: err.message } });
+    return true;
+  }
+  return false;
+}
 
-  // §25 branch A — proving starts now and is NOT awaited (§26).
-  prover.start(envelope.requestId, authorized);
+/** The DENY result shape — no credential decrypted, no provider called (Rule 5). */
+function deniedBody(outcome: GateOutcome) {
+  return {
+    requestId: outcome.requestId,
+    status: "DENIED" as const,
+    commitment: outcome.commitment,
+    policyId: outcome.decisionReceipt.receipt.policyId,
+    policyDecision: "DENY" as const,
+    policyMs: outcome.gateWallMs,
+    model: outcome.canonical.model,
+    encryptedResponse: null,
+    receipt: null,
+    attempts: [] as AttemptRecord[],
+    selected: null,
+    authorizationFailures: [],
+    proofStarted: true,
+    decisionReceipt: outcome.decisionReceipt,
+    timings: {
+      enclaveDecryptMs: outcome.decryptMs,
+      policyMs: outcome.gateWallMs,
+      gateWallMs: outcome.gateWallMs,
+      totalMs: outcome.gateWallMs,
+    },
+    error: { code: "CTN_POLICY_DENIED", message: "Request was not eligible under Safety Policy v1." },
+  };
+}
 
-  // §25 branch B — routing, credential decryption, upstream call.
+/**
+ * §25 branch B — routing, credential decryption, upstream call. Runs only after
+ * an ALLOW gate; `outcome.authorized` is the §69 proof that policy allowed.
+ */
+async function runDispatch(outcome: GateOutcome, candidates: CandidateRecord[]) {
+  const receivedAt = new Date().toISOString();
+  const t0 = performance.now();
+  const authorized = outcome.authorized!;
+  const payload = outcome.payload;
+  const decryptMs = outcome.decryptMs;
+  const gateWallMs = outcome.gateWallMs;
+
   const attempts: AttemptRecord[] = [];
   const authorizationFailures = [];
   let success: { outcome: Extract<ProviderOutcome, { ok: true }>; credentialId: string; contributorId: string; provider: string; attempt: number } | null = null;
@@ -400,24 +574,24 @@ app.post("/execute", async (request, reply) => {
     }
 
     attemptNumber += 1;
-    const outcome = await adapter.complete(authorized, authz.credential);
+    const providerOutcome = await adapter.complete(authorized, authz.credential);
 
     // Rule 6 — every provider call produces a ProviderAttempt, success or not.
     attempts.push({
       credentialId: candidate.credentialId,
       contributorId: candidate.contributorId,
       attemptNumber,
-      status: outcome.ok ? "SUCCESS" : "FAILED",
-      httpStatus: outcome.ok ? outcome.response.httpStatus : outcome.httpStatus,
-      latencyMs: outcome.ok ? outcome.response.latencyMs : outcome.latencyMs,
-      classification: outcome.ok ? undefined : outcome.classification,
-      upstreamOutcomeUnknown: outcome.ok ? undefined : outcome.upstreamOutcomeUnknown,
-      assumedSpendMicroUsd: outcome.ok ? undefined : outcome.assumedSpendMicroUsd,
+      status: providerOutcome.ok ? "SUCCESS" : "FAILED",
+      httpStatus: providerOutcome.ok ? providerOutcome.response.httpStatus : providerOutcome.httpStatus,
+      latencyMs: providerOutcome.ok ? providerOutcome.response.latencyMs : providerOutcome.latencyMs,
+      classification: providerOutcome.ok ? undefined : providerOutcome.classification,
+      upstreamOutcomeUnknown: providerOutcome.ok ? undefined : providerOutcome.upstreamOutcomeUnknown,
+      assumedSpendMicroUsd: providerOutcome.ok ? undefined : providerOutcome.assumedSpendMicroUsd,
     });
 
-    if (outcome.ok) {
+    if (providerOutcome.ok) {
       success = {
-        outcome,
+        outcome: providerOutcome,
         credentialId: candidate.credentialId,
         contributorId: candidate.contributorId,
         provider: candidate.provider,
@@ -425,15 +599,10 @@ app.post("/execute", async (request, reply) => {
       };
       break;
     }
-    lastFailure = outcome;
-    // §5.1 single dispatch — the prompt has now been sent upstream once.
-    // Sending it again (to another credential, another provider) would double
-    // both the spend risk and the exposure surface, and an outcome we could not
-    // classify is not evidence that nothing happened. Only provably
-    // pre-dispatch failures may try the next candidate; the coordinator still
-    // applies disable/cooldown from the classification we report, so the
-    // fallback story survives at request granularity (§18).
-    if (!PRE_DISPATCH_CLASSIFICATIONS.has(outcome.classification)) break;
+    lastFailure = providerOutcome;
+    // §5.1 single dispatch — the prompt has now been sent upstream once. Only
+    // provably pre-dispatch failures may try the next candidate.
+    if (!PRE_DISPATCH_CLASSIFICATIONS.has(providerOutcome.classification)) break;
   }
 
   if (!success) {
@@ -446,20 +615,21 @@ app.post("/execute", async (request, reply) => {
             ? "CTN_PROVIDER_ERROR"
             : "CTN_NO_CAPACITY";
     return {
-      requestId: envelope.requestId,
+      requestId: outcome.requestId,
       status: "FAILED" as const,
       commitment: authorized.requestCommitment,
-      policyId: pkg.policyId,
+      policyId: outcome.decisionReceipt.receipt.policyId,
       policyDecision: "ALLOW" as const,
-      policyMs: gate.policyMs,
-      model: canonical.model,
+      policyMs: gateWallMs,
+      model: outcome.canonical.model,
       encryptedResponse: null,
       receipt: null,
       attempts,
       selected: null,
       authorizationFailures,
       proofStarted: true,
-      timings: { enclaveDecryptMs: decryptMs, policyMs: gate.policyMs, totalMs: Math.round(performance.now() - t0) },
+      decisionReceipt: outcome.decisionReceipt,
+      timings: { enclaveDecryptMs: decryptMs, policyMs: gateWallMs, gateWallMs, totalMs: Math.round(performance.now() - t0) },
       error: {
         code,
         message:
@@ -470,12 +640,13 @@ app.post("/execute", async (request, reply) => {
     };
   }
 
-  const { outcome } = success;
+  const providerSuccess = success.outcome;
   const totalMs = Math.round(performance.now() - t0);
 
-  // §30 — the compute receipt. Signed here, so it binds the attested enclave to
-  // the commitment, the policy proof, the route and the usage.
-  const proofRecord = prover.get(envelope.requestId);
+  // §30 — the compute receipt. Its `policy.policyId` stays the SIMULATED prover's
+  // preview identity (`pkg.policyId`) in this build phase so the proof↔receipt
+  // binding still verifies; Task 3 migrates the proof to the guest identity.
+  const proofRecord = prover.get(outcome.requestId);
   const zkReceiptDigest =
     proofRecord && (proofRecord.state.status === "GENERATED" || proofRecord.state.status === "VERIFIED")
       ? proofRecord.state.digest
@@ -483,7 +654,7 @@ app.post("/execute", async (request, reply) => {
 
   const receipt: ComputeReceipt = {
     version: "ctn-receipt-1",
-    requestId: envelope.requestId,
+    requestId: outcome.requestId,
     requestCommitment: authorized.requestCommitment,
     tee: { mode: tee.mode, buildId: tee.buildId, attestationDigest: tee.attestationDigest() },
     policy: { policyId: pkg.policyId, decision: "ALLOW", zkReceiptDigest },
@@ -495,18 +666,18 @@ app.post("/execute", async (request, reply) => {
       attempt: success.attempt,
     },
     usage: {
-      inputTokens: outcome.response.inputTokens,
-      outputTokens: outcome.response.outputTokens,
-      estimatedCostMicroUsd: outcome.response.estimatedCostMicroUsd,
-      pricingTableDigest: outcome.response.pricingTableDigest,
+      inputTokens: providerSuccess.response.inputTokens,
+      outputTokens: providerSuccess.response.outputTokens,
+      estimatedCostMicroUsd: providerSuccess.response.estimatedCostMicroUsd,
+      pricingTableDigest: providerSuccess.response.pricingTableDigest,
     },
     timing: {
       receivedAt,
-      policyMs: gate.policyMs,
-      providerTotalMs: outcome.response.latencyMs,
+      policyMs: gateWallMs,
+      providerTotalMs: providerSuccess.response.latencyMs,
     },
-    upstreamRequestHash: outcome.response.upstreamRequestHash,
-    upstreamResponseHash: outcome.response.upstreamResponseHash,
+    upstreamRequestHash: providerSuccess.response.upstreamRequestHash,
+    upstreamResponseHash: providerSuccess.response.upstreamResponseHash,
   };
   const signed: SignedComputeReceipt = { receipt, enclaveSignature: tee.signReceipt(receipt) };
 
@@ -516,24 +687,24 @@ app.post("/execute", async (request, reply) => {
     payload.responsePublicKey,
     new TextEncoder().encode(
       JSON.stringify({
-        requestId: envelope.requestId,
+        requestId: outcome.requestId,
         model: authorized.request.model,
-        content: outcome.response.content,
+        content: providerSuccess.response.content,
         usage: {
-          inputTokens: outcome.response.inputTokens,
-          outputTokens: outcome.response.outputTokens,
+          inputTokens: providerSuccess.response.inputTokens,
+          outputTokens: providerSuccess.response.outputTokens,
         },
       })
     )
   );
 
   return {
-    requestId: envelope.requestId,
+    requestId: outcome.requestId,
     status: "COMPLETE" as const,
     commitment: authorized.requestCommitment,
-    policyId: pkg.policyId,
+    policyId: outcome.decisionReceipt.receipt.policyId,
     policyDecision: "ALLOW" as const,
-    policyMs: gate.policyMs,
+    policyMs: gateWallMs,
     model: authorized.request.model,
     encryptedResponse: sealed,
     receipt: signed,
@@ -547,14 +718,80 @@ app.post("/execute", async (request, reply) => {
     },
     authorizationFailures,
     proofStarted: true,
+    decisionReceipt: outcome.decisionReceipt,
     usage: receipt.usage,
     timings: {
       enclaveDecryptMs: decryptMs,
-      policyMs: gate.policyMs,
-      providerTotalMs: outcome.response.latencyMs,
+      policyMs: gateWallMs,
+      gateWallMs,
+      providerTotalMs: providerSuccess.response.latencyMs,
       totalMs,
     },
   };
+}
+
+/**
+ * Phase 2b §3 — the gate, called by the coordinator BEFORE candidate discovery.
+ * Signs a PolicyDecisionReceiptV1 for EVERY request and enqueues a proof for the
+ * verdict (ALLOW AND DENY). ALLOW outcomes are parked for the follow-up
+ * `/execute` (dispatch). A `PROVER_UNAVAILABLE` here is a system failure with no
+ * decision and no receipt at all.
+ */
+app.post("/gate", async (request, reply) => {
+  const { envelope } = request.body as { envelope: SecureRequestEnvelope };
+  let outcome: GateOutcome;
+  try {
+    outcome = await gateRequest(envelope);
+  } catch (err) {
+    if (replyGateError(reply, err)) return;
+    throw err;
+  }
+  // Enqueue the proof of the verdict immediately — ALLOW AND DENY.
+  prover.start(outcome.requestId, witnessFor(outcome));
+  if (outcome.decision === "ALLOW") rememberGate(outcome);
+
+  return {
+    requestId: outcome.requestId,
+    status: outcome.decision,
+    decision: outcome.decision,
+    commitment: outcome.commitment,
+    policyId: outcome.decisionReceipt.receipt.policyId,
+    imageId: outcome.decisionReceipt.receipt.imageId,
+    model: outcome.canonical.model,
+    decisionReceipt: outcome.decisionReceipt,
+    proofStarted: true,
+    gateWallMs: outcome.gateWallMs,
+    timings: { enclaveDecryptMs: outcome.decryptMs, gateWallMs: outcome.gateWallMs, policyMs: outcome.gateWallMs },
+  };
+});
+
+/**
+ * The dispatch phase (ALLOW only). If a prior `/gate` parked this request, that
+ * ALLOW outcome is consumed (no re-decrypt, no re-gate). A direct caller that
+ * posts an envelope with no prior `/gate` still works: the request is gated
+ * inline and then dispatched in one shot (the enclave's own security tests use
+ * this path). Either way the guest is the authoritative gate.
+ */
+app.post("/execute", async (request, reply) => {
+  const { envelope, candidates } = request.body as ExecuteBody;
+  const parked = envelope?.requestId ? pendingGates.get(envelope.requestId) : undefined;
+
+  let outcome: GateOutcome;
+  if (parked) {
+    pendingGates.delete(envelope.requestId);
+    outcome = parked.outcome;
+  } else {
+    try {
+      outcome = await gateRequest(envelope);
+    } catch (err) {
+      if (replyGateError(reply, err)) return;
+      throw err;
+    }
+    prover.start(outcome.requestId, witnessFor(outcome));
+  }
+
+  if (outcome.decision === "DENY") return deniedBody(outcome);
+  return await runDispatch(outcome, candidates ?? []);
 });
 
 /** §32 — proof state is polled because proving may finish after inference. */
@@ -575,6 +812,9 @@ app.get("/proofs/:requestId", async (request, reply) => {
     expectedGuestImageId: pkg.guestImageId,
     expectedPolicyId: pkg.policyId,
     expectedCommitment: proof.journal.requestCommitment,
+    // DENY requests are gated and proved too; the decision was locked against the
+    // gate verdict at generation time, so re-verify against the journal's own.
+    expectedDecision: proof.journal.decision,
     proverPublicKey: tee.proverPublicKey,
   });
   return {
@@ -613,10 +853,19 @@ app.post("/policy-test", async (request, reply) => {
 
   const canonical = toCanonicalRequest(payload.request);
   const testId = `ptest_${randomUUID().replace(/-/g, "").slice(0, 20)}`;
+  // Policy Lab is the PREVIEW surface (§5): it deliberately runs the TypeScript
+  // engine, not the guest gate, and is labelled non-authoritative. This is the
+  // one remaining request-shaped caller of `AuthorizedRequest.evaluate`.
   const gate = AuthorizedRequest.evaluate(canonical, payload.requestNonce, pkg);
 
   if (gate.decision === "ALLOW") {
-    prover.start(testId, gate.authorized);
+    const w = gate.authorized.witness();
+    prover.start(testId, {
+      canonicalRequest: w.canonicalRequest,
+      requestNonce: w.requestNonce,
+      requestCommitment: gate.commitment,
+      decision: "ALLOW",
+    });
   }
   return {
     testId,

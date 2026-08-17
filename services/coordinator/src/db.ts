@@ -112,6 +112,21 @@ export function migrate(): void {
       completed_at    TEXT
     );
 
+    -- Phase 2b §4 — the enclave-signed PolicyDecisionReceiptV1 for EVERY gated
+    -- request (ALLOW and DENY, including no-capacity). A PROVER_UNAVAILABLE system
+    -- failure deliberately writes NO row here: it has no decision to receipt.
+    CREATE TABLE IF NOT EXISTS decision_receipts (
+      request_id   TEXT PRIMARY KEY REFERENCES requests(id),
+      policy_id    TEXT NOT NULL,
+      decision     TEXT NOT NULL,
+      image_id     TEXT NOT NULL,
+      commitment   TEXT NOT NULL,
+      gate_wall_ms INTEGER,
+      receipt_json TEXT NOT NULL,
+      signature    TEXT NOT NULL,
+      created_at   TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS compute_receipts (
       id           TEXT PRIMARY KEY,
       request_id   TEXT NOT NULL REFERENCES requests(id),

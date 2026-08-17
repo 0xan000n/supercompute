@@ -18,7 +18,7 @@
  * case failed.
  */
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
@@ -35,10 +35,12 @@ import {
 // HTTP and never imports its module graph.
 import type { ProviderOutcome } from "../services/tee-sim/src/providers.js";
 import {
+  canonicalBytes,
   canonicalJson,
   generateHpkeKeyPair,
   hpkeSeal,
   randomHex,
+  requestCommitment,
   toCanonicalRequest,
   type ComputeReceipt,
   type CredentialIntentV1,
@@ -1642,6 +1644,241 @@ async function runRealProviderSmoke(
 }
 
 // ---------------------------------------------------------------------------
+// PHASE 2B — GATE-PATH RESTRUCTURING
+//
+// The guest executor (:4500) is the authoritative gate for EVERY request, run
+// BEFORE candidate discovery. Every gated request gets a signed
+// PolicyDecisionReceiptV1 and an enqueued proof (ALLOW and DENY, including
+// no-capacity). PROVER_UNAVAILABLE is a system failure, never a decision.
+// ---------------------------------------------------------------------------
+
+const PROVER_URL = process.env.CTN_PROVER_URL ?? "http://127.0.0.1:4500";
+
+/** The guest gate's authoritative POLICY_ID_V2, from the daemon /health. */
+async function guestPolicyId(): Promise<string> {
+  return ((await (await fetch(`${PROVER_URL}/health`)).json()) as { policyId: string }).policyId;
+}
+/** The TypeScript package's PREVIEW policy id (must differ from the guest's). */
+async function previewPolicyId(): Promise<string> {
+  return ((await (await fetch(`${COORD}/v1/policy`)).json()) as { policyId: string }).policyId;
+}
+async function requestDetail(id: string): Promise<any> {
+  return await (await fetch(`${COORD}/v1/requests/${id}`)).json();
+}
+
+/** All ACTIVE credentials disabled for the duration of `fn`, then restored. */
+async function withNoCapacity<T>(fn: () => Promise<T>): Promise<T> {
+  const activeIds = (await getCredentials()).filter((c) => c.status === "ACTIVE").map((c) => c.id as string);
+  for (const id of activeIds) await patchCredential(id, { status: "DISABLED" });
+  try {
+    return await fn();
+  } finally {
+    for (const id of activeIds) await patchCredential(id, { status: "ACTIVE" });
+  }
+}
+
+async function run2b_1(): Promise<void> {
+  await test("2b.1", "no-capacity ALLOW: gated (decision receipt under the guest policyId), proved, returns CTN_NO_CAPACITY", async () => {
+    const [guest, preview] = await Promise.all([guestPolicyId(), previewPolicyId()]);
+    assert(guest !== preview, `the guest and preview policy ids must differ (guest=${guest}, preview=${preview})`);
+
+    return await withNoCapacity(async () => {
+      let code: string | undefined;
+      let requestId: string | undefined;
+      try {
+        await client.completion({ model: MODEL_A, messages: [{ role: "user", content: `nocap-allow ${randomUUID()}` }] });
+      } catch (err) {
+        code = err instanceof CtnApiError ? err.code : `non-CtnApiError: ${String(err)}`;
+        requestId = err instanceof CtnApiError ? err.requestId : undefined;
+      }
+      assert(code === "CTN_NO_CAPACITY", `expected CTN_NO_CAPACITY, got ${code}`);
+      assert(requestId, "the no-capacity request surfaced no request id");
+
+      const detail = await requestDetail(requestId);
+      const dr = detail.policyDecisionReceipt;
+      assert(dr, "a gated no-capacity request must still have a PolicyDecisionReceiptV1");
+      assert(dr.receipt.decision === "ALLOW", `expected ALLOW verdict, got ${dr.receipt.decision}`);
+      assert(dr.receipt.policyId === guest, `decision receipt policyId ${dr.receipt.policyId} must equal the daemon /health policyId ${guest}`);
+      assert(dr.receipt.policyId !== preview, `decision receipt policyId must NOT be the preview pkg.policyId ${preview}`);
+      assert(detail.proof && detail.proof.status !== "NOT_REQUIRED", `a proof must be enqueued for the gated request, got ${JSON.stringify(detail.proof)}`);
+      assert(detail.request.status === "FAILED" && detail.request.errorCode === "CTN_NO_CAPACITY", `expected FAILED/CTN_NO_CAPACITY, got ${detail.request.status}/${detail.request.errorCode}`);
+      return `ALLOW gated under guest ${guest.slice(0, 14)}… (≠ preview ${preview.slice(0, 10)}…), proof=${detail.proof.status}, returned CTN_NO_CAPACITY`;
+    });
+  });
+}
+
+async function run2b_2(): Promise<void> {
+  await test("2b.2", "DENY is gated AND proved, zero provider calls (proofStarted true for DENY)", async () => {
+    const mockBefore = fileSize(MOCK_LOG_PATH);
+    let requestId: string | undefined;
+    try {
+      await client.completion({ model: MODEL_A, messages: [{ role: "user", content: DENY_PROMPT }] });
+      throw new Error("expected a PolicyDeniedError, the request unexpectedly succeeded");
+    } catch (err) {
+      if (err instanceof PolicyDeniedError) requestId = err.requestId;
+      else throw err;
+    }
+    assert(requestId, "no requestId captured from the denial");
+    const detail = await requestDetail(requestId);
+    assert(detail.request.status === "DENIED", `expected DENIED, got ${detail.request.status}`);
+    assert(detail.attempts.length === 0, `expected 0 provider attempts, got ${detail.attempts.length}`);
+    assert(fileSize(MOCK_LOG_PATH) === mockBefore, "mock-provider log grew despite a DENY decision");
+    const dr = detail.policyDecisionReceipt;
+    assert(dr && dr.receipt.decision === "DENY", `expected a signed DENY decision receipt, got ${JSON.stringify(dr?.receipt)}`);
+    // The whole point of Phase 2b: DENY is proved too.
+    assert(detail.proof && detail.proof.status !== "NOT_REQUIRED", `expected a proof enqueued for DENY, got ${JSON.stringify(detail.proof)}`);
+    return `DENY gated+proved (proof=${detail.proof.status}), 0 provider calls, receipt.decision=DENY`;
+  });
+}
+
+async function run2b_3(): Promise<void> {
+  await test("2b.3", "gate BEFORE discovery: a no-capacity DENY still denies (and proves), not CTN_NO_CAPACITY", async () => {
+    return await withNoCapacity(async () => {
+      const mockBefore = fileSize(MOCK_LOG_PATH);
+      let requestId: string | undefined;
+      let code: string | undefined;
+      try {
+        await client.completion({ model: MODEL_A, messages: [{ role: "user", content: DENY_PROMPT }] });
+      } catch (err) {
+        if (err instanceof PolicyDeniedError) {
+          requestId = err.requestId;
+          code = "CTN_POLICY_DENIED";
+        } else {
+          code = err instanceof CtnApiError ? err.code : String(err);
+          requestId = err instanceof CtnApiError ? err.requestId : undefined;
+        }
+      }
+      // If discovery ran before the gate, this would be CTN_NO_CAPACITY. The gate
+      // runs first, so a denied prompt is denied regardless of capacity.
+      assert(code === "CTN_POLICY_DENIED", `gate must precede discovery: expected CTN_POLICY_DENIED, got ${code}`);
+      assert(requestId, "no requestId captured");
+      const detail = await requestDetail(requestId);
+      assert(detail.request.status === "DENIED", `expected DENIED, got ${detail.request.status}`);
+      assert(detail.attempts.length === 0, "expected 0 provider attempts");
+      assert(fileSize(MOCK_LOG_PATH) === mockBefore, "mock-provider log grew despite a DENY decision");
+      assert(detail.policyDecisionReceipt?.receipt.decision === "DENY", "expected a DENY decision receipt");
+      assert(detail.proof && detail.proof.status !== "NOT_REQUIRED", "expected a proof enqueued for the no-capacity DENY");
+      return `no-capacity DENY → ${code} (not CTN_NO_CAPACITY), proof=${detail.proof.status}`;
+    });
+  });
+}
+
+async function run2b_4(): Promise<void> {
+  await test("2b.4", "commitment guard: a guest journal whose commitment != the enclave recomputation is rejected (fail closed)", async () => {
+    const modUrl = pathToFileURL(join(ROOT, "services/tee-sim/src/authorize.ts")).href;
+    const mod = await import(modUrl);
+    const canonical = toCanonicalRequest({ model: MODEL_A, messages: [{ role: "user", content: "benign gate probe" }] });
+    const nonce = randomHex(32);
+
+    // A journal that claims a DIFFERENT commitment than the enclave will recompute.
+    const badJournal = { requestCommitment: "0x" + "de".repeat(32), decision: "ALLOW", policyId: "0xpreview" };
+    let threw = false;
+    let typed = false;
+    try {
+      mod.AuthorizedRequest.fromGuestJournal(canonical, nonce, badJournal, 1);
+    } catch (e) {
+      threw = true;
+      typed = e instanceof mod.CommitmentMismatchError;
+    }
+    assert(threw && typed, "fromGuestJournal must throw CommitmentMismatchError on a commitment mismatch");
+
+    let guardThrew = false;
+    try {
+      mod.assertGuestCommitment("0xaaaa", "0xbbbb");
+    } catch {
+      guardThrew = true;
+    }
+    assert(guardThrew, "assertGuestCommitment must throw when the two commitments differ");
+
+    // Control: a MATCHING commitment is accepted and yields an ALLOW authorization.
+    const good = {
+      requestCommitment: requestCommitment(canonicalBytes(canonical), nonce),
+      decision: "ALLOW" as const,
+      policyId: await guestPolicyId(),
+    };
+    const ok = mod.AuthorizedRequest.fromGuestJournal(canonical, nonce, good, 1);
+    assert(ok.decision === "ALLOW" && ok.authorized, "a matching commitment must be accepted as ALLOW");
+    return "mismatched guest commitment rejected (fail closed); matching commitment accepted";
+  });
+}
+
+// ---- daemon lifecycle for the PROVER_UNAVAILABLE case ----
+
+function daemonPidOn4500(): string | undefined {
+  try {
+    return execSync(`lsof -iTCP:4500 -sTCP:LISTEN -t`, { encoding: "utf8" }).trim().split("\n")[0]?.trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+async function waitDaemon(up: boolean, timeoutMs = 20000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const ok = await fetch(`${PROVER_URL}/health`).then((r) => r.ok).catch(() => false);
+    if (ok === up) return true;
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  return false;
+}
+async function restartDaemon(): Promise<void> {
+  const bin = join(ROOT, "prover/target/release/host");
+  const child = spawn(bin, ["--serve", "--port", "4500"], { detached: true, stdio: "ignore", env: process.env });
+  child.unref();
+  await waitDaemon(true, 20000);
+}
+
+async function run2b_5(): Promise<void> {
+  await test("2b.5", "PROVER_UNAVAILABLE: gate down → system-failure record, no dispatch, no decision receipt, absent from denial metrics", async () => {
+    const pid = daemonPidOn4500();
+    assert(pid, "could not find the :4500 daemon to take it down for this case");
+    const mockBefore = fileSize(MOCK_LOG_PATH);
+    const statsBefore = await (await fetch(`${COORD}/v1/stats`)).json();
+
+    try {
+      execSync(`kill -9 ${pid}`);
+      const down = await waitDaemon(false, 10000);
+      assert(down, "the :4500 daemon did not go down");
+
+      let code: string | undefined;
+      let requestId: string | undefined;
+      try {
+        await client.completion({ model: MODEL_A, messages: [{ role: "user", content: `prover-down ${randomUUID()}` }] });
+      } catch (err) {
+        if (err instanceof PolicyDeniedError) code = "CTN_POLICY_DENIED";
+        else if (err instanceof CtnApiError) {
+          code = err.code;
+          requestId = err.requestId;
+        } else code = `non-CtnApiError: ${String(err)}`;
+      }
+      assert(code === "CTN_PROVER_UNAVAILABLE", `expected CTN_PROVER_UNAVAILABLE (never a decision), got ${code}`);
+      assert(requestId, "no requestId surfaced for the system failure");
+
+      const detail = await requestDetail(requestId);
+      assert(detail.request.status === "FAILED", `a system failure is FAILED, got ${detail.request.status}`);
+      assert(detail.request.errorCode === "CTN_PROVER_UNAVAILABLE", `expected CTN_PROVER_UNAVAILABLE errorCode, got ${detail.request.errorCode}`);
+      // No fake decision: no PolicyDecisionReceiptV1, no ALLOW/DENY, TS did not gate.
+      assert(detail.policyDecisionReceipt === null, "PROVER_UNAVAILABLE must not manufacture a PolicyDecisionReceiptV1");
+      assert(!detail.request.policyResult, `no ALLOW/DENY may be recorded (TS engine must not gate), got ${detail.request.policyResult}`);
+      // No dispatch.
+      assert(detail.attempts.length === 0, `expected 0 provider attempts, got ${detail.attempts.length}`);
+      assert(fileSize(MOCK_LOG_PATH) === mockBefore, "mock-provider log grew despite the gate being down");
+      // Kept out of denial metrics.
+      const statsAfter = await (await fetch(`${COORD}/v1/stats`)).json();
+      assert(
+        statsAfter.counts.denied === statsBefore.counts.denied,
+        `PROVER_UNAVAILABLE must not count as a denial: ${statsBefore.counts.denied} -> ${statsAfter.counts.denied}`
+      );
+      // Graph shows a system failure, not a denial.
+      const graphStatus = await awaitGraphNodeStatus(`req:${requestId}`, "FAILED");
+      assert(graphStatus === "FAILED", `graph node should render FAILED (system failure), got ${graphStatus ?? "<missing>"}`);
+      return `gate down → CTN_PROVER_UNAVAILABLE, status=FAILED, 0 attempts, no receipt, denied metric unchanged (${statsAfter.counts.denied})`;
+    } finally {
+      await restartDaemon();
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -1650,6 +1887,10 @@ async function healthCheck(): Promise<void> {
     [`${COORD}/health`, "coordinator"],
     [`${TEE}/health`, "tee-sim"],
     ["http://127.0.0.1:4300/health", "mock-provider"],
+    // Phase 2b: the guest executor is the authoritative gate for every request,
+    // so the whole suite now depends on it. (2b.5 takes it down deliberately and
+    // restarts it.)
+    [`${PROVER_URL}/health`, "prover daemon (:4500)"],
   ] as const;
   for (const [url, name] of targets) {
     const res = await fetch(url).catch(() => null);
@@ -1714,6 +1955,15 @@ async function main(): Promise<void> {
 
   console.log("\n=== §50 REVOCATION IS TERMINAL ===");
   await run66();
+
+  console.log("\n=== PHASE 2B — GATE-PATH RESTRUCTURING ===");
+  await run2b_1();
+  await run2b_2();
+  await run2b_3();
+  await run2b_4();
+  // 2b.5 takes the :4500 daemon down and restarts it — run it LAST so nothing
+  // after it depends on the daemon being up.
+  await run2b_5();
 
   console.log("\n=== §5.1 REAL PROVIDER SMOKE (env-gated) ===");
   await runRealProviderSmoke("70", "anthropic", "ANTHROPIC_API_KEY", "claude-haiku-4-5-20251001");

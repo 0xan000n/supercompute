@@ -9,6 +9,7 @@ import type {
   SecureRequestEnvelope,
   SignedComputeReceipt,
   SignedProofBinding,
+  SignedPolicyDecisionReceiptV1,
   AttestationBundle,
   ProofReceipt,
 } from "@ctn/protocol";
@@ -114,6 +115,25 @@ export const teeClient = {
       policyId: string;
     }>("/credentials/ingest", { method: "POST", body: JSON.stringify(body) }),
 
+  /**
+   * Phase 2b §3 — the AUTHORITATIVE gate, called BEFORE candidate discovery. The
+   * enclave runs the guest executor, signs a PolicyDecisionReceiptV1 for every
+   * verdict (ALLOW or DENY), and enqueues the proof. A `PROVER_UNAVAILABLE` here
+   * surfaces as an EnclaveRejectionError with code "PROVER_UNAVAILABLE" (a
+   * system failure, never a decision).
+   */
+  gate: (envelope: SecureRequestEnvelope) =>
+    call<GateResult>("/gate", {
+      method: "POST",
+      body: JSON.stringify({ envelope }),
+    }),
+
+  /**
+   * The dispatch phase (ALLOW only), run AFTER discovery. The enclave consumes
+   * the parked gate outcome for this requestId and calls the provider. Posts to
+   * the same `/execute` endpoint, which also gates inline for any direct caller
+   * that did not pre-gate.
+   */
   execute: (envelope: SecureRequestEnvelope, candidates: Candidate[]) =>
     call<ExecuteResult>("/execute", {
       method: "POST",
@@ -172,12 +192,33 @@ export interface AttemptResult {
   assumedSpendMicroUsd?: number;
 }
 
+/**
+ * Phase 2b §4 — the gate result. `status`/`decision` is ONLY ever ALLOW or DENY;
+ * `PROVER_UNAVAILABLE` is never expressed here, it is an EnclaveRejectionError.
+ */
+export interface GateResult {
+  requestId: string;
+  status: "ALLOW" | "DENY";
+  decision: "ALLOW" | "DENY";
+  commitment: string;
+  /** The guest's authoritative POLICY_ID_V2 — discovery keys on this. */
+  policyId: string;
+  imageId: string;
+  model: string;
+  decisionReceipt: SignedPolicyDecisionReceiptV1;
+  proofStarted: boolean;
+  gateWallMs: number;
+  timings: { enclaveDecryptMs?: number; gateWallMs: number; policyMs: number };
+}
+
 export interface ExecuteResult {
   requestId: string;
   status: "COMPLETE" | "DENIED" | "FAILED";
   commitment: string;
   policyId: string;
   policyDecision: "ALLOW" | "DENY";
+  /** Present on every gated response (Phase 2b). */
+  decisionReceipt?: SignedPolicyDecisionReceiptV1;
   policyMs: number;
   model: string;
   encryptedResponse: { enc: string; ciphertext: string } | null;
