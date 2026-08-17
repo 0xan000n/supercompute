@@ -10,8 +10,10 @@
 //! other. A change that broke the port in a way the corpus does not label would
 //! pass here and fail there, and vice versa.
 //!
-//! Spec §35 requires >= 50 allow, >= 50 deny, >= 25 adversarial; those minimums
-//! are asserted here too, so deleting fixtures cannot quietly shrink the corpus.
+//! Spec §35 requires >= 50 allow, >= 50 deny, >= 25 adversarial; the exact
+//! current counts (50/50/25) are asserted here, so the corpus cannot change in
+//! either direction without also updating the three documents that quote the
+//! 125 total.
 
 use std::fs;
 use std::path::{Path, PathBuf};

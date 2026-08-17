@@ -1,9 +1,11 @@
 # Receipt fixtures
 
 Five committed receipts, so `cargo test` in `prover/verify` costs seconds rather
-than the ~6.5 minutes of proving that produced them. Every one is a real
-artifact taken off `prover/host`'s wire contract (`POST /prove` →
-`GET /jobs/:id` → base64-decode `receiptB64`), not a hand-assembled structure.
+than the ~6.5 minutes of proving that produced them. Four are real artifacts
+taken off `prover/host`'s wire contract (`POST /prove` → `GET /jobs/:id` →
+base64-decode `receiptB64`); `adv-004-deny` came out of `--bench
+--keep-receipts`, which writes the same `bincode::serialize` encoding the
+daemon uses. None is a hand-assembled structure.
 
 | file | bytes | what it is |
 | --- | --- | --- |
@@ -13,10 +15,11 @@ artifact taken off `prover/host`'s wire contract (`POST /prove` →
 | `wrong-image.receipt.bin` | 537,794 | a *valid* composite receipt from a **different** image (`f40b7e788996…`), with a byte-identical journal. |
 | `dev-mode.receipt.bin` | 719 | what `RISC0_DEV_MODE=1` produces: a stub carrying no proof. |
 
-All five were produced on an M1 Pro (32 GB), release build, CPU-only, one run
-each: 124.57 s for `allow-real`, 122.73 s for `wrong-image`, 113.37 s (median of
-three) for `adv-004-deny`, 29.52 s for the succinct compression, 59 ms for the
-dev stub. These are single runs and prove timings on this machine are noisy at the
+All five were produced on an M1 Pro (32 GB), release build, CPU-only:
+124.57 s for `allow-real` (one run), 122.73 s for `wrong-image` (one run),
+29.52 s for the succinct compression, 59 ms for the dev stub. The
+`adv-004-deny` file is the final timed run of the Task 7 bench; 113.37 s is
+that bench's median of three, not this specific file's own wall time. These are single runs and prove timings on this machine are noisy at the
 ±20 % level (Task 4/5 ledger) — they are here to say what regeneration costs, not
 as benchmarks.
 

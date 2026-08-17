@@ -517,8 +517,9 @@ machine re-fits them to ~49 ms + ~6.4 ms per million, a 14% swing in the slope.
 The cycle ranks are reproducible (cycle counts are byte-identical across runs of a
 given image); **wall-time ranks are not.** The same rerun made `allow-050` the
 slowest fixture at 59.9 ms and `deny-050` the fastest at 50.5 ms, with `adv-020`
-fifth at 52.0. The band is 50–60 ms and the ordering inside it is noise, so no
-fixture in this corpus is "the slow one".
+fifth at 52.0. The band is roughly 50–60 ms on an idle machine (a third run
+grazed 60.6 ms; a loaded one reached 65.3) and the ordering inside it is noise,
+so no fixture in this corpus is "the slow one".
 
 Prompt length is not the lever either: the longest prompt in the corpus (300
 bytes, `adv-022`) lands at 57.2 ms, mid-distribution, while a 6-byte prompt
@@ -910,7 +911,7 @@ reproducible with `pnpm test`, `pnpm test:e2e`, `pnpm privacy-test` and
 | `services/coordinator` | 14 — `safeLog` redaction incl. nesting, arrays, case, depth, key names and `sk-` values; assumed-spend cap accounting and its rollback; the failure handler's inability to resurrect a revoked credential |
 | `scripts/test-e2e.mts` | 28 — §56 security, §55 routing, §53/§54 canaries, §36 invariants, §5.1 sealed intent, single dispatch, unknown outcomes, the provider catalog and terminal revocation — plus 2 env-gated real-provider cases, counted as skipped in the summary rather than silently absent |
 | `scripts/privacy-test.ts` | 16 surfaces swept for two independent canaries |
-| `prover/policy-core` | 12 — 10 normalizer/matcher/scoring unit tests, plus the 125 fixtures run against the ground-truth labels and a determinism replay |
+| `prover/policy-core` | 28 — 25 normalizer/matcher/scoring/canonicalizer unit tests, plus 3 fixture-corpus tests: the 125 fixtures run against the ground-truth labels, a determinism replay, and the exact 50/50/25 corpus-count guard |
 | `scripts/differential-test.ts` | 625 per run against the Rust engine — 125 fixtures + 500 generated Unicode adversarial cases (random seed, printed, overridable via `CTN_DIFF_SEED`), compared on normalisation, decision, score vector order and values, intent/construction/hard-block/modifiers; plus the 7-code-point zero-width strip set and a 1,112,064 code point skew sweep whose 798-pair, six-injection-site census is enforced against a recorded baseline that may shrink but not grow |
 
 Every finding in §2.4, §2.7, §2.8, §2.9 and §2.10 has a regression test, because each

@@ -141,7 +141,7 @@ cd .. && ./prover/verify/target/release/prover-verify \
 
 **Gates at Phase 2a HEAD:** `cargo fmt --check` (prover + verify + guest) ·
 `cargo clippy -D warnings` (prover workspace, verify workspace, guest
-incantation) · `cargo test` 80 pass / 1 ignored (prover) + 32 (verify) ·
+incantation) · `cargo test` 81 pass / 1 ignored (prover) + 33 (verify) ·
 `npx tsc --noEmit` clean · `pnpm test` 88 unit + the differential (625/625, the
 1,112,064-code-point skew sweep, 6 guest cases at imageId `75751480…`, 18
 canonicalizer probes) · `pnpm --filter web build` clean. ImageID unchanged

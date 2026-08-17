@@ -845,7 +845,9 @@ The extremes, from the same run:
 across runs of a given image, so "most cycles" and "fewest cycles" name the same
 two fixtures every time. The wall-time ranks do not: a rerun on this machine put
 `allow-050` slowest at 59.9 ms and `deny-050` fastest at 50.5 ms, with `adv-020`
-fifth at 52.0 ms. **The band is 50–60 ms; the ordering inside it is noise.** Read
+fifth at 52.0 ms. **The band is roughly 50–60 ms on an idle machine — a third
+run grazed 60.6 ms, and a loaded one reached 65.3 — and the ordering inside it
+is noise.** Read
 the last two rows as "what a single run happened to rank", not as properties of
 those fixtures.
 
