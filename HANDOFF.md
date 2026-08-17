@@ -37,14 +37,19 @@ committed — `.superpowers/sdd/.gitignore` is `*`). Seven tasks, all complete.
   across the whole fixture corpus, a composite proof takes two to three minutes
   of CPU on an M1 Pro, a receipt is ~525 KB, and verification is milliseconds.
 
-**What Phase 2b has to wire**, none of which exists yet: `tee-sim` calling
-`/execute` on the request path and `/prove` off it; the decision/outcome receipt
-split (§5.5); queue persistence and real backpressure (§5.6); a `PROVER_UNAVAILABLE`
-state; reconciling the TypeScript `policyId` with the guest's `POLICY_ID_V2`; a TS
-verifier matching `prover-verify`'s checks; and the trust-page rewrite. Until then
-every proof artifact the demo shows is still `simulated-reexec`, and the trust page
-says so — it was read during Phase 2a and deliberately left unchanged, because
-nothing on it became false.
+**Phase 2b is now DONE** (branch `phase2b-wiring`, off `main` after the 2a merge):
+`tee-sim` gates every request via the guest `/execute` on the request path and proves
+off it via `/prove`; the decision/outcome/proof receipt split (§5.5); `PROVER_UNAVAILABLE`
+as an honest system failure; the request-path identity unified on the guest
+`POLICY_ID_V2`; the `@ctn/verify` TS verifier + the playground proof beat; and the
+trust-page rewrite. A request-path proof is now a **real RISC Zero STARK, verified
+server-side by `prover/verify`** before it is shown VERIFIED — the demo no longer shows
+`simulated-reexec`. The confidential boundary (`tee-sim` + `prover/host`) remains
+**simulated** and is labelled so at equal weight. **Deferred to Phase 2c:** queue
+persistence, real backpressure/priority (§5.6) — the single-worker prover is why a
+seeded burst produces queue-full `503`s (see DEMO.md "Before you start"); a distinct
+non-failure state for a `503` queue-drop; pruning the dead `ProofReceipt`/`verifyProof`
+`simulated-reexec` legacy union.
 
 ## Where things stand (Phase 1)
 

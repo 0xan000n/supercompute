@@ -8,8 +8,24 @@ without seeing the workloads that use it.*
 
 ```bash
 pnpm reset && pnpm dev     # wait for all four services
-pnpm seed                  # 5 contributors + some traffic so the graph isn't empty
+cargo run -rp host --manifest-path prover/Cargo.toml -- --serve   # the :4500 prover — REQUIRED now
+pnpm seed                  # 5 contributors + a little traffic so the graph isn't empty
 ```
+
+**Timing the proof, so the demo shows VERIFIED and not a wall of failures.** Every
+request now enqueues a *real* ~2-minute STARK on a single-worker prover (Phase 2b;
+real backpressure/priority is Phase 2c). Two consequences to plan around:
+
+- **Do not seed a burst right before demoing.** `pnpm seed` enqueues several real
+  proves; the single worker can only do one at a time (~2 min each), so a fresh seed
+  leaves a backlog and later requests get a queue-full `503` that currently surfaces
+  as a *failed* proof. Either seed well ahead of time, or seed, let the queue drain,
+  then demo — or seed lightly.
+- **Drive the "watch it verify" moment against an idle prover.** Send ONE playground
+  request with nothing else queued, and it reaches VERIFIED in ~2 minutes. The
+  answer returns in under a second; the proof lands after — that lag is the honest
+  point, not a bug. (If you don't want to wait live, drive it a couple of minutes
+  before the beat and return to it verified.)
 
 Open **http://localhost:3000**. Have a second terminal ready.
 
@@ -136,9 +152,13 @@ End here. Deliberately.
 > "Two columns, equal weight. The upstream provider still sees the prompt — this is
 > private from contributors and operators, not from OpenAI. Safety Policy v1 is not
 > proof of harmlessness, it's proof that an exact named policy version allowed the
-> request. Spend caps are operational. This build has no hardware isolation. And the
-> proof isn't zero-knowledge yet — it's labelled `simulated-reexec` everywhere it
-> appears."
+> request. Spend caps are operational. This build has no hardware isolation — the
+> confidential boundary (`tee-sim` + `prover/host`) is simulated, and `prover/host`
+> is handed the plaintext prompt. What IS real now: the policy proof is a real
+> RISC Zero STARK, generated per request and verified server-side by `prover/verify`
+> against the pinned release — you watched one reach VERIFIED in the playground, and
+> anyone can re-run `prover/verify` offline. So: the proof is real; the enclave that
+> holds the prompt is still simulated. Both are on the page, at equal weight."
 
 Close on the primitive:
 

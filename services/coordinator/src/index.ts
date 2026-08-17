@@ -1490,7 +1490,15 @@ app.get("/v1/stats", async () => {
     rows.map((r) => r[key]).filter((v): v is number => typeof v === "number" && v > 0);
 
   const policy = num("policy_ms");
-  const proof = num("proof_ms");
+  // Proof latency is reported ONLY over proofs that actually VERIFIED. A FAILED
+  // proof still writes proof_ms (including a 1–5 ms queue-drop 503), so counting
+  // those would make "Proving takes X at p50" on the trust page a fabricated
+  // number — e.g. 35 s synthesized from 0 verified / 86 failed. This is the
+  // honesty page; the figure must describe real proving, not failures.
+  const proof = rows
+    .filter((r) => r.proof_status === "VERIFIED")
+    .map((r) => r.proof_ms)
+    .filter((v): v is number => typeof v === "number" && v > 0);
   const provider = num("provider_ms");
   const total = num("total_ms");
 
