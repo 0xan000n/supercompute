@@ -16,6 +16,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 import { ComputeTrustClient, CtnApiError, type CompletionResult } from "@ctn/client";
+import { normalize } from "@ctn/policy";
 
 const BASE = process.env.CTN_COORDINATOR_URL ?? "http://127.0.0.1:4200";
 /** Phase 3 — the enclave itself, swept directly so the insights surface is
@@ -74,6 +75,32 @@ async function countInUrl(url: string, needle: string): Promise<number> {
   const res = await fetch(url);
   const text = await res.text();
   return text.split(needle).length - 1;
+}
+
+/**
+ * Structural allowlist over the served bulletin: the ONLY defensible privacy
+ * proof for /v1/insights, because a substring grep can miss a normalized leak.
+ * A bulletin may carry ONLY these top-level keys, facet rows of exactly
+ * {facet, allow, deny} whose facet is an enum-shaped token (no spaces/prompt
+ * text) and whose counts are integers. Returns the number of violations (0 = clean).
+ */
+async function insightsStructuralLeaks(): Promise<number> {
+  const res = await fetch(`${BASE}/v1/insights`);
+  if (!res.ok) return 0; // no bulletin yet (all suppressed / cold) — nothing to leak
+  const b = (await res.json()) as Record<string, unknown>;
+  const TOP = new Set([
+    "version", "generatedAt", "windowRequests", "kMin",
+    "facets", "suppressedFacets", "otherCount", "policyId", "enclaveSignature",
+  ]);
+  let violations = 0;
+  for (const k of Object.keys(b)) if (!TOP.has(k)) violations++;
+  const facets = Array.isArray(b.facets) ? (b.facets as Array<Record<string, unknown>>) : [];
+  for (const row of facets) {
+    for (const k of Object.keys(row)) if (!["facet", "allow", "deny"].includes(k)) violations++;
+    if (typeof row.facet !== "string" || !/^[a-z_]+$/.test(row.facet)) violations++; // enum-shaped, not free text
+    if (!Number.isInteger(row.allow) || !Number.isInteger(row.deny)) violations++;
+  }
+  return violations;
 }
 
 /**
@@ -142,6 +169,15 @@ async function main(): Promise<void> {
   // the enclave's own bulletin nor the coordinator's opaque relay of it.
   report("insights bulletin (enclave /insights)", await countInUrl(`${TEE}/insights`, canary), 0);
   report("insights bulletin (coordinator /v1/insights)", await countInApi("/v1/insights", canary), 0);
+  // The insights path runs the prompt through @ctn/policy normalize() (lowercase,
+  // _→space, leetspeak fold), so the RAW canary would not substring-match a
+  // normalized leak. Grep the normalized form too — and, decisively, assert the
+  // bulletin is STRUCTURALLY an enum+integer allowlist, which catches any
+  // prompt-derived leak regardless of normalization.
+  const normalizedCanary = normalize(canary);
+  report("insights (enclave, normalized canary)", await countInUrl(`${TEE}/insights`, normalizedCanary), 0);
+  report("insights (coordinator, normalized canary)", await countInApi("/v1/insights", normalizedCanary), 0);
+  report("insights bulletin is enum+integer only (structural)", await insightsStructuralLeaks(), 0);
   report(
     "vault + enclave state on disk",
     countInFile(join(DATA_DIR, "wrapped-dek.json"), canary) +

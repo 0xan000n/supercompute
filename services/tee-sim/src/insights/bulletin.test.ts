@@ -8,8 +8,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { generateSigningKeyPair, signCanonical, verifyInsightsBulletin, toHex } from "@ctn/protocol";
+import { normalize } from "@ctn/policy";
 import { BulletinAccumulator } from "./bulletin.js";
-import type { Facet } from "./facets.js";
+import { classify } from "./classify.js";
+import { FACETS, type Facet } from "./facets.js";
 
 const KEY = generateSigningKeyPair();
 const PUB = toHex(KEY.publicKey);
@@ -128,16 +130,53 @@ test("the enclave signature verifies against the enclave key", () => {
   assert.ok(!verifyInsightsBulletin(tampered, PUB), "tamper is detected");
 });
 
-test("PRIVACY: a planted marker classified in appears NOWHERE in the bulletin JSON", () => {
-  // The accumulator only ever sees the enum Facet — never the prompt. Simulate a
-  // request whose prompt contained a secret; the classifier (elsewhere) mapped it
-  // to a facet, and only that facet reaches the accumulator.
+test("PRIVACY: the bulletin is a STRUCTURAL enum+integer allowlist — no prompt-derived text can appear", () => {
+  // Route a marker-bearing prompt through the real classifier so the test is not
+  // vacuous: classify() returns only a Facet, and only that Facet reaches record().
+  // Then assert the bulletin STRUCTURALLY — every field is either a known
+  // enum/number/id, so ANY regression that stored the prompt (raw OR normalized)
+  // or a matchedTarget would surface as an unexpected key or a non-enum string.
   const MARKER = "CANARY_SECRET_9F3A2B";
-  const acc = new BulletinAccumulator();
-  for (let i = 0; i < 6; i++) acc.record("coding", "ALLOW"); // the request classified as coding
-  const b = acc.buildBulletin({ kMin: 5, policyId: POLICY, generatedAt: AT, sign });
+  const normalizedMarkerPrompt = normalize(`please write a python function for ${MARKER}`);
+  const facet = classify({
+    normalizedPrompt: normalizedMarkerPrompt,
+    decision: "ALLOW",
+    categoryScores: {},
+    categoryThresholds: {},
+  });
+  assert.ok(FACETS.includes(facet), "classify returns only a Facet");
 
-  assert.ok(!JSON.stringify(b).includes(MARKER), "no prompt-derived text in the bulletin");
+  const acc = new BulletinAccumulator();
+  for (let i = 0; i < 6; i++) acc.record(facet, "ALLOW");
+  const b = acc.buildBulletin({ kMin: 5, policyId: POLICY, generatedAt: AT, sign }) as unknown as Record<string, unknown>;
+
+  // Structural allowlist: only these top-level keys may exist.
+  const TOP = new Set([
+    "version", "generatedAt", "windowRequests", "kMin",
+    "facets", "suppressedFacets", "otherCount", "policyId", "enclaveSignature",
+  ]);
+  for (const k of Object.keys(b)) assert.ok(TOP.has(k), `unexpected bulletin field "${k}" — possible prompt leak`);
+  assert.equal(typeof b.version, "number");
+  assert.equal(typeof b.windowRequests, "number");
+  assert.equal(typeof b.kMin, "number");
+  assert.equal(typeof b.suppressedFacets, "number");
+  assert.equal(typeof b.otherCount, "number");
+  // These carry ONLY known non-prompt inputs — assert they equal exactly what was
+  // passed in (a mutation that spliced prompt text in would fail here).
+  assert.equal(b.generatedAt, AT, "generatedAt is the passed-in timestamp, not free text");
+  assert.equal(b.policyId, POLICY, "policyId is the passed-in policy id, not free text");
+  assert.equal(typeof b.enclaveSignature, "string");
+  for (const row of b.facets as Array<Record<string, unknown>>) {
+    for (const k of Object.keys(row)) assert.ok(["facet", "allow", "deny"].includes(k), `unexpected facet field "${k}"`);
+    assert.ok(FACETS.includes(row.facet as Facet), `facet "${String(row.facet)}" is not a closed-enum member`);
+    assert.equal(typeof row.allow, "number");
+    assert.equal(typeof row.deny, "number");
+  }
+
+  // Belt and braces: neither the raw marker NOR its normalized form is anywhere.
+  const json = JSON.stringify(b);
+  assert.ok(!json.includes(MARKER), "raw prompt text must not appear in the bulletin");
+  assert.ok(!json.includes(normalize(MARKER)), "NORMALIZED prompt text must not appear in the bulletin");
 });
 
 test("an empty accumulator produces an honest empty, signed bulletin", () => {
