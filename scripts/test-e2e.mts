@@ -1959,6 +1959,15 @@ async function run2b_7(): Promise<void> {
     );
     assert(/^0x[0-9a-f]{64}$/.test(proof.artifact_digest ?? ""), `artifact_digest must be a 0x sha256, got ${proof.artifact_digest}`);
 
+    // The playground's ProofBeat "verify via coordinator" action decodes these
+    // real receipt bytes to run @ctn/verify LOCALLY, and reads the coordinator's
+    // delegated verification beside it — assert the /proof projection carries both.
+    assert(
+      typeof proof.artifact?.receiptB64 === "string" && proof.artifact.receiptB64.length > 100,
+      `the /proof projection must carry the base64 receipt the ProofBeat verifies locally`
+    );
+    assert(Array.isArray(proof.verification?.checks), `the /proof projection must carry the coordinator's delegated checks`);
+
     // Identity unified on POLICY_ID_V2 across decision receipt, proof, compute receipt.
     const detail = await requestDetail(result.requestId);
     const receiptResp = await (await fetch(`${COORD}/v1/requests/${result.requestId}/receipt`)).json();
@@ -2028,6 +2037,96 @@ async function run2b_8(): Promise<void> {
     );
 
     return `preview ALLOW in ${elapsedMs}ms, proofStarted=false, proof_status=NOT_REQUIRED; preview id ${preview.slice(0, 10)}… labelled non-authoritative (guest ${guest.slice(0, 10)}… authoritative)`;
+  });
+}
+
+/**
+ * Task 6 — the playground ProofBeat. The web app ships no vitest/jest runner, so
+ * (as with 2b.8) the honesty guarantees of a UI surface are guarded at the
+ * SOURCE: the ProofBeat component and its page wiring must render every required
+ * state string, and — the load-bearing one — must NEVER route a browser-local
+ * `verifyReceipt` ok into a "verified" claim; the ONLY "verified" is the
+ * coordinator's delegated seal (proof_status VERIFIED). Regresses loudly if the
+ * component's honest copy or its seal-verified guard is removed or renamed.
+ */
+async function run2b_9(): Promise<void> {
+  await test("2b.9", "ProofBeat renders the five honest proof states; 'verified' is ONLY the coordinator's delegated seal, never a local ok", async () => {
+    const beat = readFileSync(join(ROOT, "apps/web/src/components/ProofBeat.tsx"), "utf8");
+    const page = readFileSync(join(ROOT, "apps/web/src/app/playground/page.tsx"), "utf8");
+
+    // (1) QUEUED renders "waiting to prove", explicitly NOT cryptography running.
+    assert(/waiting to prove/i.test(beat), "ProofBeat must render QUEUED as 'waiting to prove'");
+    assert(
+      /no cryptography is running yet/i.test(beat),
+      "QUEUED must state no cryptography is running yet (queue time is not proving time)"
+    );
+
+    // (2) PROVING shows the real ImageID + an elapsed timer, and is HONEST: no
+    // fake ETA / percentage / progress bar (proving time is variable).
+    assert(/generating zero-knowledge proof/i.test(beat), "PROVING must render a 'generating zero-knowledge proof' state");
+    assert(/guest_image_id|imageIdHex|guest image/i.test(beat), "PROVING must surface the real ImageID");
+    assert(/elapsed/i.test(beat) && /clock\(/.test(beat), "PROVING must show a live elapsed timer");
+    assert(
+      /no progress bar and no eta/i.test(beat),
+      "PROVING must be honest: no fake progress bar / ETA (proving time is variable)"
+    );
+    // Ban a real progress FILL (a width bound to elapsed, an ARIA progressbar,
+    // an "N% complete" readout) — but not the honest prose that says there is none.
+    assert(
+      !/style=\{\{[^}]*width|aria-valuenow|role="progressbar"|\d{1,3}%\s*(complete|done)/i.test(beat),
+      "PROVING must not render a fake percentage / progress-fill (proving time is variable)"
+    );
+
+    // (3) The proof action is the Task-5 NO-GO naming: "Inspect proof" /
+    // "verify via coordinator" — and NEVER "Verify offline".
+    assert(/inspect proof/i.test(beat), "the proof action must be labelled 'Inspect proof'");
+    assert(/verify via coordinator/i.test(beat), "the proof action must be labelled 'verify via coordinator'");
+    assert(!/verify offline/i.test(beat), "the proof action must NEVER be called 'Verify offline' (Task 5 NO-GO)");
+
+    // (4) THE load-bearing invariant: "verified" is ONLY the coordinator's
+    // delegated seal (proof_status VERIFIED + proof_verified), never local ok.
+    assert(
+      /proof_status\s*===\s*"VERIFIED"/.test(beat) && /proof_verified\s*===\s*true/.test(beat),
+      "the VERIFIED claim must be gated on the coordinator's server-side seal (proof_status VERIFIED + proof_verified)"
+    );
+    assert(
+      /sealVerifiedByCoordinator/.test(beat),
+      "a single named guard must own the 'verified' claim (sealVerifiedByCoordinator)"
+    );
+    assert(
+      /necessary, not sufficient/i.test(beat),
+      "the local verifier's ok must be labelled necessary-not-sufficient, never a seal claim"
+    );
+    assert(
+      /verified by the (coordinator|.*coordinator)/i.test(beat) && /delegated/i.test(beat),
+      "delegated checks (image-id/seal/rules-digest) must be marked verified by the coordinator"
+    );
+    // The verifier is actually invoked locally over the real receipt bytes.
+    assert(
+      /verifyReceipt\(/.test(beat) && /fromB64\(/.test(beat),
+      "the inspect action must run @ctn/verify locally over the real receipt bytes"
+    );
+
+    // (5) PROVER_UNAVAILABLE is its own system-failure state, distinct from DENY.
+    assert(/systemFailure/.test(beat) && /system failure, not a policy/i.test(beat), "PROVER_UNAVAILABLE must be its own system-failure state, distinct from a DENY");
+    assert(
+      /CTN_PROVER_UNAVAILABLE/.test(page),
+      "the playground must map a PROVER_UNAVAILABLE response to the system-failure state"
+    );
+
+    // Gate cost is shown as an INTERNAL figure, not browser latency; and a DENY
+    // is still proved (the beat polls its proof through to VERIFIED).
+    assert(/internal/i.test(beat), "the ~57ms gate cost must be labelled an internal figure, not browser latency");
+    assert(/still being proved/i.test(beat), "a DENY must be shown stopping yet still being proved");
+    assert(/handleDenial/.test(page) && /pollProof\(requestId\)/.test(page), "a DENY must still poll its proof to VERIFIED");
+
+    // The pinned imageId is unchanged (no prover/policy edits in this task).
+    assert(
+      beat.includes("ddb7dc544e1425640ad3af8e7b3b48afa21499a0b371ce4a59fdb4d8594d5331"),
+      "the pinned release imageId must be ddb7dc… (unchanged)"
+    );
+
+    return "ProofBeat: QUEUED 'waiting to prove', PROVING (real ImageID + elapsed, no ETA), Inspect/verify-via-coordinator (not offline), VERIFIED only via coordinator seal (necessary-not-sufficient local), PROVER_UNAVAILABLE distinct, DENY still proved";
   });
 }
 
@@ -2193,6 +2292,7 @@ async function main(): Promise<void> {
   await run2b_6();
   await run2b_7(); // gated real prove (CTN_E2E_REAL_PROOF=1); self-skips otherwise
   await run2b_8(); // Policy-Lab preview decoupled from proving + non-authoritative label
+  await run2b_9(); // playground ProofBeat honesty (source-level guard)
   // 2b.5 takes the :4500 daemon down and restarts it — run it LAST so nothing
   // after it depends on the daemon being up.
   await run2b_5();

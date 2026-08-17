@@ -2,12 +2,13 @@
 
 import { useCallback, useMemo, useRef, useState } from "react";
 import Link from "next/link";
-import { ComputeTrustClient, PolicyDeniedError, verifyAttestationBundle, type AttestationEnvelope, type CompletionResult } from "@ctn/client";
+import { CtnApiError, ComputeTrustClient, PolicyDeniedError, verifyAttestationBundle, type AttestationEnvelope, type CompletionResult } from "@ctn/client";
 import { Shell } from "@/components/Shell";
 import { NetworkGraph } from "@/components/graph/NetworkGraph";
 import { PhaseTimeline, type Phase } from "@/components/PhaseTimeline";
+import { ProofBeat, type ProofPoll } from "@/components/ProofBeat";
 import { requestPath } from "@/components/graph/path";
-import { Badge, Button, Check, Field, Panel, SectionLabel, Textarea } from "@/components/ui";
+import { Badge, Button, Field, Panel, SectionLabel, Textarea } from "@/components/ui";
 import { COORDINATOR, api, useLiveGraph, usePolled } from "@/lib/api";
 import { ms, num, shortHash } from "@/lib/format";
 
@@ -32,19 +33,9 @@ const PRESETS = [
   },
 ];
 
-interface ProofPoll {
-  // Phase 2b — the real five-state lifecycle. QUEUED is "waiting to prove," NOT
-  // "cryptography running."
-  proof_status: string; // QUEUED | PROVING | GENERATED | VERIFIED | FAILED | NOT_REQUIRED
-  proof_verified?: boolean;
-  proof_ms?: number;
-  guest_image_id?: string;
-  artifact_digest?: string;
-  // The five-field public journal, decoded from the real receipt (never prompt-derived).
-  decoded_journal?: Record<string, unknown> | null;
-  verification?: { valid: boolean; checks: Array<{ name: string; pass: boolean; detail?: string }> };
-  error?: string;
-}
+// The `/v1/requests/:id/proof` projection shape lives with the ProofBeat that
+// consumes it (Phase 2b — the real five-state lifecycle; QUEUED is "waiting to
+// prove", NOT "cryptography running").
 
 type Stage =
   | "idle"
@@ -96,6 +87,13 @@ export default function PlaygroundPage() {
   const [proof, setProof] = useState<ProofPoll | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [denied, setDenied] = useState<{ commitment?: string } | null>(null);
+  // The signed gate verdict, and the internal executor gate cost (~57 ms), shown
+  // as a labelled internal figure — never as the browser round-trip.
+  const [verdict, setVerdict] = useState<"ALLOW" | "DENY" | null>(null);
+  const [gateWallMs, setGateWallMs] = useState<number | undefined>(undefined);
+  // PROVER_UNAVAILABLE — a system failure, distinct from a policy DENY and from
+  // a provider failure. No decision was made.
+  const [systemFailure, setSystemFailure] = useState<{ code: string; message?: string } | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const timings = useRef<Record<string, number>>({});
   const [proofElapsed, setProofElapsed] = useState(0);
@@ -108,6 +106,9 @@ export default function PlaygroundPage() {
     setProof(null);
     setError(null);
     setDenied(null);
+    setVerdict(null);
+    setGateWallMs(undefined);
+    setSystemFailure(null);
     setProofElapsed(0);
     timings.current = {};
     const t0 = performance.now();
@@ -136,8 +137,12 @@ export default function PlaygroundPage() {
         if (!res.ok) {
           const err = json.error as { code: string; message: string };
           if (err?.code === "CTN_POLICY_DENIED") {
-            setDenied({ commitment: json.request_commitment as string });
-            setStage("denied");
+            handleDenial(json.request_id as string | undefined, json.request_commitment as string);
+            return;
+          }
+          if (err?.code === "CTN_PROVER_UNAVAILABLE") {
+            setSystemFailure({ code: err.code, message: err.message });
+            setStage("error");
             return;
           }
           throw new Error(err?.message ?? "request failed");
@@ -157,6 +162,8 @@ export default function PlaygroundPage() {
           timings: {},
           trustStatus: "COMPATIBILITY",
         });
+        setVerdict("ALLOW");
+        void loadGateWall(ctn.request_id as string);
         timings.current.total = performance.now() - t0;
         setStage("proving");
         void pollProof(ctn.request_id as string);
@@ -171,16 +178,51 @@ export default function PlaygroundPage() {
       });
       timings.current.total = performance.now() - t0;
       setResult(completion);
+      setVerdict("ALLOW");
+      // Secure mode carries the internal gate cost in the completion timings.
+      setGateWallMs((completion.timings?.gateWallMs as number | undefined) ?? undefined);
       setStage("proving");
       void pollProof(completion.requestId);
     } catch (err) {
       if (err instanceof PolicyDeniedError) {
-        setDenied({ commitment: err.commitment });
-        setStage("denied");
+        handleDenial(err.requestId, err.commitment);
+        return;
+      }
+      // PROVER_UNAVAILABLE — the gate could not run. A system failure, not a
+      // decision. Its own state, distinct from a DENY and a provider error.
+      if (err instanceof CtnApiError && err.code === "CTN_PROVER_UNAVAILABLE") {
+        setSystemFailure({ code: err.code, message: err.message });
+        setStage("error");
         return;
       }
       setError((err as Error).message);
       setStage("error");
+    }
+
+    // A DENY is still gated and still PROVED — surface the verdict AND poll its
+    // proof through to VERIFIED, even though no provider was ever called.
+    function handleDenial(requestId: string | undefined, commitment?: string) {
+      setDenied({ commitment });
+      setVerdict("DENY");
+      setStage("denied");
+      if (requestId) {
+        void loadGateWall(requestId);
+        void pollProof(requestId);
+      }
+    }
+
+    // The internal executor gate cost (~57 ms), read from the request row. Shown
+    // as a labelled internal figure, never as the browser round-trip latency.
+    async function loadGateWall(requestId: string) {
+      try {
+        const detail = await api<{ request?: { timings?: { policyMs?: number } } }>(
+          `/v1/requests/${requestId}`
+        );
+        const p = detail.request?.timings?.policyMs;
+        if (typeof p === "number" && p > 0) setGateWallMs(p);
+      } catch {
+        /* the gate cost is a nicety; its absence is not an error */
+      }
     }
 
     async function pollProof(requestId: string) {
@@ -204,7 +246,9 @@ export default function PlaygroundPage() {
         }
       } finally {
         clearInterval(tick);
-        setStage("done");
+        // A DENY keeps its "denied" pipeline state; only an in-flight ALLOW
+        // ("proving") settles to "done" once the proof reaches a terminal state.
+        setStage((s) => (s === "proving" ? "done" : s));
       }
     }
   }, [prompt, model, privacyMode]);
@@ -253,31 +297,32 @@ export default function PlaygroundPage() {
         id: "proof",
         label: "Policy proof",
         parallel: true,
+        // A DENY is still proved — the proof phase is NOT skipped for a denial.
         state:
-          s === "denied"
-            ? "skipped"
-            : proofStatus === "VERIFIED"
-              ? "done"
-              : proofStatus === "FAILED"
-                ? "failed"
-                : reached(["proving"]) || (reached(["done"]) && !proofStatus)
+          proofStatus === "VERIFIED"
+            ? "done"
+            : proofStatus === "FAILED"
+              ? "failed"
+              : proofStatus === "QUEUED" || proofStatus === "PROVING" || proofStatus === "GENERATED"
+                ? "active"
+                : reached(["proving", "denied"]) || (reached(["done"]) && !proofStatus)
                   ? "active"
                   : reached(["done"])
                     ? "done"
                     : "idle",
         detail:
           proofStatus === "VERIFIED"
-            ? `verified against the pinned image · journal bound to the commitment`
+            ? `verified by the coordinator against the pinned image · journal bound to the commitment`
             : proofStatus === "FAILED"
               ? (proof?.error ?? "proof failed")
               : proofStatus === "QUEUED"
                 ? "queued — waiting to prove (not yet running)"
                 : proofStatus === "GENERATED"
-                  ? "receipt generated — verifying against the pinned image"
-                  : reached(["proving", "done"])
+                  ? "receipt generated — verifying the seal against the pinned image"
+                  : reached(["proving", "done", "denied"])
                     ? "generating a real zero-knowledge proof (~2 min)"
                     : undefined,
-        durationMs: proof?.proof_ms ?? (reached(["proving"]) ? proofElapsed : undefined),
+        durationMs: proof?.proof_ms ?? (reached(["proving", "denied"]) ? proofElapsed : undefined),
       },
       {
         id: "route",
@@ -452,27 +497,6 @@ export default function PlaygroundPage() {
 
           {/* ---- result + graph ---- */}
           <div className="space-y-4">
-            {stage === "denied" && (
-              <Panel className="border-denied/30 p-4">
-                <div className="flex items-center gap-2">
-                  <Badge tone="denied" dot>
-                    POLICY DENIED
-                  </Badge>
-                  <span className="text-[12.5px] text-ink-2">
-                    Request was not eligible under Safety Policy v1.
-                  </span>
-                </div>
-                <p className="mt-2.5 text-[12px] leading-relaxed text-ink-3">
-                  No contributed credential was decrypted and no provider was called. The network
-                  recorded the commitment and the decision, not the prompt.
-                </p>
-                <div className="mt-2.5 rounded-[10px] border border-hairline bg-abyss px-3 py-2 text-[11px] text-ink-4">
-                  The denial reason, matched rules and category scores are deliberately not returned
-                  (§33) — they would leak information about the prompt.
-                </div>
-              </Panel>
-            )}
-
             {error && (
               <Panel className="border-denied/30 p-4">
                 <Badge tone="denied" dot>
@@ -482,6 +506,8 @@ export default function PlaygroundPage() {
               </Panel>
             )}
 
+            {/* The Answer — the response is in the browser's hands sub-second,
+                before the proof of the gate that let it through even begins. */}
             {result && (
               <Panel className="p-4">
                 <div className="flex items-center justify-between gap-3">
@@ -514,31 +540,18 @@ export default function PlaygroundPage() {
               </Panel>
             )}
 
-            {proof?.verification && (
-              <Panel className="p-4">
-                <div className="flex items-center justify-between">
-                  <SectionLabel>Proof verification</SectionLabel>
-                  <Badge tone={proof.verification.valid ? "verified" : "denied"} dot>
-                    {proof.verification.valid ? "VERIFIED" : "INVALID"}
-                  </Badge>
-                </div>
-                <div className="mt-2">
-                  {proof.verification.checks.map((check) => (
-                    <Check key={check.name} pass={check.pass} name={check.name} detail={check.detail} />
-                  ))}
-                </div>
-                {proof.decoded_journal && (
-                  <div className="mt-3 border-t border-hairline pt-2.5">
-                    <SectionLabel>Public journal — everything the proof reveals</SectionLabel>
-                    <pre className="mono mt-2 overflow-x-auto rounded-[10px] border border-hairline bg-abyss p-3 text-[11px] leading-relaxed text-ink-2">
-                      {JSON.stringify(proof.decoded_journal, null, 2)}
-                    </pre>
-                    <p className="mt-1.5 text-[11px] text-ink-4">
-                      No prompt, no scores, no matched phrases, no reason.
-                    </p>
-                  </div>
-                )}
-              </Panel>
+            {/* The proof beat — gate verdict → queued → proving → VERIFIED, plus
+                PROVER_UNAVAILABLE. The only "verified" claim is the coordinator's
+                delegated seal (see ProofBeat.sealVerifiedByCoordinator). */}
+            {(verdict || systemFailure) && (
+              <ProofBeat
+                decision={verdict}
+                gateWallMs={gateWallMs}
+                commitment={result?.commitment ?? denied?.commitment}
+                proof={proof}
+                proofElapsedMs={proofElapsed}
+                systemFailure={systemFailure}
+              />
             )}
 
             <Panel className="overflow-hidden p-0">
