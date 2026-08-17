@@ -45,7 +45,8 @@ an audit artifact rather than a gate, is what makes the latency story work at al
 The spec is right to insist on measuring it rather than assuming. Measured here:
 proving takes ~2.9 s at p50 while the caller waits ~490 ms — but the ~2.9 s is a
 *modelled* proof cost, and §2c reports what a real one costs once measured. The
-insight holds; the number was optimistic by roughly 20×.
+insight holds; the number was optimistic by roughly 50× (the policy guest's
+measured composite proofs run 113–124 s against the 2.4 s model — §2c).
 
 (This clause previously said ~390 ms, disagreeing with the ~490 ms in README's
 "Measured, not assumed" table. Both are snapshots of a live `GET /v1/stats` p50
@@ -583,7 +584,9 @@ Four sentences, and none of them are the ones Phase 1's numbers implied.
 ~20 ms this section predicted from the spike; the corpus says 50–60 ms with a
 median of 56.4, and the tail is 60 ms rather than something pathological. Against
 a ~450 ms provider call that is affordable, and Phase 2b should budget it as a
-flat 60 ms rather than as a function of the prompt.
+tight ~60 ms, constant in the prompt — 60 is the ceiling, not headroom (the
+corpus max is 59.6 ms and reruns have grazed 60.6 idle, 65.3 loaded); treat
+anything over as load, not policy work.
 
 **The proof lags the request by two to three minutes.** It is not concurrent with
 inference in any useful sense; it finishes long after the response was returned

@@ -49,7 +49,7 @@ takes a while; several minutes is normal.
 |---|---|
 | `rustc` (host) | 1.97.1 (8bab26f4f 2026-07-14) |
 | `cargo` (host) | 1.97.1 (c980f4866 2026-06-30) |
-| `rzup` | 0.5.0 |
+| `rzup` (installed CLI) | 0.5.0 — the `rzup` *crate* in `host`'s build graph is 0.5.2; two different objects |
 | `cargo-risczero` | 3.0.6 |
 | `r0vm` | 3.0.6 |
 | risc0 Rust toolchain (guest) | 1.97.0 — `rustc 1.97.0-dev (e638c6cfe 2026-07-15)` |
@@ -1145,6 +1145,15 @@ compression step needs Docker — see "Which receipt kind", where the manifest's
 Everything above is one laptop, one toolchain, and — for the expensive half — a
 handful of runs. Specifically **not** shown:
 
+- **Semantic identity with the TypeScript preview.** The engine this image runs
+  and the TS engine the demo's Policy Lab previews with disagree — bidirectionally
+  — on 133 code points that Unicode 16 (Node's ICU) leaves unassigned and the
+  Rust tables (Unicode 17) assign: 416 (code point, site) pairs where the guest
+  is stricter, 104 where it is *laxer*. The differential suite enforces that
+  inventory as a baseline that may shrink but not grow, and it is zero on
+  version-stable material — but a proof of the guest's decision is a proof about
+  *this* engine, not about what a preview showed. VALIDATION §2c carries the
+  full census; labelling the disagreement in the Policy Lab UI is Phase 2b's.
 - **A stable prove time.** Two full benches of near-identical images differ by
   20–26% at the median; three daemon runs of one fixture gave 134.70 s, 122.58 s
   and 121.21 s; `--bench` gave a 124.10 s median for that same fixture with a

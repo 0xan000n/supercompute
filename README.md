@@ -139,7 +139,9 @@ pnpm privacy-test                          # canary sweep across every persisted
 pnpm verify-receipt <requestId>            # independent receipt + proof + binding check
 ```
 
-`pnpm test:differential` needs the **RISC Zero** toolchain, not just Rust: since the
+`pnpm test` (which includes the differential) and `pnpm test:differential` need
+the **RISC Zero** toolchain, not just Rust — the "Requires Node 22+" line above
+covers running the demo, not verifying it: since the
 guest suite landed it builds the zkVM guest ELF and runs the real image, so a cold
 cache costs ~1m40s (a warm one is a no-op) and it fails loudly rather than skip. It
 is the only thing keeping `prover/policy-core` (the engine a proof is about)
@@ -403,8 +405,10 @@ the prompt. It never persists or logs plaintext, and every response from it carr
 
 - Milestone 7: deploy the same service to a Nitro Enclave — vsock transport,
   real attestation, PCR-conditioned KMS unseal, parent-side TLS relay.
-- Milestone 4 properly: compile Safety Policy v1 into a RISC Zero guest and replace
-  `simulated-reexec`. The verifier already expects that shape.
+- Milestone 4 properly: ~~compile Safety Policy v1 into a RISC Zero guest~~ —
+  done, standalone, on the Phase 2a branch (`prover/`, imageId `75751480…`); what
+  remains is wiring it into the request path and replacing `simulated-reexec`
+  (Phase 2b). The verifier already expects that shape.
 - Streaming (§31) with encrypted response frames.
 - Confidential GPU workers, which is what actually removes the upstream provider
   from the trust boundary.

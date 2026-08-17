@@ -7,3 +7,4 @@ node_modules/
 apps/web/AGENTS.md
 apps/web/CLAUDE.md
 .vercel
+.claude/worktrees/

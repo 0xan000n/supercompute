@@ -29,7 +29,7 @@ committed — `.superpowers/sdd/.gitignore` is `*`). Seven tasks, all complete.
 - **`prover-verify`** is a standalone offline verifier: 13 named checks against
   the pinned `prover/release.json`, no network in its dependency graph, dev-mode
   receipts rejected cryptographically (the `disable-dev-mode` feature, not a
-  string check). Four real receipts are committed as fixtures.
+  string check). Five real receipts are committed as fixtures.
 - **Measured, not modelled.** See `prover/README.md` "Measured on this machine"
   and `VALIDATION.md` §2c. The short version: the executor gate costs ~56 ms
   across the whole fixture corpus, a composite proof takes two to three minutes
@@ -93,9 +93,11 @@ set -a; source .env.local; set +a; pnpm test:e2e   # add OPENAI_API_KEY=… for 
 
 ## Open items (triaged, none merge-blocking)
 
-- **Parked from final review:** VALIDATION's `max_tokens` clause labels the
-  "required" half but not "policy-capped" — a caller passing `max_tokens: 128000`
-  raises the assumed-spend ceiling ~125×. One honest sentence (or a real cap) closes it.
+- ~~Parked from final review: the `max_tokens` assumed-spend ceiling~~ **closed
+  on this branch** (`8e2949f`): VALIDATION §2b now labels the caller-chosen half —
+  the clamp is the pinned model's 64,000 output ceiling, so a caller sending
+  128,000 books roughly 60× (not 125×) more assumed spend than the 1,024 default.
+  A real per-credential output-token cap remains the stronger fix, unscheduled.
 - Carry list (all reviewed, all fine-to-carry): redaction `\b` prefix gap;
   `events.ts` missing `xapikey`; `enclaveLog` dead code has no key-name layer;
   PATCH accepts weight/limits on DELETED rows (labelled in VALIDATION §2b);
@@ -135,8 +137,8 @@ the above. To exercise it:
 ```bash
 cd prover
 cargo run -rp host -- --bench --fixtures     # ~30 s, all 125 fixtures through the real image
-cd .. && ./prover/verify/target/release/prover-verify \
-  --receipt prover/verify/tests/fixtures/allow-real.receipt.bin
+cd .. && cargo run --release --manifest-path prover/verify/Cargo.toml -p prover-verify -- \
+  --receipt prover/verify/tests/fixtures/allow-real.receipt.bin   # builds if needed
 ```
 
 **Gates at Phase 2a HEAD:** `cargo fmt --check` (prover + verify + guest) ·
