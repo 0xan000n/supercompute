@@ -3,8 +3,8 @@
 import { useCallback, useState } from "react";
 import { ComputeTrustClient } from "@ctn/client";
 import { Shell } from "@/components/Shell";
-import { Badge, Button, Check, Field, Panel, SectionLabel, Textarea } from "@/components/ui";
-import { COORDINATOR, api, usePolled } from "@/lib/api";
+import { Badge, Button, Field, Panel, SectionLabel, Textarea } from "@/components/ui";
+import { COORDINATOR, usePolled } from "@/lib/api";
 import { ms, shortHash } from "@/lib/format";
 
 const client = new ComputeTrustClient(COORDINATOR);
@@ -29,15 +29,12 @@ interface TestResult {
   proofStarted: boolean;
 }
 
-interface ProofResult {
-  proof_status: string;
-  proof_ms?: number;
-  proof_verified?: boolean;
-  // Phase 2b — the real receipt's decoded five-field journal.
-  decoded_journal?: Record<string, unknown> | null;
-  verification?: { valid: boolean; checks: Array<{ name: string; pass: boolean; detail?: string }> };
-  error?: string;
-}
+// The authoritative policy identity is the guest image's POLICY_ID_V2, gated on
+// the request path. The Policy Lab runs the TypeScript preview engine, whose
+// pkg.policyId is a DIFFERENT, non-authoritative id shown here for transparency.
+const PREVIEW_ID_NOTE =
+  "Preview identity. The authoritative policy id is the guest image's (POLICY_ID_V2), " +
+  "gated on the request path — this preview id is the TypeScript engine's and gates nothing.";
 
 const EXAMPLES = [
   "Explain how photosynthesis converts sunlight into chemical energy.",
@@ -53,35 +50,18 @@ export default function PolicyPage() {
   const [prompt, setPrompt] = useState(EXAMPLES[0]);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<TestResult | null>(null);
-  const [proof, setProof] = useState<ProofResult | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [elapsed, setElapsed] = useState(0);
 
   const run = useCallback(async () => {
     setBusy(true);
     setResult(null);
-    setProof(null);
     setError(null);
-    setElapsed(0);
     try {
+      // The preview returns the verdict + commitment only. It deliberately does
+      // NOT prove — the authoritative, verified STARK is produced on the request
+      // path, under the guest identity, not by this non-gating preview.
       const test = await client.policyTest(prompt);
       setResult(test);
-
-      if (test.proofStarted) {
-        const started = performance.now();
-        const tick = setInterval(() => setElapsed(performance.now() - started), 100);
-        try {
-          for (;;) {
-            const res = await api<ProofResult>(`/v1/policy/test/${test.testId}/proof`);
-            setProof(res);
-            if (res.proof_status !== "PROVING" && res.proof_status !== "QUEUED") break;
-            if (performance.now() - started > 90_000) break;
-            await new Promise((r) => setTimeout(r, 300));
-          }
-        } finally {
-          clearInterval(tick);
-        }
-      }
     } catch (err) {
       setError((err as Error).message);
     } finally {
@@ -95,9 +75,10 @@ export default function PolicyPage() {
         <header className="mb-5">
           <h1 className="text-[22px] font-semibold tracking-[-0.02em]">Policy lab</h1>
           <p className="mt-1 max-w-[760px] text-[13px] leading-relaxed text-ink-3">
-            Run a prompt through Safety Policy v1 without revealing it. The policy executes inside the
-            enclave and produces a proof whose public output names the decision and a commitment to
-            the request — and nothing about the request itself.
+            Run a prompt through Safety Policy v1 without revealing it. This is a preview: it returns
+            the decision and a commitment to the request — and nothing about the request itself — but
+            it gates nothing and produces no authoritative proof. The real, verified STARK is minted
+            on the request path, under the guest image&rsquo;s identity.
           </p>
         </header>
 
@@ -165,18 +146,22 @@ export default function PolicyPage() {
                   <Field label="Evaluation time" value={ms(result.policyMs)} />
                   <Field label="Prompt visible publicly" value="NO" tone="verified" />
                   <Field
-                    label="Policy id"
+                    label="Policy id (preview)"
                     value={shortHash(result.policyId, 10, 6)}
                     mono
+                    tone="pending"
                     copy={result.policyId}
                   />
                 </div>
+                <p className="mt-2 rounded-[10px] border border-pending/25 bg-pending/[0.06] px-3 py-2 text-[11px] leading-relaxed text-ink-4">
+                  {PREVIEW_ID_NOTE}
+                </p>
 
                 {result.decision === "DENY" && (
                   <p className="mt-2.5 rounded-[10px] border border-hairline bg-abyss px-3 py-2 text-[11px] leading-relaxed text-ink-4">
-                    No proof is generated for a denial: the proof asserts that a request satisfying
-                    the commitment was <span className="text-ink-3">allowed</span>. The matched rules
-                    and category scores are withheld because they would leak the prompt.
+                    A denial is not proved here. On the request path the proof asserts that a request
+                    satisfying the commitment was <span className="text-ink-3">allowed</span>; the
+                    matched rules and category scores are withheld because they would leak the prompt.
                   </p>
                 )}
               </Panel>
@@ -185,61 +170,32 @@ export default function PolicyPage() {
             {result?.decision === "ALLOW" && (
               <Panel className="p-4">
                 <div className="flex items-center justify-between">
-                  <SectionLabel>Policy proof</SectionLabel>
-                  <Badge
-                    tone={
-                      proof?.proof_status === "VERIFIED"
-                        ? "verified"
-                        : proof?.proof_status === "FAILED"
-                          ? "denied"
-                          : "pending"
-                    }
-                    dot
-                    pulse={!proof || proof.proof_status === "PROVING"}
-                  >
-                    {proof?.proof_status ?? "PROVING"}
-                  </Badge>
+                  <SectionLabel>Authoritative proof</SectionLabel>
+                  <Badge tone="neutral">REQUEST PATH</Badge>
                 </div>
-
-                {(!proof || proof.proof_status === "PROVING") && (
-                  <div className="mt-3">
-                    <div className="flex items-baseline justify-between">
-                      <span className="text-[12.5px] text-ink-2">Proving…</span>
-                      <span className="mono text-[11px] tabular-nums text-ink-4">{ms(elapsed)}</span>
-                    </div>
-                    <div className="sweep mt-2 h-[3px] rounded-full bg-hairline text-pending">
-                      <span className="sweep-bar" />
-                    </div>
-                  </div>
-                )}
-
-                {proof?.verification && (
-                  <div className="mt-2.5">
-                    {proof.verification.checks.map((check) => (
-                      <Check
-                        key={check.name}
-                        pass={check.pass}
-                        name={check.name}
-                        detail={check.detail}
-                      />
-                    ))}
-                    <div className="mt-2">
-                      <Field label="Proof time" value={ms(proof.proof_ms)} />
-                    </div>
-                  </div>
-                )}
-
-                {proof?.decoded_journal && (
-                  <div className="mt-3 border-t border-hairline pt-2.5">
-                    <SectionLabel>Public journal — all the proof reveals</SectionLabel>
-                    <pre className="mono mt-2 overflow-x-auto rounded-[10px] border border-hairline bg-abyss p-3 text-[11px] leading-relaxed text-ink-2">
-                      {JSON.stringify(proof.decoded_journal, null, 2)}
-                    </pre>
-                    <p className="mt-1.5 text-[11px] text-ink-4">
-                      No prompt, no category scores, no matched phrases, no reason.
-                    </p>
-                  </div>
-                )}
+                <p className="mt-2 text-[12px] leading-relaxed text-ink-3">
+                  The preview does not prove. A real STARK — verified server-side against the pinned
+                  guest manifest — is minted only when a request is gated on the request path, under
+                  the authoritative <span className="mono text-ink-2">POLICY_ID_V2</span> identity,
+                  not under this preview id. Its public journal reveals exactly these five fields, and
+                  nothing prompt-derived:
+                </p>
+                <pre className="mono mt-2 overflow-x-auto rounded-[10px] border border-hairline bg-abyss p-3 text-[11px] leading-relaxed text-ink-2">
+                  {JSON.stringify(
+                    {
+                      protocolVersion: 1,
+                      requestCommitment: shortHash(result.commitment, 10, 6),
+                      policyId: "POLICY_ID_V2",
+                      decision: "ALLOW",
+                      proofNonce: "0x…",
+                    },
+                    null,
+                    2
+                  )}
+                </pre>
+                <p className="mt-1.5 text-[11px] text-ink-4">
+                  No prompt, no category scores, no matched phrases, no reason.
+                </p>
               </Panel>
             )}
           </div>
@@ -254,9 +210,10 @@ export default function PolicyPage() {
                     <Field label="Engine" value={policy.engine} mono />
                     <Field label="Normalizer" value={policy.normalizer} mono />
                     <Field
-                      label="Policy id"
+                      label="Policy id (preview)"
                       value={shortHash(policy.policyId, 10, 6)}
                       mono
+                      tone="pending"
                       copy={policy.policyId}
                     />
                     <Field
@@ -269,7 +226,9 @@ export default function PolicyPage() {
                   <p className="mt-2.5 text-[11px] leading-relaxed text-ink-4">
                     The policy id covers the manifest, every rule byte and the proof program. Change
                     one weight and the id changes — so a contributor opts into an exact version, not
-                    a mutable label.
+                    a mutable label. This is the TypeScript preview engine&rsquo;s id and is{" "}
+                    <span className="text-pending">non-authoritative</span>; requests are gated under
+                    the guest image&rsquo;s authoritative <span className="mono">POLICY_ID_V2</span>.
                   </p>
                 </Panel>
 

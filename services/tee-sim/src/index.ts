@@ -920,27 +920,14 @@ app.post("/policy-test", async (request, reply) => {
   // one remaining request-shaped caller of `AuthorizedRequest.evaluate`.
   const gate = AuthorizedRequest.evaluate(canonical, payload.requestNonce, pkg);
 
-  if (gate.decision === "ALLOW") {
-    const w = gate.authorized.witness();
-    // Policy Lab is the PREVIEW surface, so the decision receipt it binds to
-    // carries the PREVIEW identity (pkg), labelled non-authoritative (Task 4). The
-    // proof itself is still real (the daemon proves w's canonical bytes).
-    const previewReceipt: PolicyDecisionReceiptV1 = {
-      requestId: testId,
-      requestCommitment: gate.commitment,
-      policyId: pkg.policyId,
-      decision: "ALLOW",
-      imageId: pkg.guestImageId,
-      timing: { gateWallMs: gate.policyMs },
-    };
-    prover.start(testId, {
-      canonicalRequest: w.canonicalRequest,
-      requestNonce: w.requestNonce,
-      requestCommitment: gate.commitment,
-      decision: "ALLOW",
-      decisionReceipt: previewReceipt,
-    });
-  }
+  // Task 4 — the preview does NOT prove. It is not a served request and gates
+  // nothing, so enqueuing a real ~2-min STARK here (as Task 3 briefly did) was
+  // both a UX regression and a source of an identity-inconsistent binding: the
+  // preview receipt carries the PREVIEW pkg identity, but the shared Prover
+  // stamps every artifact with the PINNED guest manifest identity (POLICY_ID_V2).
+  // Rather than mint a proof that disagrees with itself, the preview surfaces the
+  // verdict + commitment only; the authoritative, verified proof is produced on
+  // the request path (the guest gate), never here.
   return {
     testId,
     decision: gate.decision,
@@ -948,7 +935,8 @@ app.post("/policy-test", async (request, reply) => {
     policyId: pkg.policyId,
     policyMs: gate.policyMs,
     promptVisiblePublicly: false,
-    proofStarted: gate.decision === "ALLOW",
+    // The preview never proves — no artifact, no binding, no proof job.
+    proofStarted: false,
   };
 });
 

@@ -1980,6 +1980,57 @@ async function run2b_7(): Promise<void> {
   });
 }
 
+/**
+ * Task 4 — the Policy-Lab PREVIEW is decoupled from proving. It is not a served
+ * request and it does NOT gate anything; it must not enqueue a real ~2-min STARK
+ * (that was a Task-3 UX regression) and it must not mint an identity-inconsistent
+ * proof binding. Two guarantees:
+ *   (a) BEHAVIOUR — `/policy-test` returns proofStarted:false and enqueues no
+ *       proof job (the proof endpoint stays NOT_REQUIRED), while still surfacing
+ *       the PREVIEW policy id (pkg), which differs from the authoritative guest id.
+ *   (b) HONESTY  — the Policy-Lab UI labels that preview id as non-authoritative
+ *       and names POLICY_ID_V2 as the authoritative identity (source-level guard;
+ *       the web app ships no component-test runner).
+ */
+async function run2b_8(): Promise<void> {
+  await test("2b.8", "Policy-Lab preview is decoupled from proving (no real STARK) and its identity is labelled non-authoritative", async () => {
+    const [guest, preview] = await Promise.all([guestPolicyId(), previewPolicyId()]);
+    assert(guest !== preview, `guest and preview policy ids must differ (guest=${guest}, preview=${preview})`);
+
+    // (a) A benign prompt is ALLOWed by the preview gate, but NO proof is enqueued.
+    const t0 = Date.now();
+    const res = await client.policyTest("Explain how photosynthesis converts sunlight into chemical energy.");
+    const elapsedMs = Date.now() - t0;
+    assert(res.decision === "ALLOW", `expected a benign prompt to preview-ALLOW, got ${res.decision}`);
+    assert(res.proofStarted === false, `preview must NOT start a proof, got proofStarted=${res.proofStarted}`);
+    assert(res.policyId === preview, `preview must surface the PREVIEW pkg policyId ${preview}, got ${res.policyId}`);
+    assert(res.policyId !== guest, `preview policyId must NOT be the authoritative guest id ${guest}`);
+    // A real STARK would take ~2 min; decoupled preview returns in well under a second of proving work.
+    assert(elapsedMs < 30_000, `preview must return promptly without proving, took ${elapsedMs}ms`);
+
+    // The enclave itself must hold NO proof job for this preview id (404 →
+    // NOT_REQUIRED). The preview never calls prover.start, so nothing is enqueued.
+    const proofRes = await fetch(`${TEE}/proofs/${res.testId}`);
+    const proof = (await proofRes.json()) as { status?: string };
+    assert(
+      proofRes.status === 404 && proof.status === "NOT_REQUIRED",
+      `preview must enqueue no proof job in the enclave, got HTTP ${proofRes.status} ${JSON.stringify(proof)}`
+    );
+
+    // (b) The UI must label the preview identity as non-authoritative. No web
+    // component-test runner exists, so guard the copy at the source.
+    const pagePath = join(ROOT, "apps/web/src/app/policy/page.tsx");
+    const page = readFileSync(pagePath, "utf8");
+    assert(/preview identity/i.test(page), "Policy-Lab page must label the preview policy id as a 'preview identity'");
+    assert(
+      /POLICY_ID_V2/.test(page) && /authoritative/i.test(page),
+      "Policy-Lab page must name POLICY_ID_V2 as the authoritative identity"
+    );
+
+    return `preview ALLOW in ${elapsedMs}ms, proofStarted=false, proof_status=NOT_REQUIRED; preview id ${preview.slice(0, 10)}… labelled non-authoritative (guest ${guest.slice(0, 10)}… authoritative)`;
+  });
+}
+
 // ---- daemon lifecycle for the PROVER_UNAVAILABLE case ----
 
 function daemonPidOn4500(): string | undefined {
@@ -2141,6 +2192,7 @@ async function main(): Promise<void> {
   await run2b_4();
   await run2b_6();
   await run2b_7(); // gated real prove (CTN_E2E_REAL_PROOF=1); self-skips otherwise
+  await run2b_8(); // Policy-Lab preview decoupled from proving + non-authoritative label
   // 2b.5 takes the :4500 daemon down and restarts it — run it LAST so nothing
   // after it depends on the daemon being up.
   await run2b_5();

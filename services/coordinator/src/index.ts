@@ -1094,38 +1094,12 @@ app.post("/v1/policy/test", async (request, reply) => {
   }
 });
 
-/**
- * Proof state for a policy-lab test. Separate from the request proof endpoint
- * because a policy test deliberately creates no request row — it is an
- * evaluation, not a served request, and it must not appear in usage accounting
- * or the provenance graph.
- */
-app.get("/v1/policy/test/:testId/proof", async (request, reply) => {
-  const { testId } = request.params as { testId: string };
-  if (!/^ptest_[a-z0-9]+$/.test(testId)) {
-    return reply.code(400).send({ error: { code: "CTN_INTERNAL", message: "invalid test id" } });
-  }
-  try {
-    const res = await teeClient.proof(testId);
-    return {
-      test_id: testId,
-      proof_status: res.status,
-      proof_verified: res.proofVerified ?? false,
-      proof_ms: res.proofMs,
-      error: res.error,
-      decoded_journal: res.decodedJournal ?? null,
-      artifact_digest: res.artifactDigest ?? null,
-      verification: res.verification ?? null,
-    };
-  } catch (err) {
-    if (err instanceof EnclaveRejectionError) {
-      return { test_id: testId, proof_status: "NOT_REQUIRED" };
-    }
-    return reply.code(503).send({
-      error: { code: "CTN_ENCLAVE_UNAVAILABLE", message: "The confidential service is unavailable." },
-    });
-  }
-});
+// Task 4 — there is deliberately no policy-test proof endpoint. The Policy Lab
+// is a PREVIEW that gates nothing and mints no proof (proving there would produce
+// an identity-inconsistent binding: the preview receipt carries the non-authoritative
+// pkg id, while the shared prover stamps the pinned guest POLICY_ID_V2). The
+// authoritative, verified STARK is produced only on the request path and polled
+// via `/v1/requests/:id/proof`.
 
 app.get("/v1/policy", async () => ({
   policyId: pkg.policyId,
