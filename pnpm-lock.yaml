@@ -17,6 +17,9 @@ importers:
       '@ctn/protocol':
         specifier: workspace:*
         version: link:packages/protocol
+      '@ctn/verify':
+        specifier: workspace:*
+        version: link:packages/verify
     devDependencies:
       '@types/node':
         specifier: ^26.2.0
@@ -107,6 +110,16 @@ importers:
       '@noble/hashes':
         specifier: ^2.3.0
         version: 2.3.0
+    devDependencies:
+      tsx:
+        specifier: ^4.19.2
+        version: 4.23.12
+
+  packages/verify:
+    dependencies:
+      '@ctn/protocol':
+        specifier: workspace:*
+        version: link:../protocol
     devDependencies:
       tsx:
         specifier: ^4.19.2

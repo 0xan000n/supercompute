@@ -18,7 +18,8 @@
   "dependencies": {
     "@ctn/client": "workspace:*",
     "@ctn/policy": "workspace:*",
-    "@ctn/protocol": "workspace:*"
+    "@ctn/protocol": "workspace:*",
+    "@ctn/verify": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
