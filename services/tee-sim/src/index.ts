@@ -31,7 +31,9 @@ import {
   type SignedProofBindingV2,
 } from "@ctn/protocol";
 import { hpkeSeal } from "@ctn/protocol";
-import { loadPolicyPackage } from "@ctn/policy";
+import { loadPolicyPackage, normalize, requestText } from "@ctn/policy";
+import { classify } from "./insights/classify.js";
+import { BulletinAccumulator } from "./insights/bulletin.js";
 import { SimulatedTEE, SIMULATION_WARNING, vaultDecrypt, vaultEncrypt } from "./tee.js";
 import { MODEL_CATALOG } from "./catalog.js";
 import { deriveCapability, InvalidIntentError, parseIntent } from "./intent.js";
@@ -66,6 +68,17 @@ const vaultKey = tee.unsealVaultKey();
 // ---------------------------------------------------------------------------
 const PROVER_URL = process.env.CTN_PROVER_URL ?? "http://127.0.0.1:4500";
 const proverClient = new ProverClient(PROVER_URL);
+
+// ---------------------------------------------------------------------------
+// Phase 3 — Clio-lite insights. The classifier runs on the plaintext ALREADY in
+// the enclave during the gate step (no second decrypt, no second /execute); only
+// the closed-enum `Facet` and the ALLOW/DENY verdict reach this accumulator. The
+// prompt is discarded after the gate exactly as before — nothing here persists,
+// logs, or serves it. `GET /insights` emits a threshold-suppressed, enclave-
+// signed bulletin of INTEGER aggregates. Counters are cumulative since boot.
+// ---------------------------------------------------------------------------
+const INSIGHTS_K_MIN = Number(process.env.CTN_INSIGHTS_K_MIN ?? 5);
+const insights = new BulletinAccumulator();
 
 // Paths to the reference offline verifier and the pinned manifest. The enclave
 // spawns `prover/verify` (no FFI) against `prover/release.json` before any proof
@@ -229,6 +242,28 @@ app.get("/build-manifest", async () => ({
   policyRulesSha256: "0x" + canonicalHash(pkg.rules),
   warning: SIMULATION_WARNING,
 }));
+
+/**
+ * Phase 3 — Clio-lite. The current threshold-suppressed, enclave-signed insights
+ * bulletin (design §7). Aggregate INTEGER counts + closed-enum facets ONLY — no
+ * prompt, no free text, no per-request facet ever appears. `policyId` is the
+ * guest's authoritative POLICY_ID_V2 (the identity the safety facets derive
+ * from), falling back to the preview package id only if the gate is unreachable
+ * before any request has been classified. Signed with the enclave receipt key.
+ */
+app.get("/insights", async () => {
+  let policyId = pkg.policyId;
+  try {
+    policyId = (await getGuestHealth()).policyId;
+  } catch {
+    // Gate not yet reached — serve the (empty) bulletin under the preview id.
+  }
+  return insights.buildBulletin({
+    kMin: INSIGHTS_K_MIN,
+    policyId,
+    sign: (value) => tee.signReceipt(value),
+  });
+});
 
 // ---------------------------------------------------------------------------
 // §13 — credential ingestion
@@ -444,7 +479,11 @@ async function gateRequest(envelope: SecureRequestEnvelope): Promise<GateOutcome
       canonicalRequestBytes,
       requestNonceHex: payload.requestNonce,
       proofNonce,
-      emitScores: false,
+      // Phase 3 — the in-enclave facet classifier needs the per-category scores
+      // for a DENY (its facet is the deciding category). The guest already
+      // computed them; emitting them adds no second execution and they never
+      // leave the enclave — only the resulting closed-enum Facet is aggregated.
+      emitScores: true,
     });
   } catch (err) {
     if (err instanceof ProverUnavailableError) throw err; // → PROVER_UNAVAILABLE
@@ -477,6 +516,33 @@ async function gateRequest(envelope: SecureRequestEnvelope): Promise<GateOutcome
     receipt,
     enclaveSignature: tee.signReceipt(receipt),
   };
+
+  // Phase 3 — Clio-lite. Classify the request into ONE closed-enum Facet on the
+  // plaintext already decrypted above (no second decrypt / no second /execute),
+  // and fold it into the in-enclave aggregate. DENY → the deciding policy
+  // category's facet (from the scores the guest just emitted); ALLOW → the local
+  // keyword classifier over the normalized text. Only the Facet + verdict are
+  // retained; the prompt is discarded with `payload` when this function returns,
+  // exactly as before. Best-effort: a classifier fault must never fail a real
+  // request, so it is fully guarded and dropped on error.
+  try {
+    const categoryScores: Record<string, number> = {};
+    const categoryThresholds: Record<string, number> = {};
+    for (const c of execResult.privateScores?.categories ?? []) {
+      categoryScores[c.category] = c.score;
+      categoryThresholds[c.category] = c.threshold;
+    }
+    const facet = classify({
+      normalizedPrompt: normalize(requestText(payload.request.messages)),
+      decision: gate.decision,
+      categoryScores,
+      categoryThresholds,
+    });
+    insights.record(facet, gate.decision);
+  } catch {
+    // Insights are strictly best-effort; a classification error is swallowed so
+    // it can never perturb the gate verdict, the proof, or the request path.
+  }
 
   return {
     requestId: envelope.requestId,

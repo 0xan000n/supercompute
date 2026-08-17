@@ -10,6 +10,7 @@ import type {
   SignedComputeReceipt,
   SignedProofBindingV2,
   SignedPolicyDecisionReceiptV1,
+  SignedInsightsBulletinV1,
   AttestationBundle,
   ProofArtifactWireV1,
 } from "@ctn/protocol";
@@ -86,6 +87,14 @@ export const teeClient = {
     call<AttestationResponse>(`/attestation${nonce ? `?nonce=${encodeURIComponent(nonce)}` : ""}`),
 
   buildManifest: () => call<Record<string, unknown>>("/build-manifest"),
+
+  /**
+   * Phase 3 — Clio-lite. The enclave's current signed insights bulletin, relayed
+   * OPAQUELY: this process never sees a prompt or a per-request facet, only the
+   * threshold-suppressed aggregate counts the enclave signed. The coordinator
+   * does not (and cannot) recompute or widen it.
+   */
+  insights: () => call<SignedInsightsBulletinV1>("/insights"),
 
   /**
    * §5.1 — which providers the enclave has an adapter for, and the pinned

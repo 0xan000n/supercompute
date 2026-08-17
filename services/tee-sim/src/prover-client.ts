@@ -27,6 +27,31 @@
  * not a reason to dispatch again. The gate proves each request once.
  */
 
+/**
+ * One policy category's evaluation, as the guest serializes it (camelCase, the
+ * `matchedTargets` id list included). `score`/`threshold` are integers (the
+ * guest scores in i64). Phase 3 Task 2 reduces `categories[]` into
+ * `{[category]: score}` / `{[category]: threshold}` for the facet classifier.
+ */
+export interface PrivateCategoryScore {
+  category: string;
+  name: string;
+  score: number;
+  threshold: number;
+  matchedTargets: string[];
+}
+
+/**
+ * The FULL guest evaluation, present only when `/execute` was called with
+ * `emitScores: true` (null otherwise). NOTE: the wire shape is the whole
+ * Evaluation object with a `categories[]` array — NOT a flat `{[cat]: number}`
+ * map. Do not index it as a map; reduce `categories[]` instead.
+ */
+export interface PrivateScores {
+  decision: "ALLOW" | "DENY";
+  categories: PrivateCategoryScore[];
+}
+
 export interface ExecuteResult {
   journal: {
     protocolVersion: 1;
@@ -35,7 +60,7 @@ export interface ExecuteResult {
     decision: "ALLOW" | "DENY";
     proofNonce: string;
   };
-  privateScores: Record<string, number> | null;
+  privateScores: PrivateScores | null;
   execWallMs: number;
 }
 

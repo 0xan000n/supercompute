@@ -156,6 +156,28 @@ app.get("/v1/build-manifest", async (request, reply) => {
 });
 
 // ---------------------------------------------------------------------------
+// Phase 3 — Clio-lite insights. The coordinator relays the enclave's signed
+// bulletin OPAQUELY (it never sees a prompt or a per-request facet). Storage is
+// in-memory-refreshed: each request re-fetches the enclave bulletin and caches
+// the last good one, so a momentary enclave blip still serves the most recent
+// signed aggregates rather than 503-ing. The response is the verbatim
+// SignedInsightsBulletinV1 the `/insights` page (Task 3) consumes.
+// ---------------------------------------------------------------------------
+let lastInsightsBulletin: import("@ctn/protocol").SignedInsightsBulletinV1 | null = null;
+
+app.get("/v1/insights", async (_request, reply) => {
+  try {
+    lastInsightsBulletin = await teeClient.insights();
+    return lastInsightsBulletin;
+  } catch {
+    if (lastInsightsBulletin) return lastInsightsBulletin;
+    return reply.code(503).send({
+      error: { code: "CTN_ENCLAVE_UNAVAILABLE", message: "The confidential service is unavailable." },
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // §12, §13 — contributors and credential onboarding
 // ---------------------------------------------------------------------------
 

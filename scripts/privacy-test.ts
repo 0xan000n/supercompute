@@ -18,6 +18,9 @@ import { randomUUID } from "node:crypto";
 import { ComputeTrustClient, CtnApiError, type CompletionResult } from "@ctn/client";
 
 const BASE = process.env.CTN_COORDINATOR_URL ?? "http://127.0.0.1:4200";
+/** Phase 3 — the enclave itself, swept directly so the insights surface is
+ * checked at its source, not only after the coordinator relays it. */
+const TEE = process.env.CTN_TEE_URL ?? "http://127.0.0.1:4400";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const DATA_DIR = join(root, ".data");
 
@@ -62,6 +65,13 @@ function countInDir(dir: string, needle: string, skip: string[] = []): number {
 
 async function countInApi(path: string, needle: string): Promise<number> {
   const res = await fetch(`${BASE}${path}`);
+  const text = await res.text();
+  return text.split(needle).length - 1;
+}
+
+/** Same, against an absolute URL — used for the enclave's own surfaces. */
+async function countInUrl(url: string, needle: string): Promise<number> {
+  const res = await fetch(url);
   const text = await res.text();
   return text.split(needle).length - 1;
 }
@@ -126,6 +136,12 @@ async function main(): Promise<void> {
   report("proof API", await countInApi(`/v1/requests/${completion.requestId}/proof`, canary), 0);
   report("request list API", await countInApi("/v1/requests?limit=100", canary), 0);
   report("stats API", await countInApi("/v1/stats", canary), 0);
+  // Phase 3 — Clio-lite insights. The prompt is classified into a closed-enum
+  // Facet inside the enclave; only that enum + integer aggregates are signed and
+  // served. The canary (prompt-derived text) must appear on NEITHER surface —
+  // the enclave's own bulletin nor the coordinator's opaque relay of it.
+  report("insights bulletin (enclave /insights)", await countInUrl(`${TEE}/insights`, canary), 0);
+  report("insights bulletin (coordinator /v1/insights)", await countInApi("/v1/insights", canary), 0);
   report(
     "vault + enclave state on disk",
     countInFile(join(DATA_DIR, "wrapped-dek.json"), canary) +
