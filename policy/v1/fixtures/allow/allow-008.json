@@ -10,7 +10,7 @@
         "content": "How to protect against phishing emails at a small company?"
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

@@ -831,7 +831,7 @@ mod tests {
 
     #[test]
     fn image_id_hex_round_trips_word_by_word() {
-        let hex = "75751480a7e7d6b329de6614fee99e8d2cf9a793c32e9c1e3de057f8196b0ee1";
+        let hex = "ddb7dc544e1425640ad3af8e7b3b48afa21499a0b371ce4a59fdb4d8594d5331";
         let digest = image_id_from_hex(hex).expect("valid image id");
         let rendered: String = digest
             .as_words()

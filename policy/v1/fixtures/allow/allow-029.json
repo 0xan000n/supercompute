@@ -10,7 +10,7 @@
         "content": "What is the best way to attack the final boss in this turn-based RPG?"
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

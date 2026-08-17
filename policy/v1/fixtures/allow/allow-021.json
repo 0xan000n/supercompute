@@ -10,7 +10,7 @@
         "content": "Give me a beginner 30 minute full body workout I can do at home."
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

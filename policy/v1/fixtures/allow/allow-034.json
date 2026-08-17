@@ -10,7 +10,7 @@
         "content": "In general terms, what is the difference between a felony and a misdemeanor?"
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

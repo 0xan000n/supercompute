@@ -10,7 +10,7 @@
         "content": "Explain the difference between affect and effect with examples."
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

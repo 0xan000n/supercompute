@@ -10,7 +10,7 @@
         "content": "I am writing a research paper on cybersecurity awareness. Explain, at a conceptual level, the main categories of social engineering attacks and how organizations train employees to recognize and prevent them. Keep it educational and high level."
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

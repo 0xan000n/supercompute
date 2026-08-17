@@ -10,7 +10,7 @@
         "content": "How do I detect and prevent ransomware on my home network?"
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

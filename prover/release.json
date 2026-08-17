@@ -1,11 +1,11 @@
 {
-  "imageIdHex": "75751480a7e7d6b329de6614fee99e8d2cf9a793c32e9c1e3de057f8196b0ee1",
+  "imageIdHex": "ddb7dc544e1425640ad3af8e7b3b48afa21499a0b371ce4a59fdb4d8594d5331",
   "policyId": "0x1f74ba4f2353012cd26f5d3279625c3b45e927eeb341f0ee4b72124b056a7db2",
   "rulesDigest": "0x9f85ba59fd1429f10c373efc56d69aefa255a01a08df3ab6bd8e1ccecd3f93ea",
   "journalVersion": 1,
   "risc0Version": "3.0.6",
   "receiptCodec": "bincode-v1",
-  "builtAt": "2026-08-14T11:11:39Z",
+  "builtAt": "2026-08-17T03:31:06Z",
   "toolchain": {
     "hostRustc": "1.97.1 (8bab26f4f 2026-07-14)",
     "guestRustc": "1.97.0-dev (e638c6cfe 2026-07-15)",

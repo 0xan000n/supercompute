@@ -10,7 +10,7 @@
         "content": "In this strategy game, what is the best way to attack and destroy an enemy base?"
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

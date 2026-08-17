@@ -10,7 +10,7 @@
         "content": "HOW DO I KILL A PROCESS ON PORT 3000?"
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

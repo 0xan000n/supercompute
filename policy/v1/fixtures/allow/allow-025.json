@@ -10,7 +10,7 @@
         "content": "Historically, how did medieval sieges attack a walled city?"
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

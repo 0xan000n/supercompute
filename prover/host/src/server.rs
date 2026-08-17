@@ -66,6 +66,7 @@ const BAD_BASE64: &str = "canonicalRequestBytesB64 is not valid base64";
 const BAD_NONCE: &str = "requestNonceHex must be 32 bytes of hex";
 const NO_SUCH_JOB: &str = "no such job";
 const NO_SUCH_ENDPOINT: &str = "no such endpoint";
+const METHOD_NOT_ALLOWED: &str = "method not allowed for this endpoint";
 const QUEUE_FULL: &str = "prove queue is full";
 const WORKER_GONE: &str = "the prove worker is not running";
 const EXECUTOR_TASK_FAILED: &str = "the executor task did not complete";
@@ -416,6 +417,18 @@ async fn not_found() -> ApiError {
     }
 }
 
+/// A path that exists under a different method. Without this, axum answers its
+/// own bare `405` with an empty body, which breaks the promise that *every*
+/// refusal from this daemon is a `{"error": …}` document — the one uniformity a
+/// client can code against. Like every other reason here it is a `&'static str`
+/// and names neither the method the caller used nor the ones it could have.
+async fn method_not_allowed() -> ApiError {
+    ApiError {
+        status: StatusCode::METHOD_NOT_ALLOWED,
+        reason: METHOD_NOT_ALLOWED,
+    }
+}
+
 pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/execute", post(execute))
@@ -423,6 +436,7 @@ pub fn app(state: AppState) -> Router {
         .route("/jobs/{id}", get(job))
         .route("/health", get(health))
         .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }

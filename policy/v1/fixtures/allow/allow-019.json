@@ -10,7 +10,7 @@
         "content": "Translate 'good morning, how are you' into Japanese and French."
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

@@ -10,7 +10,7 @@
         "content": "Help me make my short story opening more suspenseful."
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

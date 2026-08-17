@@ -96,14 +96,18 @@ The pin was **verified not to move the image**, which is the check that makes th
 paragraph above a measurement rather than an argument. `rustup toolchain install
 1.97.1`, then `cargo clean` in `prover/`, `rm -rf methods/guest/target`, and a
 cold `cargo build --release -p host` (3m27s): the guest ELF came back
-byte-identical at SHA-256
-`e5fd1e0d47a2b4422c7a2c614bfaf4d752cc389362f050d38afffb5864414301` — the same
-hash Task 4 recorded — and `--emit-release` reported ImageID
-`75751480a7e7d6b329de6614fee99e8d2cf9a793c32e9c1e3de057f8196b0ee1`, unchanged,
-with `builtAt` the only field that differed. On this machine `stable` *was*
-1.97.1 already, so the pin renamed the toolchain rather than changing the
-compiler; the reproduction shows the rename cost nothing, not that a different
-compiler would have.
+byte-identical to the hash Task 4 recorded and `--emit-release` reported an
+unchanged ImageID, with `builtAt` the only field that differed. On this machine
+`stable` *was* 1.97.1 already, so the pin renamed the toolchain rather than
+changing the compiler; the reproduction shows the rename cost nothing, not that a
+different compiler would have.
+
+That measurement was taken against the pre-remap identity
+(`75751480a7e7…`/ELF `e5fd1e0d47a2…`), which no longer exists: the fix in
+"Reproducibility of the image" below moved the image to
+`ddb7dc544e14…`/ELF `d7ad05b17aad…` deliberately. What carries over is the
+finding — the *host* channel does not reach the image — and it carries over
+because the mechanism did not change: `RUSTC` for the guest is still rzup's.
 
 Machine: Apple M1 Pro, 10 cores, 32 GB, macOS 26.0.1. **Proving here is CPU-only.**
 Despite what the toolchain's shape suggests, risc0 3.0.6 does not use the GPU on
@@ -307,16 +311,69 @@ costs is a confusing build failure for someone who writes `1.0` where they meant
 
 ### Reproducibility of the image
 
-`prover/methods/guest/target/` and `prover/target/riscv-guest/` deleted, then
-`cargo build --release -p host`: the guest ELF comes back **byte-identical**
-(SHA-256 `e5fd1e0d47a2b4422c7a2c614bfaf4d752cc389362f050d38afffb5864414301`) and
-so does the ImageID. Three cold builds now — two under Task 4, and one under Task
-7 after `cargo clean` and the switch to the pinned `1.97.1` host channel, which
-is the strongest of the three because it changed something and the ELF still did
-not move. That is one machine, three builds — evidence that the build is not
-gratuitously nondeterministic, not a claim of cross-machine reproducibility,
-which nothing here has tested. `release.json` pins the toolchain versions; that
-is what makes the claim checkable by someone else.
+**Same path, same bytes** was true from Task 4 on. **A different path produced a
+different image**, and that was fatal to the claim this directory is built
+around, because every clean clone lands at a different path. A black-box test
+found it: same source, same toolchain, one machine, three checkouts, three
+ImageIDs — `75751480…` at the original path, `9a6117a4…` in a git worktree,
+`9a6399b3…` in a copy under `/private/tmp`. No freshly-built daemon's receipt
+verified against the committed `release.json`.
+
+Two mechanisms, both of which had to be neutralised:
+
+* **Absolute source paths in the image.** A panic location is `file!()`, and
+  `file!()` is absolute for any crate outside the compiling package's own
+  directory. `strings` on the old ELF found
+  `…/prover/policy-core/src/input.rs` and eighteen
+  `$CARGO_HOME/registry/src/…` paths.
+* **The crate disambiguator.** Cargo derives `-C metadata` — which seeds
+  rustc's `StableCrateId` and therefore every mangled symbol in the binary —
+  from the package id, and a *path* package's id contains its absolute
+  directory. This is the half that is easy to miss: after remapping the source
+  paths the ELF still differed, in the symbol hashes of `policy_core` and
+  `policy_guest` and nothing else (the crates.io dependencies already matched
+  across checkouts). Guest symbol names are in the measured image.
+
+`prover/methods/build.rs` fixes both, in committed build config rather than in
+an environment variable a reader has to be told about. It generates a
+`RUSTC_WRAPPER` shim that appends `--remap-path-prefix <checkout>=/ctn
+--remap-path-prefix <CARGO_HOME>=/cargo` to every guest `rustc` invocation and
+rewrites `-C metadata` to `ctn-<crate>-<target>` for the two path packages. A
+wrapper rather than `RUSTFLAGS` because `risc0-build` sets
+`CARGO_ENCODED_RUSTFLAGS` on the nested guest build and strips every `CARGO*`
+variable from its environment, so `RUSTFLAGS` and `config.toml` `rustflags`
+never arrive; cargo's own `trim-paths` would be the clean answer but it is not
+stabilised in cargo 1.97.1, and risc0's answer is a Docker build, which would
+make Docker a dependency of verifying. The build **fails** if either prefix
+survives into the measured ELF — `build.rs` scans the bytes risc0-build hands
+back, so this is enforced, not remembered.
+
+The acceptance test, run after the fix:
+
+| build | guest ELF SHA-256 | ImageID |
+|---|---|---|
+| `/Users/ankit/code/supercompute/compute-trust-network` | `d7ad05b17aad9f245fb4eb503fa5708ab524c4a4e9745bfb438d143bc3a79b84` | `ddb7dc54…` |
+| the same tree rsynced to `/private/tmp/claude-501/…/ctn-copy` | `d7ad05b17aad9f245fb4eb503fa5708ab524c4a4e9745bfb438d143bc3a79b84` | `ddb7dc54…` |
+| the first path again, `target/riscv-guest/` deleted | `d7ad05b17aad9f245fb4eb503fa5708ab524c4a4e9745bfb438d143bc3a79b84` | `ddb7dc54…` |
+
+(The hash is of `target/riscv-guest/methods/policy_guest/riscv32im-risc0-zkvm-elf/release/policy_guest`,
+the user ELF. The combined user+kernel `policy_guest.bin` matched too, at
+`168c0cf6a13e88049f1f50b4df240937a841e53a923d1c038ebb7120c1eb9283`.)
+
+`strings` over the new ELF finds no path from this checkout and none from this
+machine's `CARGO_HOME`. Three absolute paths remain and none of them is ours:
+`/Users/administrator/.cargo/…/rustc-demangle-0.1.27/…` in the user ELF and
+`/home/remi/.cargo/…/no_std_strings-0.1.3/…` in the kernel half, both baked into
+published risc0 crates by whoever built them, and therefore the same constants
+on every machine.
+
+**What is still untested is cross-machine.** Everything above is one M1 Pro with
+one rzup toolchain. `release.json` pins the toolchain versions, which is what
+makes that check possible for someone else to run; nobody here has run it. A
+second machine could still differ — through a different rzup Rust build, a
+different C++ toolchain, or a dependency resolving differently — and the honest
+statement of the property is *path-independent on a given machine and
+toolchain*, not *universally reproducible*.
 
 `policy-core` exposes its `policy_id` module behind a default feature, and the
 guest takes the dependency with `default-features = false`. This did **not**
@@ -329,6 +386,8 @@ paragraph claimed "an edit to the canonicalizer cannot move the ImageID", and
 that is false. Task 6 measured it: adding a new module to `policy-core` behind
 an off-by-default feature the guest does not enable moved the ImageID from
 `75751480a7e7…` to `52c3ede0c090…`, with no behavioural change of any kind.
+(Both are pre-remap identities; the current image is `ddb7dc544e14…`. The
+remap fixed *where* the tree sits, not *what is in it*.)
 rustc folds a hash of a crate's contents into the symbol names of everything
 that links it, so **any** source edit to a crate the guest links — a comment, a
 blank line, a module the guest cfg's away — is a new image. (This is the same
@@ -398,20 +457,95 @@ slower than the 57 ms below.
 
 | Endpoint | Body | Answer |
 |---|---|---|
-| `POST /execute` | `{protocolVersion, canonicalRequestBytesB64, requestNonceHex, proofNonce, emitScores}` | `200 {journal:{…5 allowlist fields…}, privateScores:{…}\|null, execWallMs}` |
-| `POST /prove` | the same, minus `emitScores` | `202 {jobId}` |
+| `POST /execute` | `{protocolVersion, canonicalRequestBytesB64, requestNonceHex, proofNonce, emitScores}` — every field required, see below | `200 {journal:{…5 allowlist fields…}, privateScores:{…}\|null, execWallMs}` |
+| `POST /prove` | the same four, and **no** `emitScores` | `202 {jobId}` |
 | `GET /jobs/:id` | — | `{status:"QUEUED"\|"PROVING"\|"GENERATED"\|"FAILED", receiptB64?, proveWallMs?, error?, devMode}` |
 | `GET /health` | — | `{imageIdHex, policyId, rulesDigest, risc0Version, devMode}` |
+
+#### The POST body, field by field
+
+There are no optional fields and no defaults. Both bodies are
+`deny_unknown_fields` **and** every listed field is non-`Option`, so a body that
+is missing one or carries one too many is a 400 with
+`request body does not match the expected schema` — a fixed string that, by
+design, does not name the field. That is the right trade for a wire that must
+not echo caller bytes, and it is why the table has a Required column: the error
+cannot tell you, so the document has to.
+
+| field | type | `/execute` | `/prove` | what it is |
+|---|---|---|---|---|
+| `protocolVersion` | number | **required** | **required** | exactly `1`; anything else is rejected rather than interpreted |
+| `canonicalRequestBytesB64` | string | **required** | **required** | standard base64 (with padding) of the canonical request bytes — see below |
+| `requestNonceHex` | string | **required** | **required** | exactly 32 bytes as 64 hex digits; an optional `0x` prefix is accepted (`parse_nonce`), nothing else is |
+| `proofNonce` | string | **required** | **required** | caller's label, echoed into the public journal; `^(0x)?[0-9a-f]{1,64}$` and nothing else |
+| `emitScores` | boolean | **required** | **forbidden** | `true` returns the private category scores; `false` returns `privateScores: null`. Sending it to `/prove` is a 400: the prove path never captures scores, so accepting the field would imply an option that does not exist. |
+
+#### The canonical request
+
+`canonicalRequestBytesB64` decodes to the *canonical* form of the request, which
+is a narrower thing than "the JSON the caller sent". The guest re-derives the
+commitment from these exact bytes, so a byte that differs is a different
+commitment, and there is exactly one admissible spelling:
+
+```json
+{"max_tokens":1024,"messages":[{"content":"Write a haiku about the first snow of winter.","role":"user"}],"model":"ctn/demo-model-a","temperature_millis":1000}
+```
+
+* **Four keys, all required, no others.** `max_tokens`, `messages`, `model`,
+  `temperature_millis` — and each message object is exactly `content` + `role`.
+  `CanonicalRequestV1` and `CanonicalMessageV1` are `deny_unknown_fields`, so an
+  extra key is a refusal, not a warning ("What the guest commits" explains why
+  the guest refuses rather than opines).
+* **`temperature_millis`, never `temperature`.** Integer millis: `1000` is
+  temperature 1.0. There are no floats anywhere in the canonical form — a float
+  has no single spelling, and the commitment is over bytes. The gateway's
+  float-valued `temperature` is an *input* to canonicalization
+  (`packages/protocol/src/canonical.ts` folds it, and defaults it to `1000`),
+  never a field of the canonical document. `max_tokens` and `temperature_millis`
+  must be JSON integers; `serde_json` parses `1.0` as a float and the guest
+  refuses it, however integral the value.
+* **JCS key order.** Keys sorted by UTF-16 code unit, at every level — which is
+  why `max_tokens` precedes `messages` precedes `model`, and `content` precedes
+  `role`. RFC 8785, as implemented by `packages/protocol/src/canonical.ts`.
+* **No whitespace** between tokens, and **raw UTF-8 in string values, not
+  escapes**: `é` is two bytes, not `\u00e9`. Only the escapes JSON requires
+  (`"`, `\`, and the C0 controls) appear. Text is NFC-normalized before it is
+  serialized. In Python this is `json.dumps(..., ensure_ascii=False,
+  separators=(",", ":"), sort_keys=True)`; in Rust it is what
+  `serde_json::to_string` already does over a struct whose fields are declared
+  in sorted order.
+* **`role` is one of `system`, `user`, `assistant`**, and `messages` must be
+  non-empty.
+
+The commitment the journal carries is then
+
+```
+requestCommitment = "0x" + hex(SHA256("CTN_REQUEST_V1" ‖ canonicalRequestBytes ‖ requestNonce32))
+```
+
+— computed **in the guest**, from the bytes you sent and the nonce you sent, and
+never supplied by the host. `policy_core::request_commitment` is the definition;
+`packages/protocol/src/crypto.ts` is the TypeScript side of the same three
+concatenations. A verifier reproduces it the same way, which is what
+`prover-verify --canonical-request` does.
+
+`prover/verify/tests/fixtures/generate.py:38-98` is a worked example of the whole
+path — a template carrying the four keys in JCS order, the prompt through
+`json.dumps(..., ensure_ascii=False)`, then base64 and POST. The fixture corpus
+under `policy/v1/fixtures/` carries its `request` objects with the same four
+keys and the same `temperature_millis`; it is *not* canonical bytes, because the
+files are pretty-printed for review and the key order in a file is not
+significant.
 
 - `receiptB64` is base64 of the **bincode**-serialized risc0 receipt — the same
   codec `--bench` measures and the one `release.json` pins as
   `receiptCodec: "bincode-v1"`.
-- Unknown fields are rejected, so sending `emitScores` to `/prove` is an error
-  rather than a silently ignored option: the prove path never captures scores.
 - Every refusal is `{"error": "<one of a fixed set of strings>"}` with status
   400 (malformed request, including a body over the 10 MiB cap or the wrong
-  content type), 404 (`no such job`, `no such endpoint`), 503 (`prove queue is
-  full`) or 500 (the daemon's own fault). **No reason string ever contains a byte
+  content type), 404 (`no such job`, `no such endpoint`), 405 (`method not
+  allowed for this endpoint` — axum's own 405 is an empty body, so the router
+  installs a `method_not_allowed_fallback` to keep the shape uniform), 503
+  (`prove queue is full`) or 500 (the daemon's own fault). **No reason string ever contains a byte
   of the request** — the guest-side ones are the `policy_core::GuestRejection`
   constants, the host-side ones are `&'static str`s in `host/src/server.rs`, and
   `tests/api.rs` plants a marker in every caller-controlled field and asserts it
@@ -469,10 +603,15 @@ guest logic and catastrophic anywhere near a measurement or a trust claim.
 
 The rule for this directory:
 
-- **`--bench` refuses to run in dev mode.** It checks
+- **`--bench` refuses to run in dev mode — on the paths that prove.** It checks
   `ProverOpts::composite().dev_mode()` — the options actually being proved with,
   not a global — and exits with an error rather than printing fast, meaningless
-  numbers.
+  numbers. The refusal is deliberately scoped: `--bench --fixtures` and
+  `CTN_BENCH_PROVE=0` still run under `RISC0_DEV_MODE`, because neither of them
+  proves anything, and dev mode does not fake *execution*. A plain `--bench`,
+  which does prove, refuses (`main.rs:684`, guarded by `do_prove`). So the rule
+  is not "the bench binary will not start"; it is "no timing that claims to be a
+  proof was taken from a stub".
 - No number in this README or in `VALIDATION.md` was produced in dev mode.
 - **The daemon refuses to start under `RISC0_DEV_MODE` unless `--dev` is
   passed** — it exits non-zero with a one-line reason before it binds a port.
@@ -502,10 +641,10 @@ prover-verify
   release manifest: prover/release.json
   receipt:          prover/verify/tests/fixtures/allow-real.receipt.bin (537794 bytes)
 
-[ ok ] manifest                   pins imageId 75751480a7e7d6b329de6614fee99e8d2cf9a793c32e9c1e3de057f8196b0ee1, journalVersion 1, risc0 3.0.6, built 2026-08-14T11:11:39Z
+[ ok ] manifest                   pins imageId ddb7dc544e1425640ad3af8e7b3b48afa21499a0b371ce4a59fdb4d8594d5331, journalVersion 1, risc0 3.0.6, built 2026-08-17T03:31:06Z
 [ ok ] receipt-codec              bincode-v1
 [ ok ] receipt-decodes            537794 bytes, all of them decoded
-[ ok ] image-id                   the receipt claims 75751480a7e7d6b329de6614fee99e8d2cf9a793c32e9c1e3de057f8196b0ee1
+[ ok ] image-id                   the receipt claims ddb7dc544e1425640ad3af8e7b3b48afa21499a0b371ce4a59fdb4d8594d5331
 [ ok ] seal                       cryptographically valid for the pinned imageId
 [ ok ] journal-parses             JSON object, 259 bytes
 [ ok ] journal-key-set            exactly {decision, policyId, proofNonce, protocolVersion, requestCommitment}
@@ -750,8 +889,9 @@ verify is the three-run median from the table further down:
 | succinct | 223,744 | +29.52 s compressing the composite | 12.5 ms |
 | Groth16 | — | **not measurable here** | — |
 
-Both verify numbers are at the current image; the composite one is the
-`allow-001` median from the three-proof table above. **Compressing halves the
+Both verify numbers are wall-clock and therefore from the previous image — see
+the re-taken/not-re-taken note at the top of "Measured on this machine"; the
+composite one is the `allow-001` median from the three-proof table above. **Compressing halves the
 verify cost as well as shrinking the artifact 2.4×** — one recursive seal to
 check instead of two segments' worth.
 
@@ -776,7 +916,7 @@ The daemon keeps shipping **composite**, and `release.json` does not pin a kind:
 ### Fixtures
 
 `prover/verify/tests/fixtures/` holds five real receipts so that `cargo test`
-costs seconds instead of ~6.5 minutes of proving. `tests/fixtures/README.md` has
+costs seconds instead of ~8 minutes of proving. `tests/fixtures/README.md` has
 the regeneration commands, including how the wrong-image receipt was produced
 without a second image ever existing inside this repository.
 
@@ -784,7 +924,7 @@ The fifth is `adv-004-deny.receipt.bin`, and it is there because it is the only
 committed artifact carrying the claim that **the Unicode fold ran in the image**:
 its prompt spells the blocked phrase fullwidth (`ｂｏｍｂ`), nothing in
 `rules.json` matches that literally, and the seal binds the resulting DENY to
-image `75751480a7e7…`. The test rebuilds the canonical request from the corpus
+image `ddb7dc544e14…`. The test rebuilds the canonical request from the corpus
 fixture and requires the receipt to verify 13/13 against that exact commitment,
 so the artifact and the prompt on disk cannot drift apart silently.
 
@@ -795,12 +935,26 @@ so the artifact and the prompt on disk cannot drift apart silently.
 Apple M1 Pro, 10 cores, 32 GB, macOS 26.0.1. `--release`, dev mode off (refused
 outright), in-process prover (backend `local`, enforced), host toolchain pinned
 1.97.1. Guest image
-`75751480a7e7d6b329de6614fee99e8d2cf9a793c32e9c1e3de057f8196b0ee1`, policy id
+`ddb7dc544e1425640ad3af8e7b3b48afa21499a0b371ce4a59fdb4d8594d5331`, policy id
 `0x1f74ba4f2353012cd26f5d3279625c3b45e927eeb341f0ee4b72124b056a7db2`, rules digest
 `0x9f85ba59fd1429f10c373efc56d69aefa255a01a08df3ab6bd8e1ccecd3f93ea`. The policy
 id and the rules digest have not moved since Task 4's first image — `policy/v1/`
-has not been touched since — and **every number in this section was taken at the
-ImageID above.** There is no longer a table here quoting a previous image.
+has not been touched since. There is no longer a table here quoting a previous
+image.
+
+**Which numbers were re-taken at this ImageID, and which were not.** The
+path-independence fix (see "Reproducibility of the image") moved the image from
+`75751480a7e7…` without changing what the guest *does*: it renamed symbols and
+rewrote embedded path strings. **Cycle counts are exact and they did move**, by
+tens of cycles out of a million, so every cycle number below was re-taken at
+`ddb7dc544e14…` with a fresh `--bench --fixtures` (the one exception is the
+three-proof table under "Three proofs, end to end", whose cycle columns come out
+of the 24-minute proving bench, which was not re-run — that table is entirely at
+the previous image and says so). **Wall-clock timings were not re-taken**, and the reason is stated so it can be argued with: they are
+±20 %-noisy on this machine, a tens-of-cycles change is four orders of magnitude
+below that noise, and re-running the 24-minute proving bench would have replaced
+good numbers with equally noisy ones. So the wall-clock columns are the Task
+5/7 runs at the previous image and the cycle columns are new.
 
 ```bash
 cargo run -rp host -- --bench --fixtures                 # the corpus table
@@ -827,7 +981,7 @@ estimator is not reproducible.
 
 | | min | median | p95 | max |
 |---|---|---|---|---|
-| user cycles | 468,795 | 1,114,823 | 1,204,208 | 1,696,862 |
+| user cycles | 468,739 | 1,114,720 | 1,204,154 | 1,696,804 |
 
 Segments across the corpus: `[1, 2]`. Max po2: **20, for all 125 of them.**
 
@@ -835,11 +989,11 @@ The extremes, from the same run:
 
 | | fixture | prompt bytes | median | user cycles |
 |---|---|---|---|---|
-| most cycles | `allow-050` | 244 | 59.5 ms | 1,696,862 |
-| fewest cycles | `adv-020` (empty prompt) | 0 | 50.4 ms | 468,795 |
-| longest prompt | `adv-022` | 300 | 57.2 ms | 1,255,930 |
-| slowest *(this run only)* | `deny-027` | 55 | 59.6 ms | 1,054,214 |
-| fastest *(this run only)* | `adv-020` | 0 | 50.4 ms | 468,795 |
+| most cycles | `allow-050` | 244 | 59.5 ms | 1,696,804 |
+| fewest cycles | `adv-020` (empty prompt) | 0 | 50.4 ms | 468,739 |
+| longest prompt | `adv-022` | 300 | 57.2 ms | 1,255,825 |
+| slowest *(this run only)* | `deny-027` | 55 | 59.6 ms | 1,054,111 |
+| fastest *(this run only)* | `adv-020` | 0 | 50.4 ms | 468,739 |
 
 **Only the cycle-ranked rows are corpus facts.** Cycle counts are byte-identical
 across runs of a given image, so "most cycles" and "fewest cycles" name the same
@@ -880,7 +1034,10 @@ ran in the image, which is the part of this design a reader is most entitled to
 doubt. `--bench` refuses to start if any of the three has drifted from the file in
 `policy/v1/fixtures`.
 
-Three timed runs each after one discarded warmup. Medians:
+Three timed runs each after one discarded warmup. Medians. **Every number in
+this subsection — cycles included — is from the previous image**
+(`75751480a7e7…`): re-taking it costs 24 minutes of proving and the fix that
+moved the ImageID moved cycle counts by about a hundred out of a million.
 
 | Case | Executor | Composite prove | Receipt (bincode) | Verify, in-process | Verify, `prover-verify` |
 |---|---|---|---|---|---|
@@ -1320,8 +1477,12 @@ been touched — including a comment, for the reason in "Reproducibility of the
 image":
 
 ```bash
-# builtAt is the only field allowed to move; anything else means the image or a
-# toolchain changed and release.json plus the verify fixtures have to be re-cut
+# builtAt is the only field allowed to move. This gate is a real signal on a
+# clean checkout: since the ImageID stopped depending on the build path (see
+# "Reproducibility of the image"), a mismatch here means something in the image
+# or the toolchain actually changed — not that you cloned to a different
+# directory. Do NOT answer a mismatch by re-cutting release.json; find what
+# moved first.
 diff <(grep -v builtAt release.json) \
      <(cargo run -qrp host -- --emit-release | grep -v builtAt)
 ```

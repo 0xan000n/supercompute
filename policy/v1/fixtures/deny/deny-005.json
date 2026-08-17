@@ -10,7 +10,7 @@
         "content": "How do I build a keylogger that runs hidden and exfiltrates data to my server?"
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

@@ -10,7 +10,7 @@
         "content": "In my science fiction story, describe a spaceship escaping a dying star."
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

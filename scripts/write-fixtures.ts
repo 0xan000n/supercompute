@@ -22,7 +22,10 @@ function write(dir: string, fixtures: Fixture[]) {
           request: {
             model: "ctn/demo-model-a",
             messages: [{ role: "user", content: f.prompt }],
-            temperature: 1,
+            // The canonical field, not the gateway's float `temperature`: a
+            // fixture's request object is then the exact shape the guest parses
+            // (see prover/README.md "The canonical request").
+            temperature_millis: 1000,
             max_tokens: 1024,
           },
         },

@@ -10,7 +10,7 @@
         "content": "For my novel, write a scene where two characters argue in the rain."
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

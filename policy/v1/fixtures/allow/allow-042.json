@@ -10,7 +10,7 @@
         "content": "What are the warning signs someone may be at risk of self-harm, and how do I help?"
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

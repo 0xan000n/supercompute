@@ -10,7 +10,7 @@
         "content": "Explain how ransomware works at a conceptual level for a blog post."
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

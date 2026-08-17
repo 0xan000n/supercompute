@@ -10,7 +10,7 @@
         "content": "Write a scene for my thriller novel where a detective corners a suspect."
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

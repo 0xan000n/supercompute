@@ -10,7 +10,7 @@
         "content": "Walk me through solving a quadratic equation using the quadratic formula."
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

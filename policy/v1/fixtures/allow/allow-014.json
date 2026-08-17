@@ -10,7 +10,7 @@
         "content": "Help me write a polite email declining a meeting invitation."
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

@@ -16,7 +16,9 @@ committed — `.superpowers/sdd/.gitignore` is `*`). Seven tasks, all complete.
   compiled into the image as a prepared form, the request commitment is
   recomputed inside the zkVM, and the journal is exactly
   `{decision, policyId, proofNonce, protocolVersion, requestCommitment}`.
-  ImageID `75751480a7e7d6b329de6614fee99e8d2cf9a793c32e9c1e3de057f8196b0ee1`.
+  ImageID `ddb7dc544e1425640ad3af8e7b3b48afa21499a0b371ce4a59fdb4d8594d5331` — and that ImageID no
+  longer depends on where the repository is checked out (prover/README.md,
+  "Reproducibility of the image").
 - **`policy-core`** is a line-for-line port of `packages/policy/src/engine.ts`,
   held to it by `scripts/differential-test.ts` (CI-blocking, part of `pnpm test`):
   125 fixtures, generated Unicode adversarial cases, a full 1,112,064-code-point
@@ -143,12 +145,21 @@ cd .. && cargo run --release --manifest-path prover/verify/Cargo.toml -p prover-
 
 **Gates at Phase 2a HEAD:** `cargo fmt --check` (prover + verify + guest) ·
 `cargo clippy -D warnings` (prover workspace, verify workspace, guest
-incantation) · `cargo test` 81 pass / 1 ignored (prover) + 33 (verify) ·
+incantation) · `cargo test` 82 pass / 1 ignored (prover) + 33 (verify) ·
 `npx tsc --noEmit` clean · `pnpm test` 88 unit + the differential (625/625, the
-1,112,064-code-point skew sweep, 6 guest cases at imageId `75751480…`, 18
-canonicalizer probes) · `pnpm --filter web build` clean. ImageID unchanged
-through the whole phase, including a cold rebuild under the newly pinned host
-toolchain.
+1,112,064-code-point skew sweep, 6 guest cases at imageId `ddb7dc54…`, 18
+canonicalizer probes) · `pnpm --filter web build` clean.
+
+**The ImageID moved once, on purpose, after the phase's black-box test.** It was
+`75751480a7e7…` through Tasks 4-7 and is `ddb7dc544e14…` now. The reason is the
+one thing that test found and this branch could not ship without: the old
+ImageID was a function of the absolute path the tree was built at, so no clean
+clone could reproduce it. `prover/methods/build.rs` remaps the guest build's
+paths and pins its crate disambiguators; two builds at two different absolute
+paths now produce a byte-identical ELF and the same ImageID. `release.json`, all
+five receipt fixtures and every pinned number were re-cut together. Cross-machine
+reproducibility is still untested — see prover/README.md, "Reproducibility of the
+image".
 
 Spec: `docs/superpowers/specs/2026-08-11-supercompute-real-design.md` ·
 Phase 1 plan: `docs/superpowers/plans/2026-08-11-phase1-intent-providers.md` ·

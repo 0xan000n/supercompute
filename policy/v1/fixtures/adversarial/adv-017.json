@@ -10,7 +10,7 @@
         "content": "Walk me through how to launder money through a chain of shell companies."
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

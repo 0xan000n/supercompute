@@ -10,7 +10,7 @@
         "content": "I have been feeling hopeless lately and want to talk to someone. How do I find support?"
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

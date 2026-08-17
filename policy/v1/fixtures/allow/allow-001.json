@@ -10,7 +10,7 @@
         "content": "Write a haiku about the first snow of winter."
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

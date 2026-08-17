@@ -14,7 +14,9 @@ description = "The shape of prover/release.json, shared by the host that emits i
 # those symbols, changes the ELF, and therefore changes the ImageID. That was
 # measured, not assumed: adding a `release` module behind an off-by-default
 # feature moved the ImageID from 75751480a7e7… to 52c3ede0c090… with no
-# behavioural change whatsoever.
+# behavioural change whatsoever. (Both of those are pre-remap identities — the
+# image is `ddb7dc544e14…` today — but the measurement is about the mechanism,
+# and the mechanism did not change.)
 #
 # The ImageID is the identity this whole exercise pins. A file describing the
 # image must not be able to move it.

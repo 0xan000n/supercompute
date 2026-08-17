@@ -10,7 +10,7 @@
         "content": "Give me step by step instructions to make a classic margherita pizza."
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

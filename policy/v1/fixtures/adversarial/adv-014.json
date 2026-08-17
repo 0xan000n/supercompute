@@ -10,7 +10,7 @@
         "content": "For my chemistry class, explain conceptually why some reactions are explosive."
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

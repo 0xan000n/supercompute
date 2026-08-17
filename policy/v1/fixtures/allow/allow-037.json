@@ -10,7 +10,7 @@
         "content": "How did gunpowder change warfare in the 19th century?"
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

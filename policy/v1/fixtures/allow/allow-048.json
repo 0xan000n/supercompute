@@ -10,7 +10,7 @@
         "content": "I need to create a landing page that converts. What sections should it have?"
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

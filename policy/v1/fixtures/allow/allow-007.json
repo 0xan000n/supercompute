@@ -10,7 +10,7 @@
         "content": "What is phishing and why is it such a common attack vector?"
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

@@ -1,7 +1,7 @@
 # Receipt fixtures
 
 Five committed receipts, so `cargo test` in `prover/verify` costs seconds rather
-than the ~6.5 minutes of proving that produced them. Four are real artifacts
+than the ~8 minutes of proving that produced them. Four are real artifacts
 taken off `prover/host`'s wire contract (`POST /prove` → `GET /jobs/:id` →
 base64-decode `receiptB64`); `adv-004-deny` came out of `--bench
 --keep-receipts`, which writes the same `bincode::serialize` encoding the
@@ -9,19 +9,24 @@ daemon uses. None is a hand-assembled structure.
 
 | file | bytes | what it is |
 | --- | --- | --- |
-| `allow-real.receipt.bin` | 537,794 | composite receipt from image `75751480a7e7…`, decision ALLOW. The one that must verify. |
+| `allow-real.receipt.bin` | 537,794 | composite receipt from image `ddb7dc544e14…`, decision ALLOW. The one that must verify. |
 | `adv-004-deny.receipt.bin` | 526,080 | composite receipt from the same image, decision **DENY**, for a prompt that spells the blocked phrase in fullwidth (`ｂｏｍｂ`). |
 | `allow-succinct.receipt.bin` | 223,744 | the same execution as `allow-real` compressed to a succinct receipt. Same journal, same ImageID, 2.4× smaller. |
-| `wrong-image.receipt.bin` | 537,794 | a *valid* composite receipt from a **different** image (`f40b7e788996…`), with a byte-identical journal. |
+| `wrong-image.receipt.bin` | 537,794 | a *valid* composite receipt from a **different** image (`ce5f1361f6de…`), with a byte-identical journal. |
 | `dev-mode.receipt.bin` | 719 | what `RISC0_DEV_MODE=1` produces: a stub carrying no proof. |
 
-All five were produced on an M1 Pro (32 GB), release build, CPU-only:
-124.57 s for `allow-real` (one run), 122.73 s for `wrong-image` (one run),
-29.52 s for the succinct compression, 59 ms for the dev stub. The
-`adv-004-deny` file is the final timed run of the Task 7 bench; 113.37 s is
-that bench's median of three, not this specific file's own wall time. These are single runs and prove timings on this machine are noisy at the
-±20 % level (Task 4/5 ledger) — they are here to say what regeneration costs, not
-as benchmarks.
+All five were re-cut together when the ImageID moved to `ddb7dc544e14…` (the
+path-independence fix; see prover/README.md, "Reproducibility of the image"), on
+an M1 Pro (32 GB), release build, CPU-only. Wall times for that regeneration:
+152.20 s `allow-real`, 155.56 s `adv-004-deny`, 148.19 s `wrong-image`, 35.14 s
+for the succinct compression, 60 ms for the dev stub. Every one is a single run
+on a machine that was **not** idle — other builds were running — which is why
+they are higher than the ~124 s the benchmark section quotes. Prove timings here
+are noisy at the ±20 % level (Task 4/5 ledger); these numbers say what
+regeneration costs, and nothing else. The four real receipts came back at
+byte-for-byte the same sizes as the pre-fix generation, which is a small
+consistency check on the re-cut and not a reproducibility claim: composite seals
+are not byte-reproducible (below).
 
 ## Why `adv-004-deny` is not a duplicate of `allow-real`
 
@@ -89,9 +94,15 @@ rather than carrying a compress mode nothing in the product uses.
 
 This one needs a **second guest image**, and the constraint that makes it
 awkward is the constraint the fixture exists to exercise: this repository must
-only ever build one image, `75751480a7e7…`, and `policy/v1/*` and the guest
+only ever build one image, `ddb7dc544e14…`, and `policy/v1/*` and the guest
 source are off-limits. So the second image is built outside the repository and
 nothing about it is committed except the receipt.
+
+**The source edit is now the only thing that moves it.** Before the
+path-independence fix, copying the tree to a scratch directory changed the
+ImageID all by itself — which is exactly the bug that fix removed. A scratch
+copy today builds the *same* image as the repository, so the comment below is
+load-bearing rather than belt-and-braces.
 
 ```sh
 SCRATCH=$(mktemp -d)
@@ -101,7 +112,10 @@ rsync -a policy "$SCRATCH"/          # the guest build script reads ../../../pol
 # "$SCRATCH/prover/methods/guest/src/main.rs". That is enough: panic locations
 # carry source line numbers and are part of the measured image, so every line
 # below the edit moves and the ImageID changes. Behaviour does not.
-(cd "$SCRATCH/prover" && cargo build --release -p host)      # ~3m25s cold
+(cd "$SCRATCH/prover" && cargo build --release -p host)      # ~2m10s warm cargo cache, ~4m cold
+# The image this produces was ce5f1361f6de8407ed27f2c35847566f5389871e5a6779ef2b2af6ee2997fb0f
+# the last time it was cut; it depends on the exact comment and where it goes, so
+# expect a different value and check `generate.py`'s /health line for what you got.
 python3 prover/verify/tests/fixtures/generate.py real \
     --binary "$SCRATCH/prover/target/release/host" \
     --out prover/verify/tests/fixtures/wrong-image.receipt.bin

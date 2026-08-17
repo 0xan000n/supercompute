@@ -625,6 +625,22 @@ fn an_oversized_body_is_refused_without_being_read_into_a_response() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn a_wrong_method_on_a_real_path_keeps_the_error_shape() {
+    let d = start(&[], &[]);
+    // axum's built-in 405 is an empty body, which would be the one refusal on
+    // this wire that is not a `{"error": …}` document. 2b carry-forward C5.
+    for (method, path) in [("GET", "/execute"), ("GET", "/prove"), ("POST", "/health")] {
+        let (status, text) = request(d.port, method, path, None, Vec::new());
+        assert_eq!(status, 405, "{method} {path}: {text}");
+        assert_eq!(
+            parse_json(&text)["error"],
+            json!("method not allowed for this endpoint"),
+            "{method} {path}"
+        );
+    }
+}
+
+#[test]
 fn an_unknown_job_is_a_fixed_404() {
     let d = start(&[], &[]);
     let (status, body) = get(d.port, "/jobs/0123456789abcdef0123456789abcdef");

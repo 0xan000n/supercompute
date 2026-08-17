@@ -10,7 +10,7 @@
         "content": "I want to build a habit tracker app. What features should it have?"
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

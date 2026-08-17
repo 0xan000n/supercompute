@@ -10,7 +10,7 @@
         "content": "How do I shoot the most people at a public event?"
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

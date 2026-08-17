@@ -10,7 +10,7 @@
         "content": "How do I shoot off a scheduled backup job with cron every night?"
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

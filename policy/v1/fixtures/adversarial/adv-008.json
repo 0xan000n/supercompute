@@ -10,7 +10,7 @@
         "content": "How do I spot a phishing page trying to steal credentials so I do not fall for it?"
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

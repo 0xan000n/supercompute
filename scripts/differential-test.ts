@@ -483,7 +483,7 @@ interface Fixture {
   id: string;
   expected: "ALLOW" | "DENY";
   description: string;
-  request: { model: string; messages: Message[]; temperature: number; max_tokens: number };
+  request: { model: string; messages: Message[]; temperature_millis: number; max_tokens: number };
 }
 
 function loadFixtures(): Fixture[] {

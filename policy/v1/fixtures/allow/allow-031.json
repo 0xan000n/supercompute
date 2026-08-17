@@ -10,7 +10,7 @@
         "content": "How can I support a friend who is going through a hard breakup?"
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

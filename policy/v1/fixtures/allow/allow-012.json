@@ -10,7 +10,7 @@
         "content": "What role did the atomic bomb play historically in ending the war?"
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

@@ -10,7 +10,7 @@
         "content": "Write a SQL query to count orders per customer in the last 30 days."
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

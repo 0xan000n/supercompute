@@ -10,7 +10,7 @@
         "content": "As a security researcher defending our app, how do I recognize a phishing page?"
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

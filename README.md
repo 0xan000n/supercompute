@@ -66,8 +66,13 @@ rzup install        # fetches a Rust toolchain for the zkVM target; takes a few 
 `prover/rust-toolchain.toml` pins the host channel to `1.97.1`, so the first
 `cargo` command inside `prover/` installs that exact compiler if rustup does not
 already have it. Both installers write outside the working tree (`~/.cargo`,
-`~/.rustup`, `~/.risc0`). A cold `cargo build --release -p host` takes about
-three and a half minutes on an M1 Pro, most of it compiling the guest.
+`~/.rustup`, `~/.risc0`). A cold `cargo build --release -p host` takes
+**3m30s-4m30s** on an M1 Pro, most of it compiling the guest; where it lands in
+that range is what else the machine is doing (the low end is an idle machine,
+the high end was measured with other work running). A **warm** rebuild with
+nothing edited is a no-op — under a second — which was not true until
+`prover/methods/build.rs` stopped `risc0-build`'s always-rebuild hack from
+re-running the guest build script on every invocation.
 
 ```bash
 cd prover
@@ -406,7 +411,7 @@ the prompt. It never persists or logs plaintext, and every response from it carr
 - Milestone 7: deploy the same service to a Nitro Enclave — vsock transport,
   real attestation, PCR-conditioned KMS unseal, parent-side TLS relay.
 - Milestone 4 properly: ~~compile Safety Policy v1 into a RISC Zero guest~~ —
-  done, standalone, on the Phase 2a branch (`prover/`, imageId `75751480…`); what
+  done, standalone, on the Phase 2a branch (`prover/`, imageId `ddb7dc54…`); what
   remains is wiring it into the request path and replacing `simulated-reexec`
   (Phase 2b). The verifier already expects that shape.
 - Streaming (§31) with encrypted response frames.

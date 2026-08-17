@@ -476,7 +476,16 @@ Apple M1 Pro, 10 cores, 32 GB, macOS 26.0.1. risc0 3.0.6 (`cargo-risczero` 3.0.6
 `prover/rust-toolchain.toml` as of Task 7), guest toolchain 1.97.0. Release
 build, in-process prover (enforced — `--bench` refuses to run against a remote or
 subprocess backend), dev mode off (refused outright). Guest image
-`75751480a7e7d6b329de6614fee99e8d2cf9a793c32e9c1e3de057f8196b0ee1`.
+`ddb7dc544e1425640ad3af8e7b3b48afa21499a0b371ce4a59fdb4d8594d5331`
+The wall-clock timings in this section were taken at the previous image,
+`75751480a7e7…`, before the fix that made the ImageID independent of the build
+path (prover/README.md, "Reproducibility of the image"). That fix renamed
+symbols and rewrote embedded path strings without changing what the guest does:
+**the corpus cycle counts moved by tens of cycles out of a million and have been
+re-taken at the new image; wall-clock numbers, which are ±20 %-noisy here, have
+not.** The three-proof table further down is the exception in both columns: it
+comes from the 24-minute proving bench, which was not re-run, so its cycle
+figures are the previous image's too.
 
 **These are CPU numbers.** risc0 3.0.6 compiles Metal kernels on macOS and then
 never calls them — the Metal branches of `segment_prover()` and
@@ -502,14 +511,14 @@ distribution is over the 125 per-fixture medians; p95 is nearest-rank
 
 | | min | median | p95 | max |
 |---|---|---|---|---|
-| user cycles | 468,795 | 1,114,823 | 1,204,208 | 1,696,862 |
+| user cycles | 468,739 | 1,114,720 | 1,204,154 | 1,696,804 |
 
 Segments across the corpus: 1 or 2. Max po2: **20 for every one of the 125**.
 
 The shape of that is the finding. User cycles vary by **3.6×** across the corpus
 and wall time by **1.18×**, because most of the 56 ms is not policy work at all:
-the two extremes of the *cycle* range (468,795 cycles at 50.4 ms, `adv-020`;
-1,696,862 at 59.5 ms, `allow-050`) imply roughly **47 ms of fixed session setup
+the two extremes of the *cycle* range (468,739 cycles at 50.4 ms, `adv-020`;
+1,696,804 at 59.5 ms, `allow-050`) imply roughly **47 ms of fixed session setup
 plus ~7.4 ms per million user cycles**. That is a two-point estimate from the ends
 of the range, not a fit, and it is offered as an order of magnitude — including
 its anchor: both constants come from one run's extremes, and a rerun on this
@@ -541,6 +550,9 @@ evidence that the Unicode half of the policy ran in the image.
 | `allow-001` ALLOW | 58.3 ms | 124.10 s | 537,794 B | 29.1 ms | 31.3 ms |
 | `deny-001` DENY | 56.4 ms | 122.85 s | 537,792 B | 29.4 ms | 31.9 ms |
 | `adv-004` DENY | 57.3 ms | 113.37 s | 526,080 B | 29.7 ms | 30.5 ms |
+
+**Both tables above and below are from the previous image** — see the note at
+the top of this section.
 
 | Case | Segments | Max po2 | User cyc | Total cyc | Paging cyc | Reserved cyc |
 |---|---|---|---|---|---|---|

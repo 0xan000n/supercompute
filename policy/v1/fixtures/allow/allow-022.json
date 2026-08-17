@@ -10,7 +10,7 @@
         "content": "Plan a 3 day itinerary for a first trip to Kyoto."
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }

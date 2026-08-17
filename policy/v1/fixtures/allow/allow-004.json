@@ -10,7 +10,7 @@
         "content": "Explain how to reverse a linked list in Python with recursion."
       }
     ],
-    "temperature": 1,
+    "temperature_millis": 1000,
     "max_tokens": 1024
   }
 }
