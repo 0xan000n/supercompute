@@ -2126,7 +2126,26 @@ async function run2b_9(): Promise<void> {
       "the pinned release imageId must be ddb7dc… (unchanged)"
     );
 
-    return "ProofBeat: QUEUED 'waiting to prove', PROVING (real ImageID + elapsed, no ETA), Inspect/verify-via-coordinator (not offline), VERIFIED only via coordinator seal (necessary-not-sufficient local), PROVER_UNAVAILABLE distinct, DENY still proved";
+    // WIRING, not just copy. The checks above assert the honest guard/labels EXIST;
+    // this asserts the VERIFIED chip is actually GATED on the coordinator seal, never
+    // on the local verifier. It catches the exact regression a string check misses:
+    // rewiring `const verified = sealVerifiedByCoordinator(proof)` to
+    // `= verifyReceipt(...).ok` (a real receipt from the WRONG image passes the local
+    // check but its seal is for a different image — it must never read as VERIFIED).
+    assert(
+      /const\s+verified\s*=\s*sealVerifiedByCoordinator\(proof\)\s*;/.test(beat),
+      "the VERIFIED gate must be assigned solely from sealVerifiedByCoordinator(proof)"
+    );
+    assert(
+      !/\bverified\b[^\n]*=\s*[^;\n]*(verifyReceipt|local\.ok|\.ok\b)/.test(beat),
+      "the VERIFIED gate must NOT derive from the local verifyReceipt result or its .ok"
+    );
+    assert(
+      beat.indexOf("sealVerifiedByCoordinator(proof)") < beat.indexOf("verifyReceipt("),
+      "verifyReceipt must be invoked only inside the verified view (after the gate), never in the chip's gating scope"
+    );
+
+    return "ProofBeat: QUEUED 'waiting to prove', PROVING (real ImageID + elapsed, no ETA), Inspect/verify-via-coordinator (not offline), VERIFIED only via coordinator seal (necessary-not-sufficient local; wiring-asserted), PROVER_UNAVAILABLE distinct, DENY still proved";
   });
 }
 
