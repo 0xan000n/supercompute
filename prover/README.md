@@ -102,6 +102,13 @@ unchanged ImageID, with `builtAt` the only field that differed. On this machine
 changing the compiler; the reproduction shows the rename cost nothing, not that a
 different compiler would have.
 
+To force a guest rebuild, use `cargo clean` (or edit/`touch` a guest source) —
+**not** a partial `rm -rf target/riscv-guest`. The `methods` build script keeps
+no-op builds instant by restoring `methods.rs`'s mtime, so cargo will not notice
+a manually deleted *output*, will skip re-running the script, and the build then
+fails trying to `include_bytes!` the ELF you deleted. A fresh clone is
+unaffected (no `target/`, so the script runs normally).
+
 That measurement was taken against the pre-remap identity
 (`75751480a7e7…`/ELF `e5fd1e0d47a2…`), which no longer exists: the fix in
 "Reproducibility of the image" below moved the image to
