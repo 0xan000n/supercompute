@@ -1802,6 +1802,80 @@ async function run2b_4(): Promise<void> {
   });
 }
 
+async function run2b_6(): Promise<void> {
+  await test("2b.6", "pending gate is bound to its commitment: a mismatched /execute is rejected and does NOT consume the victim gate", async () => {
+    const att = await client.attestation();
+    const { envelope } = await sealCustom(att, {
+      model: MODEL_A,
+      messages: [{ role: "user", content: `gate-binding ${randomUUID()}` }],
+    });
+
+    // Two-call flow, step 1: gate the request. This parks the ALLOW plaintext
+    // under envelope.requestId, bound to the returned commitment.
+    const gateRes = await fetch(`${TEE}/gate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ envelope }),
+    });
+    const gate = await gateRes.json();
+    assert(gate.decision === "ALLOW", `expected an ALLOW gate to park, got ${gate.decision} / ${JSON.stringify(gate.error)}`);
+    assert(typeof gate.commitment === "string" && gate.commitment.length > 0, "gate must return the commitment");
+
+    const creds = await getCredentials();
+    const real = creds.find((c) => c.status === "ACTIVE" && c.capability.allowedModels.includes(MODEL_A));
+    assert(real, "no active credential found for model-a");
+    // The public API hides encrypted_blob; read it from the DB so the matching
+    // /execute is a genuine COMPLETE dispatch (blob digest must match capability).
+    const db = new DatabaseSync(DB_PATH, { readOnly: true });
+    let encryptedBlob: string;
+    try {
+      encryptedBlob = (db.prepare(`SELECT encrypted_blob FROM credentials WHERE id = ?`).get(real.id) as { encrypted_blob: string }).encrypted_blob;
+    } finally {
+      db.close();
+    }
+    const candidate = {
+      credentialId: real.id,
+      contributorId: real.contributorId,
+      provider: real.provider,
+      status: "ACTIVE",
+      encryptedBlob,
+      capability: real.capability,
+      capabilitySignature: real.capabilitySignature,
+    };
+
+    // Attacker knows the pending requestId but not the commitment. Their /execute
+    // presents a WRONG commitment — must be rejected with a fixed string, and the
+    // victim gate must NOT be consumed or redirected to attacker candidates.
+    const mockBefore = fileSize(MOCK_LOG_PATH);
+    const badRes = await fetch(`${TEE}/execute`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ envelope, candidates: [candidate], requestCommitment: "0x" + "de".repeat(32) }),
+    });
+    const badJson = await badRes.json();
+    assert(badRes.status === 400, `mismatched /execute must be 400, got ${badRes.status}`);
+    assert(badJson?.error?.code === "CTN_INVALID_ENVELOPE", `expected CTN_INVALID_ENVELOPE, got ${JSON.stringify(badJson)}`);
+    assert(
+      badJson.error.message === "execute does not match the parked gate commitment",
+      `expected the fixed-string rejection, got ${JSON.stringify(badJson.error.message)}`
+    );
+    assert(!badJson.status, "a rejected /execute must not return a dispatch result");
+    assert(fileSize(MOCK_LOG_PATH) === mockBefore, "a mismatched /execute must not dispatch to any provider");
+
+    // The legitimate holder presents the correct commitment: the victim gate is
+    // still intact and dispatches normally.
+    const okRes = await fetch(`${TEE}/execute`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ envelope, candidates: [candidate], requestCommitment: gate.commitment }),
+    });
+    const okJson = await okRes.json();
+    assert(okRes.status === 200, `the correct /execute must succeed, got ${okRes.status} ${JSON.stringify(okJson?.error)}`);
+    assert(okJson.status === "COMPLETE", `expected COMPLETE after a matching commitment, got ${okJson.status}`);
+    return `mismatched /execute → 400 fixed-string (0 dispatch); matching commitment → ${okJson.status}`;
+  });
+}
+
 // ---- daemon lifecycle for the PROVER_UNAVAILABLE case ----
 
 function daemonPidOn4500(): string | undefined {
@@ -1961,6 +2035,7 @@ async function main(): Promise<void> {
   await run2b_2();
   await run2b_3();
   await run2b_4();
+  await run2b_6();
   // 2b.5 takes the :4500 daemon down and restarts it — run it LAST so nothing
   // after it depends on the daemon being up.
   await run2b_5();

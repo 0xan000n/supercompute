@@ -134,10 +134,13 @@ export const teeClient = {
    * the same `/execute` endpoint, which also gates inline for any direct caller
    * that did not pre-gate.
    */
-  execute: (envelope: SecureRequestEnvelope, candidates: Candidate[]) =>
+  execute: (envelope: SecureRequestEnvelope, candidates: Candidate[], requestCommitment?: string) =>
     call<ExecuteResult>("/execute", {
       method: "POST",
-      body: JSON.stringify({ envelope, candidates }),
+      // `requestCommitment` (from the prior `/gate`) binds this dispatch to the
+      // parked gate so a caller cannot redirect another request's ALLOW by
+      // naming its requestId. Omitted by design for direct callers with no gate.
+      body: JSON.stringify({ envelope, candidates, requestCommitment }),
     }),
 
   proof: (requestId: string) => call<ProofResponse>(`/proofs/${requestId}`),

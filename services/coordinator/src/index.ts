@@ -686,7 +686,7 @@ async function runSecureRequest(
   // ---- Dispatch (ALLOW only). The enclave consumes the parked gate outcome. ----
   let result: ExecuteResult;
   try {
-    result = await teeClient.execute(envelope, discovery.candidates);
+    result = await teeClient.execute(envelope, discovery.candidates, gate.commitment);
   } catch (err) {
     if (err instanceof EnclaveRejectionError) {
       const totalMs = Math.round(performance.now() - startedAt);

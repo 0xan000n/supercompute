@@ -45,6 +45,7 @@ import { Prover, type ProofWitness } from "./prover.js";
 import { verifyAttestation, verifyProof, verifyComputeReceipt } from "./verify.js";
 import { enclaveSafe } from "./enclave-log.js";
 import { ProverClient, ProverUnavailableError, type ProverHealth } from "./prover-client.js";
+import { PendingGates } from "./pending-gates.js";
 import { randomUUID } from "node:crypto";
 
 const PORT = Number(process.env.TEE_PORT ?? 4400);
@@ -304,6 +305,13 @@ interface ExecuteBody {
   envelope: SecureRequestEnvelope;
   /** Coordinator's candidate discovery result, in its preferred routing order. */
   candidates: CandidateRecord[];
+  /**
+   * The commitment returned by the prior `/gate`. Required to consume a parked
+   * gate: it binds this dispatch to the request the gate actually evaluated, so
+   * naming a victim's pending `requestId` alone cannot redirect their ALLOW.
+   * Absent for direct callers (no prior `/gate`), who are gated inline instead.
+   */
+  requestCommitment?: string;
 }
 
 export interface AttemptRecord {
@@ -473,27 +481,31 @@ function witnessFor(outcome: GateOutcome): ProofWitness {
 /**
  * Phase 2b §3 — the gate runs BEFORE candidate discovery, so the coordinator
  * gates (`/gate`), then discovers on the guest policyId, then dispatches
- * (`/execute`). An ALLOW gate outcome — which holds the plaintext witness the
- * dispatch needs — is parked here between the two calls. Bounded + TTL like the
- * nonce window: a single-operator demo dispatches within milliseconds, and an
- * abandoned gate (e.g. no-capacity, where the coordinator never dispatches) is
- * evicted rather than retained.
+ * (`/execute`). An ALLOW gate outcome — which holds the DECRYPTED plaintext
+ * witness the dispatch needs — is parked here between the two calls.
+ *
+ * The plaintext is bounded in TIME, not merely in count: an entry is dropped the
+ * instant `/execute` consumes it, OR reaped once its age exceeds `PENDING_TTL_MS`
+ * — enforced on every insert (reap-on-insert) AND by a low-frequency background
+ * sweep, so an abandoned gate (e.g. no-capacity, where the coordinator returns
+ * CTN_NO_CAPACITY and never dispatches) does not sit in enclave RAM once traffic
+ * stops. `PENDING_MAX` is the hard count bound; the oldest are dropped if the map
+ * is still full after reaping. Consumption is bound to the request commitment
+ * (see PendingGates): naming a parked `requestId` is not enough to consume it.
+ *
+ * TTL = 60s. The real `/gate`→`/execute` gap is milliseconds (a DB discovery
+ * query plus two loopback calls), so 60s is already orders of magnitude above
+ * any legitimate latency while shrinking the plaintext residency window 5× from
+ * the earlier 5-minute value. A no-capacity ALLOW is dropped after this window;
+ * that visible-absence is the correct behavior — those gates get no `/execute`,
+ * so their reaping IS the TTL.
  */
-const pendingGates = new Map<string, { outcome: GateOutcome; at: number }>();
-const PENDING_TTL_MS = 5 * 60 * 1000;
+const PENDING_TTL_MS = 60 * 1000;
 const PENDING_MAX = 10_000;
-function rememberGate(outcome: GateOutcome): void {
-  const now = Date.now();
-  if (pendingGates.size >= PENDING_MAX) {
-    for (const [k, v] of pendingGates) if (now - v.at > PENDING_TTL_MS) pendingGates.delete(k);
-    while (pendingGates.size >= PENDING_MAX) {
-      const oldest = pendingGates.keys().next();
-      if (oldest.done) break;
-      pendingGates.delete(oldest.value);
-    }
-  }
-  pendingGates.set(outcome.requestId, { outcome, at: now });
-}
+const pendingGates = new PendingGates<GateOutcome>({ ttlMs: PENDING_TTL_MS, max: PENDING_MAX });
+// A single unref'd background sweep so an idle enclave still reaps parked
+// plaintext on time even with no new inserts. Never keeps the process alive.
+pendingGates.startSweeper();
 
 /** Map a gate throw onto the HTTP reply. Shared by `/gate` and `/execute`. */
 function replyGateError(reply: import("fastify").FastifyReply, err: unknown): boolean {
@@ -748,7 +760,9 @@ app.post("/gate", async (request, reply) => {
   }
   // Enqueue the proof of the verdict immediately — ALLOW AND DENY.
   prover.start(outcome.requestId, witnessFor(outcome));
-  if (outcome.decision === "ALLOW") rememberGate(outcome);
+  // Park the ALLOW plaintext for the follow-up `/execute`, bound to the
+  // commitment the coordinator must reproduce to consume it.
+  if (outcome.decision === "ALLOW") pendingGates.remember(outcome.requestId, outcome.commitment, outcome);
 
   return {
     requestId: outcome.requestId,
@@ -773,14 +787,27 @@ app.post("/gate", async (request, reply) => {
  * this path). Either way the guest is the authoritative gate.
  */
 app.post("/execute", async (request, reply) => {
-  const { envelope, candidates } = request.body as ExecuteBody;
-  const parked = envelope?.requestId ? pendingGates.get(envelope.requestId) : undefined;
+  const { envelope, candidates, requestCommitment: presentedCommitment } = request.body as ExecuteBody;
+
+  // Consume a parked gate ONLY if the caller reproduces the commitment it was
+  // parked under. A mismatch (wrong or absent commitment for a real pending
+  // requestId) is rejected with a fixed string — never any request bytes — and
+  // leaves the victim's gate intact.
+  const consumed = envelope?.requestId
+    ? pendingGates.consume(envelope.requestId, presentedCommitment ?? "")
+    : ({ status: "MISS" } as const);
+
+  if (consumed.status === "MISMATCH") {
+    return reply
+      .code(400)
+      .send({ error: { code: "CTN_INVALID_ENVELOPE", message: "execute does not match the parked gate commitment" } });
+  }
 
   let outcome: GateOutcome;
-  if (parked) {
-    pendingGates.delete(envelope.requestId);
-    outcome = parked.outcome;
+  if (consumed.status === "HIT") {
+    outcome = consumed.value;
   } else {
+    // No parked gate for this requestId: gate inline (direct callers) in one shot.
     try {
       outcome = await gateRequest(envelope);
     } catch (err) {
