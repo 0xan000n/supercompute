@@ -96,15 +96,23 @@ whoever produced the receipt. Every proof and every number in
 prover backend is enforced local, and a composite proof of one policy evaluation
 takes two to three minutes of CPU on an M1 Pro.
 
-It is **not** wired into the demo. Nothing in `services/`, `apps/` or `scripts/`
-calls it; `pnpm dev` never starts it; no request that goes through this prototype
-produces a RISC Zero receipt. Every proof artifact the running demo shows is
-still `simulated-reexec` — the enclave re-executes the policy from the witness
-and signs the journal, which is not a zero-knowledge proof and is labelled that
-way in the UI, the API and `VALIDATION.md`. Connecting the two is Phase 2b. Until
-that lands, the correct summary is "the repository contains a real prover, and
-the demo does not use it", and any reading of the form "the demo now has real ZK
-proofs" is wrong.
+**Phase 2b wired it in.** The request path is now the guest gate: `services/`
+calls the prover on every gated request, and every gated request — ALLOW, DENY
+and no-capacity alike — produces a real RISC Zero receipt. Before the request is
+marked `VERIFIED`, the coordinator verifies that receipt's cryptographic seal
+server-side by running `prover/verify` against the pinned `release.json` (imageId
+`ddb7dc…`, `POLICY_ID_V2`); a receipt that does not verify is recorded as a
+failed proof, never rewritten to look verified. You still start the guest daemon
+yourself (`prover/target/release/host --serve --port 4500`) — `pnpm dev` does not
+launch it, and with it down every request fails closed with `PROVER_UNAVAILABLE`
+— but the demo now uses it, so the correct summary is "the repository contains a
+real prover, and the request path proves and verifies with it", and the reading
+"the demo now has real ZK proofs" is finally right. What stays simulated is the
+confidential boundary itself: the enclave (`tee-sim`) and the prover
+(`prover/host`) both run in ordinary, host-readable processes — the prover is
+handed the plaintext witness to prove over — so a real proof does not add
+hardware isolation. That boundary is labelled simulated at equal weight in the
+UI, the API and `VALIDATION.md`; only a Nitro deployment closes it.
 
 ---
 
@@ -253,9 +261,9 @@ be quoted on the half that flatters it.
 | Egress control | **Real** | Hostname allowlist checked inside the trust boundary before any bytes leave, redirects refused rather than followed. A refused redirect is classified as a *dispatched* failure, because the prompt and key already went out on the first hop. |
 | Intent replay protection | **Real, but in-memory** | The enclave refuses a sealed intent digest it has already consumed. That set does not survive a restart; what does is structural — the credential id is sealed inside the intent, so a replay can only re-mint the same capability for the same contributor. |
 | Spend caps | **Real counters, operational enforcement** | Daily dollar and request limits are counted and enforced, including for dispatches whose outcome was never learned. They live in ordinary application state, so a malicious host could roll them back. |
-| Hardware confidentiality | **Simulated** | `SimulatedTEE`: identical protocol, policy, credential handling, routing checks and receipt generation to the Nitro target, in an ordinary process whose memory the host can read. |
+| Hardware confidentiality | **Simulated** | `SimulatedTEE`: identical protocol, policy, credential handling, routing checks and receipt generation to the Nitro target, in an ordinary process whose memory the host can read. The boundary now spans `tee-sim` **and** `prover/host` — the prover receives the plaintext witness — and both run host-readable; a real proof does not isolate either. |
 | Attestation document | **Simulated platform, real signatures** | The document is genuinely signed by the enclave key and genuinely verified by the client, including nonce freshness — but no PCR measures a real host, so it attests code identity only by convention. |
-| Policy proof | **Simulated** (`simulated-reexec`) | The policy is genuinely re-executed from the witness and the journal is signed by an attested key, but there is no succinct argument. |
+| Policy proof | **Real** (RISC Zero STARK, coordinator-verified) | Every gated request produces a real RISC Zero receipt; the coordinator verifies its seal server-side with `prover/verify` against the pinned `release.json` (imageId `ddb7dc…`, `POLICY_ID_V2`) before `VERIFIED`. The browser runs structural checks only; the seal is the coordinator's, and anyone can re-run `prover/verify` offline. |
 | Demo traffic and dashboards | **Simulated** (mock upstream) | `pnpm seed` contributes five mock keys against `ctn/demo-model-*`. Every number on the graph, contributor and trust pages comes from that stand-in unless you ran the real-provider smoke tests above. |
 
 ## What this establishes
@@ -313,11 +321,13 @@ Read this as carefully as the list above.
   ingestion, accepts unauthenticated requests. That is fine for a single-machine
   demo and is why `pnpm seed` is three lines, but it means this must not be exposed
   to a network. See `VALIDATION.md` §2a.
-- **The proof is not yet zero-knowledge.** Artifacts are labelled
-  `simulated-reexec`. The policy is genuinely re-executed from the witness and the
-  journal is signed by a key bound into the attestation, but there is no succinct
-  argument — a verifier who distrusts the enclave learns nothing from it. RISC Zero
-  removes that assumption; this build does not.
+- **A real proof is not an isolated enclave.** The policy proof is now a real,
+  coordinator-verified RISC Zero STARK — but producing it does not shrink the
+  trust boundary. The prover (`prover/host`) is handed the plaintext witness and,
+  like `tee-sim`, runs in an ordinary host-readable process, so the simulated
+  confidential boundary is `tee-sim` + `prover/host` together. The receipt reveals
+  nothing of the prompt, but that is a property of the proof, not evidence of the
+  hardware isolation this build does not have.
 
 ---
 
@@ -330,7 +340,7 @@ Each of these is a substitution of infrastructure, not of architecture.
 | PostgreSQL | `node:sqlite` | Same schema, table for table. Keeps `pnpm dev` dependency-free. Swapping back is a driver change. |
 | Neo4j | SQLite `graph_nodes` / `graph_links` | The graph is still a **projection** built from the outbox, never on the inference path (§42), so Rule 9 holds. The projection logic is the spec's `MERGE` statements; only the adapter differs. |
 | Cosmograph | custom canvas renderer | §48 asks for a fixed lane layout with requests animating across it. A force layout rescrambles that on every update. Cosmograph is also CC-BY-NC and pins React 18. |
-| RISC Zero zkVM | `simulated-reexec` prover **on the request path** | The reason used to be "no Rust toolchain here"; since Phase 2a that is no longer true — `prover/` holds a real zkVM prover and a real offline verifier. What remains is that nothing calls them: the request path still produces `simulated-reexec` artifacts, and the wiring is Phase 2b. The verification path checks the same journal, image id and commitment bindings a risc0 receipt needs, so the proof system is swappable without touching callers. Labelled honestly everywhere. |
+| RISC Zero zkVM | **wired in** (Phase 2b) — no longer substituted | Phase 2a built a real zkVM prover and a real offline verifier in `prover/`; Phase 2b connected them to the request path. Every gated request now produces a real RISC Zero receipt, verified server-side by `prover/verify` against the pinned `release.json` before `VERIFIED`. What remains simulated is the confidential boundary the prover and enclave run in (the `SimulatedTEE` row below), not the proof. |
 | AWS Nitro Enclaves | `SimulatedTEE` | §38 explicitly provides for this. Only the attestation and vault-unseal modules differ; `TrustedEnvironment` is the seam. |
 | `docker compose up` | `pnpm dev` | Four Node processes, one command, nothing to install. |
 
@@ -410,10 +420,11 @@ the prompt. It never persists or logs plaintext, and every response from it carr
 
 - Milestone 7: deploy the same service to a Nitro Enclave — vsock transport,
   real attestation, PCR-conditioned KMS unseal, parent-side TLS relay.
-- Milestone 4 properly: ~~compile Safety Policy v1 into a RISC Zero guest~~ —
-  done, standalone, on the Phase 2a branch (`prover/`, imageId `ddb7dc54…`); what
-  remains is wiring it into the request path and replacing `simulated-reexec`
-  (Phase 2b). The verifier already expects that shape.
+- ~~Milestone 4: compile Safety Policy v1 into a RISC Zero guest~~ — done
+  (Phase 2a, `prover/`, imageId `ddb7dc54…`) and ~~wired into the request path~~ —
+  done (Phase 2b): every gated request produces a real receipt, verified
+  server-side by `prover/verify` before `VERIFIED`. What remains is running that
+  prover inside a real enclave rather than the simulated boundary.
 - Streaming (§31) with encrypted response frames.
 - Confidential GPU workers, which is what actually removes the upstream provider
   from the trust boundary.

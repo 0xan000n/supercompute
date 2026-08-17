@@ -90,6 +90,10 @@ export default function TrustPage() {
                 body="A verifier is handed a journal, a proof and a signed receipt, and can check that a request matching the commitment was evaluated by the exact named policy version and allowed — without receiving the request."
               />
               <Claim
+                title="The policy proof is real, and coordinator-verified"
+                body="Real RISC Zero STARK, generated per request and verified server-side by prover/verify against the pinned release manifest (imageId ddb7dc…). Structural checks also run in your browser; the cryptographic seal is verified by the coordinator; anyone can re-run prover/verify offline."
+              />
+              <Claim
                 title="Constrained delegation"
                 body="A contributor's allowed models and required policy are bound into an enclave-signed capability. The untrusted coordinator cannot widen them, reassign ownership, or swap the provider without detection. Models are named as dated snapshots, never as movable aliases, so consent to claude-haiku-4-5-20251001 cannot be re-pointed at whatever that name means next month."
               />
@@ -136,14 +140,16 @@ export default function TrustPage() {
                 <Claim
                   negative
                   title="This build has no hardware confidentiality"
-                  body="The enclave is running in simulation: the same protocol, policy, credential handling, routing checks and receipt generation as the Nitro build, but in an ordinary process whose memory the host can read. Only the Nitro deployment can claim isolation."
+                  body="The confidential service is running in simulation: the same protocol, policy, credential handling, routing checks, receipt generation and proving as the Nitro build, but in ordinary processes whose memory the host can read. Only the Nitro deployment can claim isolation."
                 />
               )}
-              <Claim
-                negative
-                title="The proof is not yet a zero-knowledge proof"
-                body="Proof artifacts are labeled simulated-reexec: the policy is genuinely re-executed from the witness and the journal is signed by a key bound into the attestation, but there is no succinct argument, so a verifier who distrusts the enclave learns nothing. RISC Zero removes that assumption; this build does not."
-              />
+              {simulated && (
+                <Claim
+                  negative
+                  title="The prover receives the plaintext, and runs simulated too"
+                  body="Making the proof real did not shrink the trust boundary. To prove the policy was evaluated, prover/host is handed the plaintext witness — the canonical request — so the simulated confidential boundary is now tee-sim + prover/host together. Both run in ordinary, host-readable processes; a real STARK does not make either of them hardware-isolated. The receipt reveals nothing of the prompt, but that is a property of the proof, not of an enclave this build does not have."
+                />
+              )}
               <Claim
                 negative
                 title="Intent replay protection is in-memory"
@@ -225,9 +231,10 @@ export default function TrustPage() {
                   />
                 ))}
                 <Field
-                  label="Policy id"
+                  label="Policy id (preview)"
                   value={shortHash(manifest.policyId, 12, 6)}
                   mono
+                  tone="pending"
                   copy={manifest.policyId}
                 />
                 <Field
@@ -237,13 +244,21 @@ export default function TrustPage() {
                   copy={manifest.policyRulesSha256}
                 />
                 <Field
-                  label="Proof program"
+                  label="Proof program (preview)"
                   value={shortHash(manifest.zkGuestImageId, 12, 6)}
                   mono
+                  tone="pending"
                   copy={manifest.zkGuestImageId}
                 />
-                <Field label="Proof system" value={manifest.proofSystem} mono tone="pending" />
+                <Field label="Proof system" value={manifest.proofSystem} mono tone="verified" />
               </div>
+              <p className="mt-2.5 text-[11px] leading-relaxed text-ink-4">
+                The policy id and proof program above are the TypeScript package&rsquo;s{" "}
+                <span className="text-pending">preview</span> identity. Every request is gated and
+                proved under the guest image&rsquo;s authoritative identity — POLICY_ID_V2, imageId{" "}
+                <span className="mono">ddb7dc…</span> — which is the identity <span className="mono">prover/verify</span>{" "}
+                checks the proof against server-side.
+              </p>
             </Panel>
           )}
 

@@ -2149,6 +2149,79 @@ async function run2b_9(): Promise<void> {
   });
 }
 
+/**
+ * Task 7 — the trust page finally tells the truth about the proof. After Tasks
+ * 2–6 the request path produces a REAL, coordinator-verified RISC Zero proof, so
+ * the trust page must move the ZK proof to ESTABLISHED with the exact honest
+ * scope, KEEP the enclave labelled SIMULATED at equal weight, and name
+ * prover/host in the simulated confidential boundary. No web test runner exists,
+ * so the honest copy is guarded at the SOURCE (as with 2b.8/2b.9); the live
+ * build-manifest and the services source confirm that no request-path surface
+ * still emits "simulated-reexec" as the live proof system. This is the honesty
+ * invariant's last mile — it regresses loudly if the page softens a simulated
+ * label or overclaims the proof.
+ */
+async function run2b_10(): Promise<void> {
+  await test("2b.10", "trust page: proof ESTABLISHED (real + coordinator-verified) AND enclave SIMULATED at equal weight; prover/host in the boundary; no request-path 'simulated-reexec'; README/VALIDATION corrected", async () => {
+    const trust = readFileSync(join(ROOT, "apps/web/src/app/trust/page.tsx"), "utf8");
+
+    // (1) The proof is ESTABLISHED — a non-negative Claim — with the exact honest
+    // scope: real STARK, per request, verified server-side by prover/verify
+    // against the pinned manifest (imageId ddb7dc…).
+    assert(/<Claim\s+title="The policy proof is real/.test(trust), "the proof must be an ESTABLISHED (non-negative) Claim");
+    assert(/Real RISC Zero STARK/.test(trust), "the proof claim must state a Real RISC Zero STARK");
+    assert(/verified server-side by prover\/verify against the pinned release manifest/i.test(trust), "the proof must be verified server-side by prover/verify against the pinned manifest");
+    assert(/ddb7dc/.test(trust), "the established proof must name the pinned release imageId ddb7dc…");
+    assert(/the cryptographic seal is verified by the coordinator/i.test(trust), "the seal must be attributed to the coordinator");
+    assert(/Structural checks also run in your browser/i.test(trust), "the browser's role must be limited to structural checks");
+
+    // Overclaim guards (spec §1 / task): NOT offline in-browser seal verification,
+    // NOT trustless, NOT zero-knowledge OF THE ENCLAVE.
+    assert(!/verify (the )?(seal )?offline in (your |the )?browser|offline browser verification/i.test(trust), "must NOT claim offline in-browser seal verification (browser does structural checks only)");
+    assert(!/trustless/i.test(trust), "must NOT claim 'trustless'");
+    assert(!/zero-knowledge of the enclave/i.test(trust), "must NOT claim zero-knowledge of the enclave");
+
+    // (2) The enclave stays SIMULATED at EQUAL weight: it is STILL a `negative`
+    // (not-established) Claim, and the old "not yet a zero-knowledge proof" /
+    // "simulated-reexec" non-guarantee is GONE (the proof left that column).
+    assert(/negative\s+title="This build has no hardware confidentiality"/.test(trust), "the enclave must remain a negative (not-established) 'no hardware confidentiality' claim");
+    assert(!/simulated-reexec/.test(trust), "the trust page must no longer describe the request-path proof as 'simulated-reexec'");
+    assert(!/not yet a zero-knowledge proof|not yet zero-knowledge/i.test(trust), "the 'proof is not yet zero-knowledge' non-guarantee must be removed (now established)");
+
+    // (3) prover/host is named in the simulated confidential boundary — the
+    // boundary is now tee-sim + prover/host together (the prover gets plaintext).
+    assert(/negative\s+title="The prover receives the plaintext/.test(trust), "the boundary must add a negative prover/host row");
+    assert(/tee-sim \+ prover\/host together/i.test(trust), "the simulated boundary must be named 'tee-sim + prover/host together'");
+    assert(/plaintext witness/i.test(trust), "the prover/host row must state the prover receives the plaintext witness");
+
+    // (4) No request-path surface still emits "simulated-reexec" as the live proof
+    // system. The enclave build-manifest now reports risc0…
+    const teeIndex = readFileSync(join(ROOT, "services/tee-sim/src/index.ts"), "utf8");
+    assert(/proofSystem:\s*"risc0"/.test(teeIndex), "the enclave build-manifest must report proofSystem risc0 (the real request-path proof system)");
+    assert(!/proofSystem:\s*"simulated-reexec"/.test(teeIndex), "the enclave build-manifest must NOT still report proofSystem 'simulated-reexec'");
+    // …the coordinator's request-path proof rows/events are risc0…
+    const coord = readFileSync(join(ROOT, "services/coordinator/src/index.ts"), "utf8");
+    assert(/proof_system:\s*"risc0"/.test(coord), "the coordinator's request-path proof rows/events must be risc0");
+    // …and it is confirmed LIVE against the running enclave.
+    const manifest = (await (await fetch(`${COORD}/v1/build-manifest`)).json()) as { proofSystem?: string };
+    assert(manifest.proofSystem === "risc0", `live build-manifest proofSystem must be risc0, got ${manifest.proofSystem}`);
+
+    // (5) README no longer claims the prover is "not wired" / the demo "does not
+    // use it"; it states Phase 2b wired it into the request path.
+    const readme = readFileSync(join(ROOT, "README.md"), "utf8");
+    assert(!/It is \*\*not\*\* wired into the demo/.test(readme), "README must not still say the prover is 'not wired into the demo'");
+    assert(!/the demo does not use it/.test(readme), "README must not still say 'the demo does not use it'");
+    assert(!/simulated-reexec/.test(readme), "README must not still call the request-path proof 'simulated-reexec'");
+    assert(/Phase 2b wired it in|wired in\*\* \(Phase 2b\)/.test(readme), "README must state the prover is wired in (Phase 2b)");
+
+    // (6) VALIDATION no longer calls the ZK proof a substituted simulated-reexec.
+    const validation = readFileSync(join(ROOT, "VALIDATION.md"), "utf8");
+    assert(!/simulated-reexec/.test(validation), "VALIDATION must not still call the ZK proof a substituted 'simulated-reexec'");
+
+    return "trust: proof ESTABLISHED (Real RISC Zero STARK · prover/verify server-side · ddb7dc… · structural checks in-browser · seal by coordinator); enclave STILL SIMULATED (negative, equal weight); boundary named tee-sim + prover/host (plaintext witness); live manifest proofSystem=risc0; README/VALIDATION corrected";
+  });
+}
+
 // ---- daemon lifecycle for the PROVER_UNAVAILABLE case ----
 
 function daemonPidOn4500(): string | undefined {
@@ -2312,6 +2385,7 @@ async function main(): Promise<void> {
   await run2b_7(); // gated real prove (CTN_E2E_REAL_PROOF=1); self-skips otherwise
   await run2b_8(); // Policy-Lab preview decoupled from proving + non-authoritative label
   await run2b_9(); // playground ProofBeat honesty (source-level guard)
+  await run2b_10(); // trust-page truth: proof established, enclave simulated, prover/host in the boundary (source + live manifest)
   // 2b.5 takes the :4500 daemon down and restarts it — run it LAST so nothing
   // after it depends on the daemon being up.
   await run2b_5();

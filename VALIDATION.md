@@ -893,7 +893,7 @@ Worth calling out because they are easy to dismiss as ceremony:
 | 1 · Router: credential CRUD, mock provider, weighted routing, usage | complete |
 | 2 · Graph: outbox, projector, live UI, SSE | complete (SQLite projection, not Neo4j) |
 | 3 · Policy v1: shared implementation, fixtures, stable policy id, DENY blocks provider | complete — 125/125 fixtures |
-| 4 · ZK policy proof | **substituted** — `simulated-reexec`, honestly labelled; verifier expects the risc0 shape |
+| 4 · ZK policy proof | complete (Phase 2b) — every gated request produces a real RISC Zero receipt, verified server-side by `prover/verify` against the pinned `release.json` before `VERIFIED`; the confidential boundary it runs in (`tee-sim` + `prover/host`) remains simulated |
 | 5 · Simulated confidential service | complete — canary absent from all intermediary surfaces |
 | 6 · Credential encryption: browser seals to attested key | complete |
 | 7 · AWS Nitro Enclave | not attempted — no AWS in this environment |
@@ -903,13 +903,15 @@ Worth calling out because they are easy to dismiss as ceremony:
 
 ### Definition of done (§75)
 
-31 of 35 items pass. The four that do not, and why:
+32 of 35 items pass. `ZK proof independently verifies` now passes: since Phase 2b
+every gated request produces a real RISC Zero STARK, and `prover/verify` checks it
+independently against the pinned `release.json` with no network and no trust in
+whoever produced the receipt. The three that still do not, and why:
 
 | Item | Status |
 |---|---|
 | Nitro attestation verifies | **no** — simulation only; the verification path exists and reports the mode honestly |
 | TLS provider call originates logically inside enclave | **partial** — the TLS client is inside the confidential service and the allowlist is enforced there, but there is no vsock relay because there is no enclave |
-| ZK proof independently verifies | **partial** — the artifact verifies independently against the attested key, but it is not a zero-knowledge argument |
 | Real Nitro mode is clearly labeled | **n/a** — simulation mode is labelled everywhere; the Nitro branch is unexercised |
 
 Everything else — including all four privacy and tampering tests — passes and is

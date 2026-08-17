@@ -36,6 +36,16 @@ const PREVIEW_ID_NOTE =
   "Preview identity. The authoritative policy id is the guest image's (POLICY_ID_V2), " +
   "gated on the request path — this preview id is the TypeScript engine's and gates nothing.";
 
+// The preview runs the TypeScript engine; the request path runs the guest. The
+// two normalize Unicode independently, and on codepoints introduced by Unicode
+// 17 they can disagree — so a preview verdict is not a guarantee of the
+// authoritative one. The guest's decision, on the request path, is the one that
+// binds.
+const PREVIEW_SKEW_NOTE =
+  "This verdict is the TypeScript preview engine's. On Unicode-17-only codepoints it can " +
+  "disagree with the authoritative guest that gates the request path — where the two normalizers " +
+  "differ, the guest's decision is the one that binds.";
+
 const EXAMPLES = [
   "Explain how photosynthesis converts sunlight into chemical energy.",
   "How do I detect and prevent ransomware on my home network?",
@@ -155,6 +165,9 @@ export default function PolicyPage() {
                 </div>
                 <p className="mt-2 rounded-[10px] border border-pending/25 bg-pending/[0.06] px-3 py-2 text-[11px] leading-relaxed text-ink-4">
                   {PREVIEW_ID_NOTE}
+                </p>
+                <p className="mt-2 rounded-[10px] border border-pending/25 bg-pending/[0.06] px-3 py-2 text-[11px] leading-relaxed text-ink-4">
+                  {PREVIEW_SKEW_NOTE}
                 </p>
 
                 {result.decision === "DENY" && (
