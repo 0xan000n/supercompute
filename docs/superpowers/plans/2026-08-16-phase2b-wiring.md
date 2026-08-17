@@ -2,218 +2,165 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Connect the Phase 2a RISC Zero prover to the live demo so real requests are gated by the zkVM executor and backed by real STARK proofs a viewer can watch reach `VERIFIED` and check themselves.
+**Goal:** Connect the Phase 2a prover to the live demo so every request is gated by the zkVM executor and backed by a real, server-side-verified STARK proof a viewer can watch reach `VERIFIED`.
 
-**Architecture:** `services/tee-sim` gains a typed `ProverClient` for the `:4500` daemon. The executor becomes the authoritative gate on the request path (~57 ms); if the daemon is unreachable a request fails visibly with `PROVER_UNAVAILABLE`. The existing `Prover` state machine's simulated sleep is replaced by real `/prove` + poll, and the existing `proof_status` projection carries `PROVING → VERIFIED` to the browser unchanged. Receipts split by lifecycle; a TS verifier lets the coordinator and browser check a receipt; the playground shows the proof beat and the trust page tells the truth.
+**Architecture:** Restructure the coordinator/tee-sim request path around five distinct states — gate result, provider result, proof job, verified artifact, infrastructure failure. The guest gates every request (ALLOW, DENY, no-capacity) before capacity discovery; every gated request enqueues a proof; tee-sim verifies each receipt via the reference `prover/verify` subprocess before VERIFIED; a real five-state projection carries QUEUED→PROVING→GENERATED→VERIFIED to the browser with timeouts that tolerate multi-minute proving.
 
-**Tech Stack:** TypeScript (Node 22, `node:sqlite`), the `:4500` Rust daemon from Phase 2a, Next.js (`apps/web`), `@ctn/protocol` canonical/crypto, RISC Zero receipts (bincode).
+**Tech Stack:** TypeScript (Node 22, `node:sqlite`), the `:4500` Rust daemon + `prover/verify` binary from Phase 2a, Next.js (`apps/web`), `@ctn/protocol`.
 
-**Spec:** `docs/superpowers/specs/2026-08-16-phase2b-wiring-design.md` (and its parent `docs/superpowers/specs/2026-08-11-supercompute-real-design.md` §5.2, §5.5, §7).
+**Spec:** `docs/superpowers/specs/2026-08-16-phase2b-wiring-design.md` (revised post-review) and parent `docs/superpowers/specs/2026-08-11-supercompute-real-design.md` §5.5/§5.6/§7.
 
 ## Global Constraints
 
-- Guest verdict is authoritative on the request path; the TS engine (`packages/policy`) gates NOTHING after this plan — it powers the Policy-Lab preview only. Copy this rule into every gate-touching task.
-- No inference retries; single dispatch survives from Phase 1. The `ProverClient` does NOT retry `/prove` or `/execute`.
-- `PROVER_UNAVAILABLE` is a visible request state, never a silent fall-through to the TS engine and never a fake success.
-- The public journal / any browser-visible proof artifact is EXACTLY `{protocolVersion, requestCommitment, policyId, decision, proofNonce}` — no prompt-derived bytes, ever.
-- `policyId` on the request path is the guest's `POLICY_ID_V2` (`SHA256(canonical_manifest ‖ rules_bytes)`, path-independent, unchanged by the 2a ImageID fix). The TS `pkg.policyId` is preview-only and labelled as such.
-- Honesty invariant: the enclave stays labelled simulated at equal weight. New labels (proof-is-real, prover/host in the boundary, preview-vs-gate skew) are additions, never softenings.
-- The canonical request wire shape is `{"max_tokens":N,"messages":[{"content":…,"role":…}],"model":…,"temperature_millis":N}`, JCS key order, raw UTF-8 (no `\u` escapes). The daemon computes the commitment itself; never trust a host-supplied commitment.
-- Every proving/timing number written to a doc states machine, image, run count, variance. No fake ETA in the UI.
-- Begin only after the Phase 2a branch merges to `main`.
+- The guest verdict is authoritative for **every** request; the TS engine (`packages/policy`) gates nothing — Policy-Lab preview only.
+- **Every gated request enqueues a proof — ALLOW and DENY, including no-capacity.** Gate happens BEFORE candidate discovery, so `CTN_NO_CAPACITY` requests are still gated and proved.
+- **Decoding a receipt is not verifying it.** Before GENERATED→VERIFIED or `proofVerified: true`, tee-sim runs the reference `prover/verify` subprocess against pinned `prover/release.json` and rejects: devMode; imageId/policyId/rulesDigest/risc0Version/receiptCodec mismatch; a journal differing from the gate journal in any of the five fields; malformed/trailing bytes.
+- **`PROVER_UNAVAILABLE` is a 503-class system-failure record, never a `PolicyDecisionReceiptV1`** (whose decision is only ALLOW/DENY) and never a silent TS fall-through.
+- Request-path `policyId` is the guest `POLICY_ID_V2` (from `/health`). Demo data is **reseeded** under it (capabilities' `allowedPolicies` contain `POLICY_ID_V2`, discovery keys on it). Phase 1 receipts stay identifiable as legacy.
+- No proof has a flat wall-clock deadline that fails a legitimately-proving job. Poll while the daemon reports QUEUED/PROVING/GENERATED; end only on daemon FAILED, PROVER_UNAVAILABLE, or a generous absolute ceiling (15 min). QUEUED time never counts as proving time. (Replaces the current 120 s coordinator + 90 s playground deadlines.)
+- The public journal / any browser-visible proof artifact is EXACTLY `{protocolVersion, requestCommitment, policyId, decision, proofNonce}` — no prompt-derived bytes.
+- Canonical request wire shape: `{"max_tokens":N,"messages":[{"content":…,"role":…}],"model":…,"temperature_millis":N}`, JCS key order, raw UTF-8. The daemon computes the commitment itself.
+- Honesty invariant: the enclave stays labelled simulated at equal weight. No fake ETA bar; QUEUED is not "cryptography running."
+- Begin after the Phase 2a branch merges to `main`.
+
+Exact schemas (parent §5.5), used verbatim below:
+
+```typescript
+interface PolicyDecisionReceiptV1 { requestId: string; requestCommitment: string; policyId: string; decision: "ALLOW"|"DENY"; imageId: string; timing: { gateWallMs: number } }
+interface ComputeOutcomeReceiptV2 { requestId: string; route: unknown; usage: unknown; pricingTableDigest: string; timing: unknown; upstreamHashes: unknown; outcome: "success"|"failed"|"UPSTREAM_OUTCOME_UNKNOWN" }
+interface ProofArtifactV1 { proofSystem: "risc0"; risc0Version: string; receiptCodec: "bincode-v1"; receiptBytes: Uint8Array; imageId: string; journalVersion: number; decodedJournal: { protocolVersion: 1; requestCommitment: string; policyId: string; decision: "ALLOW"|"DENY"; proofNonce: string } }
+// artifactDigest = SHA256("CTN_ZK_RECEIPT_V1" ‖ receiptBytes)
+interface ProofBindingV2 { decisionReceiptDigest: string; artifactDigest: string; imageId: string; policyId: string; decision: "ALLOW"|"DENY"; proofVerified: boolean }
+```
 
 ---
 
-### Task 1: `ProverClient` — a typed client for the `:4500` daemon
+### Task 1: `ProverClient` — typed client for the `:4500` daemon
 
-**Files:**
-- Create: `services/tee-sim/src/prover-client.ts`
-- Test: `services/tee-sim/src/prover-client.test.ts`
-- Reference: `prover/README.md` wire-contract section (the `/execute`, `/prove`, `/jobs/:id`, `/health` shapes and the required `emitScores` field); `services/coordinator/src/tee-client.ts` for the existing fetch-with-timeout pattern to mirror.
+**Files:** Create `services/tee-sim/src/prover-client.ts`; Test `services/tee-sim/src/prover-client.test.ts`. Reference `prover/README.md` wire contract and `services/coordinator/src/tee-client.ts`'s fetch-with-timeout pattern.
 
-**Interfaces:**
-- Produces (Tasks 2/3 consume verbatim):
+**Interfaces — Produces (Tasks 2/3 consume):**
 
 ```typescript
-export interface ExecuteResult {
-  journal: { protocolVersion: 1; requestCommitment: string; policyId: string; decision: "ALLOW" | "DENY"; proofNonce: string };
-  privateScores: Record<string, number> | null;
-  execWallMs: number;
-}
-export interface JobStatus {
-  status: "QUEUED" | "PROVING" | "GENERATED" | "FAILED";
-  receiptB64?: string;
-  proveWallMs?: number;
-  error?: string;
-  devMode: boolean;
-}
+export interface ExecuteResult { journal: { protocolVersion: 1; requestCommitment: string; policyId: string; decision: "ALLOW"|"DENY"; proofNonce: string }; privateScores: Record<string, number> | null; execWallMs: number }
+export interface JobStatus { status: "QUEUED"|"PROVING"|"GENERATED"|"FAILED"; receiptB64?: string; proveWallMs?: number; error?: string; devMode: boolean }
 export interface ProverHealth { imageIdHex: string; policyId: string; rulesDigest: string; risc0Version: string; devMode: boolean }
 export class ProverUnavailableError extends Error { readonly code = "PROVER_UNAVAILABLE" }
-
 export class ProverClient {
   constructor(baseUrl: string, opts?: { timeoutMs?: number });
-  health(): Promise<ProverHealth>;                                  // throws ProverUnavailableError on unreachable/timeout
+  health(): Promise<ProverHealth>;
   execute(input: { canonicalRequestBytes: string; requestNonceHex: string; proofNonce: string; emitScores: boolean }): Promise<ExecuteResult>;
   prove(input: { canonicalRequestBytes: string; requestNonceHex: string; proofNonce: string }): Promise<{ jobId: string }>;
   pollJob(jobId: string): Promise<JobStatus>;
 }
 ```
 
-- [ ] **Step 1: Write failing tests** against a stub HTTP server (use `node:http` on an ephemeral port in the test, as `scripts/test-e2e.mts` patterns do):
-
-```typescript
-// prover-client.test.ts — key assertions:
-// 1. execute() posts camelCase body {protocolVersion, canonicalRequestBytesB64, requestNonceHex, proofNonce, emitScores}
-//    and returns the parsed journal + execWallMs.
-// 2. A connection refused / timeout from any method throws ProverUnavailableError (code PROVER_UNAVAILABLE), NOT a generic Error.
-// 3. The client base64-encodes canonicalRequestBytes into canonicalRequestBytesB64 exactly once.
-// 4. pollJob returns the daemon's JobStatus verbatim incl. devMode.
-// 5. No retry: a 500 from /execute rejects, and the stub records exactly ONE request.
-```
-
-- [ ] **Step 2: Run tests, verify they fail** — `pnpm --filter @ctn/tee-sim test` (or the package's test script; grep `services/tee-sim/package.json`). Expected: FAIL, ProverClient undefined.
-- [ ] **Step 3: Implement `ProverClient`** — `fetch` with an `AbortController` timeout (default 3000 ms for execute/health, longer for pollJob), base64 via `Buffer.from(bytes).toString("base64")`, map `ECONNREFUSED`/`AbortError`/network errors to `ProverUnavailableError`, no retry loop. Error messages must NOT include any request bytes.
-- [ ] **Step 4: Run tests, verify pass.**
-- [ ] **Step 5: Commit** — `git add services/tee-sim/src/prover-client.ts services/tee-sim/src/prover-client.test.ts && git commit -m "tee-sim: typed ProverClient for the :4500 daemon"`
+- [ ] **Step 1: Failing tests** against a `node:http` stub: execute() posts camelCase `{protocolVersion, canonicalRequestBytesB64, requestNonceHex, proofNonce, emitScores}` and returns the journal + execWallMs; connection-refused/timeout on ANY method throws `ProverUnavailableError`; base64 applied exactly once; pollJob returns JobStatus verbatim incl. devMode; a 500 rejects with exactly one request (no retry).
+- [ ] **Step 2:** Run, verify fail.
+- [ ] **Step 3:** Implement — `fetch` + `AbortController` timeout, map network errors to `ProverUnavailableError`, no retry, error messages never include request bytes.
+- [ ] **Step 4:** Run, verify pass.
+- [ ] **Step 5:** `git add services/tee-sim/src/prover-client.* && git commit -m "tee-sim: typed ProverClient for the :4500 daemon"`
 
 ---
 
-### Task 2: Guest-authoritative gate + `PROVER_UNAVAILABLE`
+### Task 2: Gate-path restructuring — guest gates every request, decision receipt for all, DENY & no-capacity proved, `PROVER_UNAVAILABLE`, policy-identity reseed
 
-**Files:**
-- Modify: `services/tee-sim/src/index.ts` (the request-ingestion / policy-gate path — grep for where `evaluate(`/`evaluateRequest(` is called on the request path today)
-- Modify: `services/tee-sim/src/authorize.ts` (the `AuthorizedRequest` factory — the gate verdict now comes from the guest)
-- Modify: `services/coordinator/src/index.ts` (add `PROVER_UNAVAILABLE` as a request outcome + error code) and `services/coordinator/src/tee-client.ts` (propagate it)
-- Test: extend `scripts/test-e2e.mts`
+**Files:** Modify `services/tee-sim/src/index.ts` (gate the request via the guest, sign `PolicyDecisionReceiptV1`, `proofStarted` for ALLOW **and** DENY), `services/tee-sim/src/authorize.ts` (verdict + commitment from the guest journal; assert commitment equality, fail closed), `services/coordinator/src/index.ts` (call the gate BEFORE `discoverCandidates`; key discovery on the guest `policyId`; add `PROVER_UNAVAILABLE` system-failure record distinct from FAILED/DENY; enqueue proof for DENY & no-capacity), `packages/protocol` (`PolicyDecisionReceiptV1`), the seed script `scripts/seed-demo.ts` (mint capabilities under `POLICY_ID_V2`). Test: extend `scripts/test-e2e.mts`.
 
-**Interfaces:**
-- Consumes: `ProverClient.execute` / `.health` (Task 1).
-- Produces: the enclave now sets the request decision from `ExecuteResult.journal.decision`. `AuthorizedRequest` still constructs only on ALLOW; its `requestCommitment` MUST equal the guest journal's `requestCommitment` (the guest computed it — assert equality, fail closed on mismatch).
+**Interfaces — Consumes:** `ProverClient.execute`/`.health` (Task 1). **Produces:** a signed `PolicyDecisionReceiptV1` for every request; discovery keyed on the guest `policyId`.
 
-- [ ] **Step 1: Failing e2e tests** in `scripts/test-e2e.mts`:
-
-```
-// 80: a benign prompt gates ALLOW via the GUEST (assert the enclave used the guest verdict:
-//     the decision receipt's policyId == the daemon /health policyId, not pkg.policyId).
-// 81: a blocked-phrase prompt gates DENY via the guest — no credential decrypted, no provider called.
-// 82: with the daemon NOT started (or pointed at a dead port), a request fails with
-//     PROVER_UNAVAILABLE, no dispatch happened, and the TS engine did NOT silently gate it.
-// 83: the enclave rejects a guest ExecuteResult whose requestCommitment != the enclave's own
-//     recomputation (fail-closed determinism guard).
-```
-
-- [ ] **Step 2: Run, verify fail** (daemon wiring not present).
-- [ ] **Step 3: Implement** — on the request path, call `proverClient.execute(...)` with the canonical bytes; use its decision as authoritative; on `ProverUnavailableError` return a `PROVER_UNAVAILABLE` error through the coordinator (new error code + request state) without dispatching; assert commitment equality. Remove the TS `evaluate` gate from the request path (leave it exported for Policy Lab). The daemon URL comes from env (`CTN_PROVER_URL` default `http://127.0.0.1:4500`).
-- [ ] **Step 4: Run tests, verify pass** (start the daemon in the test harness setup, or gate cases 80/81/83 behind daemon-up and make 82 the daemon-down case explicitly).
-- [ ] **Step 5: Commit** — `git add services/tee-sim services/coordinator scripts/test-e2e.mts && git commit -m "tee-sim: guest executor is the authoritative gate; PROVER_UNAVAILABLE on daemon-down"`
+- [ ] **Step 1: Failing e2e tests:**
+  - `no-capacity ALLOW`: a benign prompt for a model with no eligible credential is gated ALLOW (decision receipt exists, policyId == `/health.policyId`), a proof is enqueued, and the request returns `CTN_NO_CAPACITY`.
+  - `no-capacity DENY` and `DENY (with capacity)`: gated DENY, no provider called, a proof IS enqueued (`proofStarted` true for DENY).
+  - `PROVER_UNAVAILABLE`: daemon down → a system-failure record (its own code), no dispatch, no `PolicyDecisionReceiptV1` manufactured, absent from denial metrics; TS engine did NOT gate.
+  - `commitment guard`: a guest ExecuteResult whose commitment ≠ the enclave's recomputation is rejected (fail closed).
+  - `reseed`: after `pnpm seed`, discovery finds candidates under the guest `policyId`.
+- [ ] **Step 2:** Run, verify fail.
+- [ ] **Step 3:** Implement the reorder: gate → sign decision receipt → enqueue proof → branch (DENY done; ALLOW → discovery keyed on guest policyId → dispatch or NO_CAPACITY). Remove the TS `evaluate` gate from the request path. Reseed capabilities under `POLICY_ID_V2`. `PROVER_UNAVAILABLE` is a system-failure row, never a decision.
+- [ ] **Step 4:** Run, verify pass (daemon up in harness for gate cases; the down case is explicit).
+- [ ] **Step 5:** `git add services scripts/seed-demo.ts scripts/test-e2e.mts packages/protocol && git commit -m "path: guest gates every request before capacity; decision receipt for all; DENY & no-capacity proved; PROVER_UNAVAILABLE system failure; reseed under POLICY_ID_V2"`
 
 ---
 
-### Task 3: Real proofs in `Prover.run()` + receipt split
+### Task 3: Real proofs + server-side verification + receipt split + five-state projection + timeout fix
 
-**Files:**
-- Modify: `services/tee-sim/src/prover.ts` (replace the simulated sleep with real `/prove` + poll)
-- Create: `packages/protocol/src/receipts.ts` (the three receipt types) — or extend the existing receipt module (grep `packages/protocol/src` for the current `ComputeReceipt`/`ProofBinding` definitions and version them in place)
-- Modify: `services/coordinator/src/index.ts` (persist the split; `proof_status` transitions unchanged)
-- Test: `services/tee-sim/src/prover.test.ts`, extend `scripts/test-e2e.mts`
+**Files:** Modify `services/tee-sim/src/prover.ts` (replace the simulated sleep with `/prove` + poll; on GENERATED, **verify via the `prover/verify` subprocess** before VERIFIED; build `ProofArtifactV1` + `ProofBindingV2`), `packages/protocol` (`ComputeOutcomeReceiptV2` versioning, `ProofArtifactV1`, `ProofBindingV2`, the domain-separated digests), `services/coordinator/src/events.ts` (add `proof.queued`/`proof.generated`; make `proof.completed` carry its verified payload instead of hardcoding VERIFIED; poll through GENERATED to a terminal state), `services/coordinator/src/index.ts` (`watchProof` — remove the 120 s deadline; state-based termination with a 15 min ceiling), `apps/web/src/app/playground/page.tsx` (remove the 90 s poll cap; poll to a terminal state). Test: `services/tee-sim/src/prover.test.ts`, extend `scripts/test-e2e.mts`.
 
-**Interfaces:**
-- Consumes: `ProverClient.prove` / `.pollJob` (Task 1).
-- Produces:
+**Interfaces — Consumes:** `ProverClient.prove`/`.pollJob` (Task 1); the reference `prover/verify` binary. **Produces:** the three receipts + `ProofBindingV2` (schemas in Global Constraints); events `proof.queued|started|generated|completed|failed`.
 
-```typescript
-export interface PolicyDecisionReceiptV1 { version: 1; requestCommitment: string; policyId: string; decision: "ALLOW"|"DENY"; gateWallMs: number; proof: "pending" | ProofBindingV2 }
-export interface ComputeOutcomeReceiptV2 { version: 2; /* Phase-1 receipt fields: tokens, pricingTableDigest, estimatedCostMicroUsd, outcome */ }
-export interface ProofBindingV2 { requestCommitment: string; policyId: string; guestImageId: string; zkReceiptDigest: string; decision: "ALLOW"|"DENY"; proofVerified: boolean }
-```
-
-- [ ] **Step 1: Failing tests** — `prover.test.ts`: `Prover.run()` calls `prove` then polls to `GENERATED`, decodes the receipt, transitions `PROVING → GENERATED → VERIFIED`, and the `ProofBindingV2` carries a non-empty `zkReceiptDigest` and the daemon's `guestImageId`. e2e: a full ALLOW request produces a decision receipt reading `proof: "pending"` immediately and a binding with a real digest after the job completes (gated slow test, one real proof).
-- [ ] **Step 2: Run, verify fail.**
-- [ ] **Step 3: Implement** — replace `SIMULATED_PROVING_MS`/`setTimeout` with `prove` + a poll loop (bounded, honest interval); keep the TS re-execution determinism guard (it already exists — now compare guest vs enclave and fail the proof on disagreement); build `ProofBindingV2` from the daemon receipt digest; split the persisted receipt. Keep `simulatedCostMs` semantics gone — proving is now measured; rename the field or drop it and update the UI consumer (grep for `simulatedCostMs`/`SIMULATED_PROVING_MS`).
-- [ ] **Step 4: Run tests, verify pass.**
-- [ ] **Step 5: Commit** — `git add services/tee-sim/src/prover.ts packages/protocol services/coordinator services/tee-sim/src/prover.test.ts scripts/test-e2e.mts && git commit -m "tee-sim: real STARK proofs via the daemon; decision/outcome/binding receipt split"`
+- [ ] **Step 1: Failing tests:**
+  - `Prover.run()` calls prove, polls to GENERATED, spawns `prover/verify` against the pinned manifest, and only then transitions VERIFIED with `proofVerified: true` and a non-empty `artifactDigest`/`decisionReceiptDigest`.
+  - a receipt that fails verification (tampered/wrong-image/dev-mode fixture, or a journal ≠ the gate journal) → proof `FAILED`, never VERIFIED.
+  - the projection emits QUEUED→PROVING→GENERATED→VERIFIED; a fake slow daemon that proves at 130 s still reaches VERIFIED (no 120 s/90 s failure).
+  - a real ALLOW request: decision receipt reads `proof: "pending"` immediately; binding with a real `artifactDigest` after the job completes (gated slow test, one real proof).
+- [ ] **Step 2:** Run, verify fail.
+- [ ] **Step 3:** Implement — poll loop (honest interval), subprocess verification (spawn `prover/verify`; strict-decode; reject the §4 list), receipt split, the five events, the timeout/ceiling changes in both coordinator and playground. Drop `SIMULATED_PROVING_MS`/`simulatedCostMs`; update its UI consumer.
+- [ ] **Step 4:** Run, verify pass.
+- [ ] **Step 5:** `git add services packages/protocol apps/web/src/app/playground scripts/test-e2e.mts && git commit -m "proofs: real STARKs verified via prover/verify subprocess; receipt split; five-state projection; timeouts tolerate multi-minute proving"`
 
 ---
 
-### Task 4: policyId reconciliation
+### Task 4: policyId reconciliation (preview labelling)
 
-**Files:**
-- Modify: the request-path receipt/journal construction (Tasks 2/3 sites) to stamp `POLICY_ID_V2` (from `/health`)
-- Modify: `apps/web` Policy-Lab component (grep `apps/web/src` for where `policyId` renders) to label the preview id as "preview identity"
-- Test: unit assertion that a decision receipt's `policyId` equals `/health.policyId`, not `pkg.policyId`
+**Files:** Modify the Policy-Lab component (grep `apps/web/src` for `policyId` render) to label `pkg.policyId` as "preview identity — authoritative id is the guest image's." Test: assert the request-path receipts carry `/health.policyId` and the preview carries `pkg.policyId` (they differ).
 
-- [ ] **Step 1: Failing test** — assert request-path `policyId === proverHealth.policyId` and that the two differ (guarding against an accidental collapse).
-- [ ] **Step 2: Run, verify fail.**
-- [ ] **Step 3: Implement** — source the request-path `policyId` from the daemon; leave `pkg.policyId` only in the Policy-Lab preview with a visible "preview identity — authoritative id is the guest image's" label.
-- [ ] **Step 4: Run, verify pass.**
-- [ ] **Step 5: Commit** — `git add services apps/web && git commit -m "policyId: guest POLICY_ID_V2 is canonical on the request path; TS id is preview-only, labelled"`
+*(The request-path switch to `POLICY_ID_V2` and the reseed already landed in Task 2; this task is only the preview-side labelling, kept separate so a reviewer can gate the UI copy independently.)*
+
+- [ ] **Step 1:** Failing test — decision receipt `policyId === proverHealth.policyId`; Policy-Lab renders the "preview identity" label.
+- [ ] **Step 2:** Run, verify fail.
+- [ ] **Step 3:** Implement the label.
+- [ ] **Step 4:** Run, verify pass.
+- [ ] **Step 5:** `git add apps/web && git commit -m "policyId: label the Policy-Lab preview id as non-authoritative"`
 
 ---
 
-### Task 5: TypeScript verifier + differential agreement
+### Task 5: Verifier + expanded differential + browser go/no-go spike
 
-**Files:**
-- Create: `packages/verify/` (or `packages/protocol/src/verify.ts`) — the TS port of `prover-verify`'s checks
-- Modify: `scripts/verify-receipt.ts` (route through the TS verifier)
-- Test: `packages/verify` unit tests + a differential case asserting agreement with `prover-verify` on the five committed fixtures
-- **Step 0 SPIKE (fold into this task, ~15 min, timeboxed):** determine whether full receipt *seal* verification is feasible in TypeScript/wasm in the browser. If yes, the TS verifier checks everything. If no, the TS verifier checks structure + journal key-set + policyId/rulesDigest + proofNonce shape, and delegates seal verification to the coordinator (which shells to `prover-verify` or a wasm module server-side). Record the decision + its honesty implication in `packages/verify/README.md`. Do NOT claim in-browser seal verification if it is delegated.
+**Files:** Create `packages/verify/` (TS verifier for the coordinator + browser); Modify `scripts/verify-receipt.ts`; Test `packages/verify` + differential.
+**Step 0 SPIKE (timeboxed ~15 min, go/no-go):** is full receipt **seal** verification feasible in-browser (wasm risc0 verify)? GO → bundle the pinned manifest, verify raw receipt bytes locally, the browser action may be "Verify offline." NO-GO → the browser checks structure + journal key-set + policyId/rulesDigest + proofNonce shape locally and delegates seal verification to the coordinator; the action is "Inspect proof" / "Verify via coordinator," shows which checks ran where, and points to `prover-verify`. Record the outcome + honesty implication in `packages/verify/README.md`. Never call a delegated flow "offline."
 
-**Interfaces:**
-- Produces:
+**Interfaces — Produces:** `verifyReceipt(receiptBytes, manifest, expect?) => { ok: boolean; checks: Array<{ name; ok; detail }> }`.
 
-```typescript
-export interface VerifyReport { ok: boolean; checks: Array<{ name: string; ok: boolean; detail: string }> }
-export function verifyReceipt(receiptBytes: Uint8Array, manifest: { imageIdHex: string; policyId: string; rulesDigest: string }, expect?: { commitment?: string; decision?: "ALLOW"|"DENY"; proofNonce?: string }): VerifyReport;
-```
-
-- [ ] **Step 1: Failing tests** — parse each committed fixture's journal, assert the exact five-field key set; assert `verifyReceipt` returns `ok:true` for `allow-real`/`allow-succinct`/`adv-004` and `ok:false` at the right named check for `wrong-image`/`dev-mode`; a hostile fat-proofNonce journal fails `journal-proof-nonce`. Differential: for each fixture, the TS `checks[]` verdict matches `prover-verify`'s exit code.
-- [ ] **Step 2: Run, verify fail.**
-- [ ] **Step 3: Implement** per the spike outcome.
-- [ ] **Step 4: Run, verify pass** (incl. the differential agreement).
-- [ ] **Step 5: Commit** — `git add packages/verify scripts/verify-receipt.ts && git commit -m "verify: TS receipt verifier agreeing with prover-verify on the committed fixtures"`
+- [ ] **Step 1: Failing tests** — parse each committed fixture journal, assert the exact five-field key set; `verifyReceipt` ok for allow-real/allow-succinct/adv-004, fails at the right named check for wrong-image/dev-mode; AND fails for **hand-built malformed, appended, truncated, and invalid-journal** receipts. Differential: the verifier's verdict matches `prover-verify`'s exit code across ALL of these, not just the five good fixtures.
+- [ ] **Step 2:** Run, verify fail.
+- [ ] **Step 3:** Implement per the spike outcome.
+- [ ] **Step 4:** Run, verify pass (incl. differential agreement on the expanded set).
+- [ ] **Step 5:** `git add packages/verify scripts/verify-receipt.ts && git commit -m "verify: TS verifier + expanded differential (malformed/appended/truncated/wrong-image/dev-mode/invalid-journal); browser go/no-go recorded"`
 
 ---
 
 ### Task 6: Frontend proof beat (playground)
 
-**Files:**
-- Modify: `apps/web/src/app` playground page + request-card component (grep for the current playground request rendering and the `proof_status` consumer)
-- Create: a `ProofBeat` component — the `PROVING` visual + `VERIFIED ✓` + Verify-offline expander
-- Modify: the coordinator projection/event consumer if a new field is needed for the browser (reuse existing `proof_status` events; add `imageIdHex` and `proveWallMs` to what the browser receives if not already present)
-- Test: component tests for the three render states (ALLOW→proving→verified, DENY, PROVER_UNAVAILABLE)
+**Files:** Modify the playground page + request-card (grep the current proof-status consumer); Create a `ProofBeat` component; wire it to the five-state projection. Test: component tests for the states.
 
-- [ ] **Step 1: Failing component tests** — the card renders: a verdict chip on gate; a `PROVING…` state with an elapsed timer and the real ImageID (NO percentage/ETA bar); a `VERIFIED ✓` state after the projection reports it; a distinct `PROVER_UNAVAILABLE` state; the Verify-offline expander runs `verifyReceipt` (Task 5) and shows checks going green.
-- [ ] **Step 2: Run, verify fail.**
-- [ ] **Step 3: Implement** — `ProofBeat` driven by the existing proof-status projection (poll or the existing timer); the proving visual is an honest pulsing/elapsed state, not a fake ETA; Verify-offline calls the TS verifier and renders the check list; DENY and PROVER_UNAVAILABLE are first-class states.
-- [ ] **Step 4: Run, verify pass; `pnpm --filter web build` clean.**
-- [ ] **Step 5: Commit** — `git add apps/web services/coordinator && git commit -m "web: playground proof beat — gate → proving → VERIFIED, verify-offline"`
+- [ ] **Step 1: Failing component tests** — the card renders: verdict chip on completion (gate; the ~57 ms figure shown as internal cost, not browser latency); a `QUEUED` "waiting to prove" state distinct from `PROVING`; `PROVING` with an elapsed timer + real ImageID and NO ETA bar; `VERIFIED ✓` only after the terminal verified event; a distinct `PROVER_UNAVAILABLE` system-failure state; DENY shown stopping yet still proving; the proof action (name per Task 5 spike) runs the verifier and shows checks.
+- [ ] **Step 2:** Run, verify fail.
+- [ ] **Step 3:** Implement `ProofBeat` off the projection; honest visuals; all five states first-class.
+- [ ] **Step 4:** Run, verify pass; `pnpm --filter web build` clean.
+- [ ] **Step 5:** `git add apps/web && git commit -m "web: playground proof beat — gate → queued → proving → VERIFIED, honest states, proof action"`
 
 ---
 
 ### Task 7: Trust-page rewrite + skew label + honesty pass
 
-**Files:**
-- Modify: `apps/web/src/app/trust/page.tsx` (the two-column truth table + trust-boundary row)
-- Modify: `apps/web` Policy-Lab (the preview-vs-gate Unicode skew label)
-- Modify: `README.md` trust table (add `prover/host` to the boundary), `VALIDATION.md` (the "simulated-reexec" statements that are now false on the request path)
-- Test: assertions that the trust page renders "ZK proof: established (local, simulated enclave)" and still renders "enclave: simulated"; a grep-style check in CI or a test that no request-path surface still emits `simulated-reexec`
+**Files:** Modify `apps/web/src/app/trust/page.tsx`, the Policy-Lab skew label, `README.md` trust table, `VALIDATION.md`. Test: trust page renders proof "established (local, verified, simulated enclave)" AND enclave "simulated"; no request-path surface emits `simulated-reexec`; boundary row names `tee-sim + prover/host`.
 
-- [ ] **Step 1: Failing tests** — trust page shows the proof as established AND the enclave as simulated (both, at equal weight); `proofSystem` on the request path is no longer `simulated-reexec`; the boundary row names `tee-sim + prover/host`.
-- [ ] **Step 2: Run, verify fail.**
-- [ ] **Step 3: Implement** — rewrite the trust two-column; add the `prover/host` boundary row; label the preview-vs-gate skew in Policy Lab (guest authoritative, can disagree with the preview on Unicode-17-only codepoints); update README/VALIDATION statements that are now false. Keep every still-simulated label at equal weight.
-- [ ] **Step 4: Run, verify pass; web build clean; `pnpm test` + `pnpm test:e2e` green.**
-- [ ] **Step 5: Commit** — `git add apps/web README.md VALIDATION.md && git commit -m "trust: the proof is real and labelled; enclave still simulated; prover/host in the boundary"`
+- [ ] **Step 1:** Failing tests as above.
+- [ ] **Step 2:** Run, verify fail.
+- [ ] **Step 3:** Implement — rewrite the two-column; add the `prover/host` boundary row; label the preview-vs-gate Unicode skew (guest authoritative); update README/VALIDATION statements now false. Every still-simulated label stays at equal weight.
+- [ ] **Step 4:** Run, verify pass; web build clean; `pnpm test` + `pnpm test:e2e` green.
+- [ ] **Step 5:** `git add apps/web README.md VALIDATION.md && git commit -m "trust: proof is real and verified; enclave still simulated; prover/host in the boundary"`
 
 ---
 
 ## Self-Review
 
-**Spec coverage:** §3 wiring → Tasks 1–2; §4 receipt split → Task 3; §5 policyId → Task 4; §6 TS verifier → Task 5; §7 frontend beat → Task 6; §7 trust page + §8 honesty → Task 7; §10 testing → distributed across tasks + the e2e additions. §9 deferrals are explicitly out of scope (2c). Covered.
+**Spec coverage:** §3 restructuring → Tasks 1–2; §4 receipts+verification → Task 3; §5 identity migration → Task 2 (reseed) + Task 4 (label); §6 lifecycle+timeouts → Task 3; §7 frontend → Task 6; §7 trust page + §8 verifier go/no-go → Tasks 5/7; §10 testing → distributed. §9 deferrals are out of scope. Covered.
 
-**Placeholder scan:** the one genuine unknown (in-browser seal verification) is a timeboxed spike inside Task 5 with both outcomes specified and an honesty rule for each — not a placeholder. File paths that the 2a fixer or Phase-1 churn may have moved are given as path + grep-target rather than fixed line numbers, deliberately.
+**Placeholder scan:** the one unknown (in-browser seal verification) is a go/no-go spike in Task 5 with both branches specified and an honesty rule each. File paths that Phase-2a churn may move are given as path + grep-target.
 
-**Type consistency:** `ExecuteResult`/`JobStatus`/`ProverHealth`/`ProverUnavailableError` (Task 1) are consumed unchanged in Tasks 2–3; `POLICY_ID_V2` sourced from `/health.policyId` consistently in Tasks 2/3/4; `verifyReceipt`/`VerifyReport` (Task 5) consumed in Task 6; the journal five-field shape is identical everywhere it appears.
+**Type consistency:** the four receipt/artifact interfaces are defined once in Global Constraints and consumed unchanged in Tasks 2/3; `ExecuteResult`/`JobStatus`/`ProverHealth`/`ProverUnavailableError` (Task 1) consumed in 2/3; `verifyReceipt` (Task 5) consumed in 6; the journal five-field shape identical everywhere. `PROVER_UNAVAILABLE` is a system-failure record everywhere, never a decision.
 
 ## Execution Handoff
 
-Execution begins after the Phase 2a branch merges to `main`. Subagent-driven (Opus), same discipline as 2a: fresh implementer per task, independent reviewer, fix loops, ledger at `.superpowers/sdd/2026-08-16-phase2b-wiring/progress.md`.
+After the Phase 2a merge. Subagent-driven (Opus), same discipline as 2a; ledger at `.superpowers/sdd/2026-08-16-phase2b-wiring/progress.md`.
