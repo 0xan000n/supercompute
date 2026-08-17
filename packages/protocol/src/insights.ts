@@ -11,7 +11,7 @@
  * the facet array SORTED and all counts asserted integer so the signed bytes are
  * stable regardless of accumulation order.
  */
-import { canonicalHash, signCanonical, verifyCanonical } from "./crypto.js";
+import { canonicalHash, signCanonical, verifyCanonical } from "./crypto";
 
 /**
  * The closed, versioned facet enum (design §5). Mirrors

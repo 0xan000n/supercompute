@@ -42,9 +42,11 @@ import {
   randomHex,
   requestCommitment,
   toCanonicalRequest,
+  verifyInsightsBulletin,
   type ComputeReceipt,
   type CredentialIntentV1,
   type SecureRequestEnvelope,
+  type SignedInsightsBulletinV1,
 } from "@ctn/protocol";
 
 // ---------------------------------------------------------------------------
@@ -2222,6 +2224,82 @@ async function run2b_10(): Promise<void> {
   });
 }
 
+/**
+ * Phase 3 — Clio-lite /insights. Guards (a) the LIVE bulletin shape + client-side
+ * signature verification, and (b) the /insights page SOURCE, the same way 2b.8/9/10
+ * guard UI honesty at the source (apps/web has no component-test runner). The
+ * honesty labels here are load-bearing — the page must NOT read as an LLM, a real
+ * embedding, or anonymity — so the exact strings are asserted, not paraphrased.
+ */
+async function run3_1(): Promise<void> {
+  await test("3.1", "/insights: SignedInsightsBulletinV1 shape (enum + integers, no 'other' row) + client-verified enclave signature; page renders scatter / allow-deny / safety view / honesty panel / suppressed state", async () => {
+    const FACET_ENUM = new Set([
+      "weapons", "malware_cyber", "phishing_fraud", "violence", "self_harm", "csam",
+      "coding", "writing", "research", "data_analysis", "education", "business",
+      "creative", "translation", "conversation", "technical_ops", "other",
+    ]);
+
+    // (a) LIVE bulletin — one fetch of /v1/insights, asserted against the schema.
+    const bulletin = (await (await fetch(`${COORD}/v1/insights`)).json()) as SignedInsightsBulletinV1;
+    assert(bulletin.version === 1, `version must be 1, got ${JSON.stringify(bulletin.version)}`);
+    assert(typeof bulletin.generatedAt === "string" && !Number.isNaN(Date.parse(bulletin.generatedAt)),
+      `generatedAt must be an ISO date, got ${bulletin.generatedAt}`);
+    assert(Number.isInteger(bulletin.windowRequests) && bulletin.windowRequests >= 0, `windowRequests must be a non-negative integer, got ${bulletin.windowRequests}`);
+    assert(Number.isInteger(bulletin.kMin) && bulletin.kMin >= 1, `kMin must be a positive integer, got ${bulletin.kMin}`);
+    assert(Number.isInteger(bulletin.suppressedFacets) && bulletin.suppressedFacets >= 0, `suppressedFacets must be a non-negative integer`);
+    assert(Number.isInteger(bulletin.otherCount) && bulletin.otherCount >= 0, `otherCount must be a non-negative integer`);
+    assert(typeof bulletin.policyId === "string" && bulletin.policyId.length > 0, `policyId must be present`);
+    assert(typeof bulletin.enclaveSignature === "string" && /^[0-9a-f]+$/i.test(bulletin.enclaveSignature), `enclaveSignature must be hex`);
+    assert(Array.isArray(bulletin.facets), `facets must be an array`);
+    let sortedOk = true;
+    for (let i = 0; i < bulletin.facets.length; i++) {
+      const f = bulletin.facets[i];
+      assert(FACET_ENUM.has(f.facet), `facet ${f.facet} is not in the closed enum`);
+      assert(f.facet !== "other", `'other' must NEVER be a facets[] row (it lives in otherCount)`);
+      assert(Number.isInteger(f.allow) && f.allow >= 0 && Number.isInteger(f.deny) && f.deny >= 0, `facet ${f.facet} counts must be non-negative integers`);
+      assert(f.allow + f.deny >= bulletin.kMin, `facet ${f.facet} total ${f.allow + f.deny} is below kMin ${bulletin.kMin} — should have been suppressed`);
+      if (i > 0 && bulletin.facets[i - 1].facet > f.facet) sortedOk = false;
+    }
+    assert(sortedOk, `facets[] must be sorted by facet id`);
+
+    // (b) Client-side signature verification — verify the enclave signature in
+    // THIS process against the attestation signing key, exactly as the page does
+    // in the browser (verifyInsightsBulletin against bundle.enclaveSigningPublicKey).
+    const att = (await (await fetch(`${COORD}/v1/attestation`)).json()) as { bundle: { enclaveSigningPublicKey: string } };
+    const signingKey = att.bundle.enclaveSigningPublicKey;
+    assert(typeof signingKey === "string" && signingKey.length > 0, `attestation must expose enclaveSigningPublicKey`);
+    assert(verifyInsightsBulletin(bulletin, signingKey) === true, `enclave signature must verify against the attested signing key`);
+
+    // (c) The /insights page SOURCE — the render surface + the load-bearing honesty
+    // strings. No component-test runner exists (Phase 2b), so guard at the source.
+    const page = readFileTextSafe(join(ROOT, "apps/web/src/app/insights/page.tsx"));
+    assert(page.length > 0, "insights page source not found");
+    // the four render surfaces
+    assert(/FacetScatter/.test(page) && /Facet cluster|Facet clusters/i.test(page), "page must render the facet cluster scatter");
+    assert(/AllowDenyBreakdown/.test(page) && /Allow vs deny/i.test(page), "page must render the allow/deny breakdown");
+    assert(/SafetyView/.test(page) && /what the network refused/i.test(page), "page must render the deny-category safety view");
+    // the honesty panel strings (verbatim, load-bearing)
+    for (const needle of [
+      "classified locally",
+      "prompts never leave",
+      "not an LLM",
+      "grouping, not semantic embedding",
+      "threshold suppression",
+      "not anonymity",
+    ]) {
+      assert(page.includes(needle), `honesty panel must state "${needle}" verbatim`);
+    }
+    // the empty/suppressed state
+    assert(/not enough traffic yet/i.test(page), "page must render an honest 'not enough traffic yet' suppressed state");
+    assert(/clusters below \{?kMin\}?|below \{kMin\}|below \{ *kMin *\}|below {kMin} requests are suppressed|clusters below/i.test(page), "suppressed state must reference the kMin threshold");
+    // the client verifies the signature
+    assert(/verifyInsightsBulletin/.test(page), "page must verify the enclave signature client-side (verifyInsightsBulletin)");
+
+    const populated = bulletin.facets.length > 0;
+    return `bulletin v1 OK (${bulletin.windowRequests} req, ${bulletin.facets.length} visible facet(s) ≥ kMin ${bulletin.kMin}, ${bulletin.suppressedFacets} suppressed, no 'other' row, sorted) · signature VERIFIED client-side against ${signingKey.slice(0, 8)}… · page renders scatter+breakdown+safety+honesty+suppressed (${populated ? "populated" : "all-suppressed"})`;
+  });
+}
+
 // ---- daemon lifecycle for the PROVER_UNAVAILABLE case ----
 
 function daemonPidOn4500(): string | undefined {
@@ -2386,6 +2464,10 @@ async function main(): Promise<void> {
   await run2b_8(); // Policy-Lab preview decoupled from proving + non-authoritative label
   await run2b_9(); // playground ProofBeat honesty (source-level guard)
   await run2b_10(); // trust-page truth: proof established, enclave simulated, prover/host in the boundary (source + live manifest)
+
+  console.log("\n=== PHASE 3 — CLIO-LITE INSIGHTS ===");
+  await run3_1(); // /insights bulletin shape + client-verified signature + page honesty (source guard)
+
   // 2b.5 takes the :4500 daemon down and restarts it — run it LAST so nothing
   // after it depends on the daemon being up.
   await run2b_5();

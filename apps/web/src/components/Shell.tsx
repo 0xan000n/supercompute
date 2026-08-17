@@ -13,6 +13,7 @@ const NAV = [
   { href: "/contribute", label: "Contribute" },
   { href: "/dashboard", label: "Contributors" },
   { href: "/policy", label: "Policy Lab" },
+  { href: "/insights", label: "Insights" },
   { href: "/trust", label: "Trust Model" },
 ];
 
