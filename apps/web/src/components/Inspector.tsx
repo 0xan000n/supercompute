@@ -36,8 +36,10 @@ interface RequestDetail {
     proofSystem: string;
     guestImageId: string;
     proofMs: number;
-    simulatedCostMs: number;
-    digest: string;
+    // Phase 2b — real proof: the domain-separated artifact + decision-receipt
+    // digests replace the old simulated-cost / single-digest fields.
+    artifactDigest: string | null;
+    decisionReceiptDigest: string | null;
     error: string | null;
   } | null;
 }

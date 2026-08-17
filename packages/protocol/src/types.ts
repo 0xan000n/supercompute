@@ -286,6 +286,97 @@ export interface SignedComputeReceipt {
 }
 
 /**
+ * Phase 2b §4 — the compute (provider-outcome) receipt, versioned. Signed after
+ * the provider call, on the ALLOW path only. The Phase-1 `ComputeReceipt` fields
+ * carried over; `policyId` inside `route`/`usage` unified onto the guest
+ * `POLICY_ID_V2` in Phase 2b so a single policy identity spans the decision
+ * receipt, the proof journal, and this receipt.
+ *
+ * NOTE (deviation, Task 3): the runtime ALLOW receipt continues to be emitted as
+ * the richer `ComputeReceipt` shape above (now carrying the guest policyId); a
+ * full field-for-field migration of the runtime receipt to this interface is
+ * deferred. This interface pins the versioned shape the spec names.
+ */
+export interface ComputeOutcomeReceiptV2 {
+  requestId: string;
+  route: unknown;
+  usage: unknown;
+  pricingTableDigest: string;
+  timing: unknown;
+  upstreamHashes: unknown;
+  outcome: "success" | "failed" | "UPSTREAM_OUTCOME_UNKNOWN";
+}
+
+/**
+ * Phase 2b §4 — the immutable, cryptographically-real proof artifact. Unlike the
+ * Phase-1 `ProofReceipt` (a signed re-execution with an ed25519 `seal`), this
+ * carries the RAW bincode-serialized RISC Zero receipt bytes; its authenticity
+ * comes from the STARK verified against the pinned image by the reference
+ * `prover/verify` subprocess, NOT from an enclave signature.
+ *
+ * `decodedJournal` is the five-field public journal the receipt commits — the
+ * ONLY thing derivable from the proof, and never prompt-derived. The enclave does
+ * NOT trust a locally-decoded journal: every field of `decodedJournal` is checked
+ * against the receipt-committed journal by the subprocess (`--expect-commitment`,
+ * `--expect-decision`, `--expect-proof-nonce`, plus imageId/policyId/version
+ * against the manifest) before `proofVerified` may ever be true.
+ *
+ * `artifactDigest = SHA256("CTN_ZK_RECEIPT_V1" ‖ receiptBytes)` (see crypto.ts).
+ */
+export interface ProofArtifactV1 {
+  proofSystem: "risc0";
+  risc0Version: string;
+  receiptCodec: "bincode-v1";
+  receiptBytes: Uint8Array;
+  imageId: string;
+  journalVersion: number;
+  decodedJournal: {
+    protocolVersion: 1;
+    requestCommitment: string;
+    policyId: string;
+    decision: "ALLOW" | "DENY";
+    proofNonce: string;
+  };
+}
+
+/**
+ * JSON/SQLite transport of a {@link ProofArtifactV1}: `receiptBytes` becomes
+ * standard-base64 `receiptB64`. The digest is over the raw bytes, so any consumer
+ * that recomputes it must base64-decode `receiptB64` first.
+ */
+export interface ProofArtifactWireV1 {
+  proofSystem: "risc0";
+  risc0Version: string;
+  receiptCodec: "bincode-v1";
+  receiptB64: string;
+  imageId: string;
+  journalVersion: number;
+  decodedJournal: ProofArtifactV1["decodedJournal"];
+}
+
+/**
+ * Phase 2b §4 — binds a verified proof artifact to the DECISION receipt (not the
+ * outcome receipt). `proofVerified` is only ever true once the `prover/verify`
+ * subprocess has passed against the pinned manifest.
+ *
+ *   decisionReceiptDigest = SHA256("CTN_DECISION_RECEIPT_V1" ‖ canonical(PolicyDecisionReceiptV1))
+ *   artifactDigest        = SHA256("CTN_ZK_RECEIPT_V1" ‖ receiptBytes)
+ */
+export interface ProofBindingV2 {
+  decisionReceiptDigest: string;
+  artifactDigest: string;
+  imageId: string;
+  policyId: string;
+  decision: "ALLOW" | "DENY";
+  proofVerified: boolean;
+}
+
+export interface SignedProofBindingV2 {
+  binding: ProofBindingV2;
+  enclaveSignature: string;
+}
+
+/**
  * Rule 8 / §30 — the artifact that closes the loop between a receipt and its proof.
  *
  * The compute receipt has to be signed when inference finishes, but proving runs
@@ -330,7 +421,16 @@ export type CtnEventType =
    * as permanently in-flight — a UI that quietly disagrees with the DB row.
    */
   | "request.failed"
+  /**
+   * Phase 2b — the real five-state proof lifecycle. `proof.queued` is "waiting to
+   * prove," NOT "cryptography running"; `proof.started` is PROVING; `proof.generated`
+   * is GENERATED (a receipt exists but is NOT yet verified); `proof.completed` is
+   * VERIFIED (the reference verifier passed and its payload says so — never
+   * hardcoded); `proof.failed` is FAILED.
+   */
+  | "proof.queued"
   | "proof.started"
+  | "proof.generated"
   | "proof.completed"
   | "proof.failed"
   | "route.selected"

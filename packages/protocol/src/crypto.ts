@@ -1,7 +1,12 @@
 import { sha256, sha512 } from "@noble/hashes/sha2.js";
 import * as ed from "@noble/ed25519";
 import { canonicalJson } from "./canonical";
-import type { CredentialIntentV1 } from "./types";
+import type {
+  CredentialIntentV1,
+  PolicyDecisionReceiptV1,
+  ProofArtifactV1,
+  ProofArtifactWireV1,
+} from "./types";
 
 // Wire noble-ed25519 v3 to noble-hashes sha512 (enables sync sign/verify).
 ed.hashes.sha512 = sha512;
@@ -73,6 +78,47 @@ export function intentDigest(intent: CredentialIntentV1): string {
   buf.set(domain, 0);
   buf.set(canonical, domain.length);
   return "0x" + toHex(sha256(buf));
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b §4 — domain-separated digests for the proof artifact and its binding.
+// Each is a raw-byte concatenation of a fixed domain label with the material,
+// matching the request-commitment construction above. "0x"-prefixed lowercase
+// hex, so a verifier (Task 5) reproduces the exact same string.
+// ---------------------------------------------------------------------------
+
+const ZK_RECEIPT_DOMAIN = "CTN_ZK_RECEIPT_V1";
+
+/** artifactDigest = SHA256("CTN_ZK_RECEIPT_V1" ‖ receiptBytes). Over the RAW bincode bytes. */
+export function zkArtifactDigest(receiptBytes: Uint8Array): string {
+  const domain = utf8(ZK_RECEIPT_DOMAIN);
+  const buf = new Uint8Array(domain.length + receiptBytes.length);
+  buf.set(domain, 0);
+  buf.set(receiptBytes, domain.length);
+  return "0x" + toHex(sha256(buf));
+}
+
+const DECISION_RECEIPT_DOMAIN = "CTN_DECISION_RECEIPT_V1";
+
+/** decisionReceiptDigest = SHA256("CTN_DECISION_RECEIPT_V1" ‖ canonical(PolicyDecisionReceiptV1)). */
+export function decisionReceiptDigest(receipt: PolicyDecisionReceiptV1): string {
+  const canonical = utf8(canonicalJson(receipt));
+  const domain = utf8(DECISION_RECEIPT_DOMAIN);
+  const buf = new Uint8Array(domain.length + canonical.length);
+  buf.set(domain, 0);
+  buf.set(canonical, domain.length);
+  return "0x" + toHex(sha256(buf));
+}
+
+/** JSON/SQLite transport <-> in-enclave form for a ProofArtifactV1 (Uint8Array <-> base64). */
+export function artifactToWire(artifact: ProofArtifactV1): ProofArtifactWireV1 {
+  const { receiptBytes, ...rest } = artifact;
+  return { ...rest, receiptB64: toB64(receiptBytes) };
+}
+
+export function artifactFromWire(wire: ProofArtifactWireV1): ProofArtifactV1 {
+  const { receiptB64, ...rest } = wire;
+  return { ...rest, receiptBytes: fromB64(receiptB64) };
 }
 
 // ---------------------------------------------------------------------------

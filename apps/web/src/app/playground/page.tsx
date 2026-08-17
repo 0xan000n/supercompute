@@ -33,10 +33,15 @@ const PRESETS = [
 ];
 
 interface ProofPoll {
-  proof_status: string;
+  // Phase 2b — the real five-state lifecycle. QUEUED is "waiting to prove," NOT
+  // "cryptography running."
+  proof_status: string; // QUEUED | PROVING | GENERATED | VERIFIED | FAILED | NOT_REQUIRED
+  proof_verified?: boolean;
   proof_ms?: number;
-  simulated_cost_ms?: number;
-  receipt?: { journal: Record<string, unknown>; guestImageId: string; proofSystem: string };
+  guest_image_id?: string;
+  artifact_digest?: string;
+  // The five-field public journal, decoded from the real receipt (never prompt-derived).
+  decoded_journal?: Record<string, unknown> | null;
   verification?: { valid: boolean; checks: Array<{ name: string; pass: boolean; detail?: string }> };
   error?: string;
 }
@@ -182,12 +187,20 @@ export default function PlaygroundPage() {
       const started = performance.now();
       const tick = setInterval(() => setProofElapsed(performance.now() - started), 100);
       try {
+        // Phase 2b — poll to a TERMINAL state (VERIFIED or FAILED). NO wall-clock
+        // cap: a real STARK takes minutes, and QUEUED / PROVING / GENERATED are all
+        // still in flight. The old 90 s cap failed every legitimate proof.
         for (;;) {
           const res = await api<ProofPoll>(`/v1/requests/${requestId}/proof`);
           setProof(res);
-          if (res.proof_status !== "PROVING" && res.proof_status !== "QUEUED") break;
-          if (performance.now() - started > 90_000) break;
-          await new Promise((r) => setTimeout(r, 350));
+          if (
+            res.proof_status === "VERIFIED" ||
+            res.proof_status === "FAILED" ||
+            res.proof_status === "NOT_REQUIRED"
+          ) {
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 1000));
         }
       } finally {
         clearInterval(tick);
@@ -254,12 +267,16 @@ export default function PlaygroundPage() {
                     : "idle",
         detail:
           proofStatus === "VERIFIED"
-            ? `verified · journal bound to the commitment`
+            ? `verified against the pinned image · journal bound to the commitment`
             : proofStatus === "FAILED"
               ? (proof?.error ?? "proof failed")
-              : reached(["proving", "done"])
-                ? "proving in parallel with inference"
-                : undefined,
+              : proofStatus === "QUEUED"
+                ? "queued — waiting to prove (not yet running)"
+                : proofStatus === "GENERATED"
+                  ? "receipt generated — verifying against the pinned image"
+                  : reached(["proving", "done"])
+                    ? "generating a real zero-knowledge proof (~2 min)"
+                    : undefined,
         durationMs: proof?.proof_ms ?? (reached(["proving"]) ? proofElapsed : undefined),
       },
       {
@@ -510,11 +527,11 @@ export default function PlaygroundPage() {
                     <Check key={check.name} pass={check.pass} name={check.name} detail={check.detail} />
                   ))}
                 </div>
-                {proof.receipt?.journal && (
+                {proof.decoded_journal && (
                   <div className="mt-3 border-t border-hairline pt-2.5">
                     <SectionLabel>Public journal — everything the proof reveals</SectionLabel>
                     <pre className="mono mt-2 overflow-x-auto rounded-[10px] border border-hairline bg-abyss p-3 text-[11px] leading-relaxed text-ink-2">
-                      {JSON.stringify(proof.receipt.journal, null, 2)}
+                      {JSON.stringify(proof.decoded_journal, null, 2)}
                     </pre>
                     <p className="mt-1.5 text-[11px] text-ink-4">
                       No prompt, no scores, no matched phrases, no reason.

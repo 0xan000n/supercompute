@@ -595,21 +595,23 @@ async function runSecureRequest(
 
   // §4 — enqueue the proof of the verdict for EVERY gated request: ALLOW, DENY,
   // and (below) no-capacity. The enclave already started proving at the gate;
-  // this records the coordinator-side job and watches it to a terminal state.
+  // this records the coordinator-side job (status QUEUED — "waiting to prove,"
+  // NOT "cryptography running") and watches it through the real five-state
+  // machine to a terminal state.
   if (gate.proofStarted) {
-    db.prepare(`UPDATE requests SET proof_status = 'PROVING' WHERE id = ?`).run(requestId);
-    // The proof is still SIMULATED in this build phase, so its image is the
-    // preview `pkg.guestImageId` (Task 3 migrates it to the guest daemon image).
-    // The authoritative GATE image (`gate.imageId`) lives on the decision receipt.
+    db.prepare(`UPDATE requests SET proof_status = 'QUEUED' WHERE id = ?`).run(requestId);
+    // The proof is a REAL risc0 STARK now; its image is the guest image the gate
+    // ran (`gate.imageId` == the decision receipt's), unifying identity across the
+    // decision receipt, the proof journal, and the compute receipt.
     db.prepare(
       `INSERT INTO proofs (id, request_id, proof_system, guest_image_id, status, created_at)
-       VALUES (?, ?, 'simulated-reexec', ?, 'PROVING', ?)`
-    ).run(`proof_${requestId}`, requestId, pkg.guestImageId, nowIso());
-    emitEvent("proof.started", requestId, {
+       VALUES (?, ?, 'risc0', ?, 'QUEUED', ?)`
+    ).run(`proof_${requestId}`, requestId, gate.imageId, nowIso());
+    emitEvent("proof.queued", requestId, {
       request_id: requestId,
       policy_id: guestPolicyId,
-      proof_system: "simulated-reexec",
-      guest_image_id: pkg.guestImageId,
+      proof_system: "risc0",
+      guest_image_id: gate.imageId,
     });
     watchProof(requestId);
   }
@@ -968,7 +970,7 @@ async function runSecureRequest(
         request_commitment: result.commitment,
         policy: "safety-v1",
         policy_id: result.policyId,
-        proof_status: "PROVING",
+        proof_status: "QUEUED",
         signed_receipt: result.receipt,
       },
       route: {
@@ -1108,11 +1110,12 @@ app.get("/v1/policy/test/:testId/proof", async (request, reply) => {
     return {
       test_id: testId,
       proof_status: res.status,
+      proof_verified: res.proofVerified ?? false,
       proof_ms: res.proofMs,
-      simulated_cost_ms: res.simulatedCostMs,
       error: res.error,
-      receipt: res.proof,
-      verification: res.verification,
+      decoded_journal: res.decodedJournal ?? null,
+      artifact_digest: res.artifactDigest ?? null,
+      verification: res.verification ?? null,
     };
   } catch (err) {
     if (err instanceof EnclaveRejectionError) {
@@ -1145,49 +1148,97 @@ app.get("/v1/policy", async () => ({
 // §29, §32 — proof and receipt retrieval
 // ---------------------------------------------------------------------------
 
-/** Polls the enclave until proving settles, then records the artifact (§32). */
+/**
+ * Phase 2b §6 — poll the enclave through the REAL five-state machine
+ * (QUEUED → PROVING → GENERATED → VERIFIED/FAILED) and record the artifact (§32).
+ *
+ * NO flat wall-clock deadline. Phase 2a proofs run 113–135 s BEFORE any queue
+ * wait, so the old 120 s deadline failed normal proofs. Termination is
+ * STATE-based: keep polling while the daemon reports QUEUED/PROVING/GENERATED;
+ * end only on a daemon FAILED, a PROVER_UNAVAILABLE, or a generous absolute
+ * ceiling (15 min, well above the measured max + plausible queue wait). QUEUED
+ * time never counts against a proving deadline because there is no proving
+ * deadline — only the absolute ceiling.
+ */
+const PROOF_ABSOLUTE_CEILING_MS = 15 * 60 * 1000;
+
 function watchProof(requestId: string): void {
-  const deadline = Date.now() + 120_000;
+  const ceiling = Date.now() + PROOF_ABSOLUTE_CEILING_MS;
+  // Track the last projected status so we emit an event only on a real transition.
+  let lastStatus: string | null = "QUEUED";
+
+  const markFailed = (error: string, proofMs: number | null): void => {
+    db.prepare(`UPDATE requests SET proof_status = 'FAILED', proof_ms = ? WHERE id = ?`).run(proofMs, requestId);
+    db.prepare(
+      `UPDATE proofs SET status = 'FAILED', error = ?, proof_ms = ?, completed_at = ? WHERE request_id = ?`
+    ).run(error, proofMs, nowIso(), requestId);
+    db.prepare(
+      `UPDATE requests SET trust_status = 'CONFIDENTIAL_PROOF_FAILED' WHERE id = ? AND privacy_mode = 'secure'`
+    ).run(requestId);
+    emitEvent("proof.failed", requestId, { request_id: requestId, error, proof_ms: proofMs ?? 0 });
+    safeLog("warn", "proof.failed", { request_id: requestId, error });
+  };
+
   const poll = async (): Promise<void> => {
-    if (Date.now() > deadline) {
-      db.prepare(`UPDATE requests SET proof_status = 'FAILED' WHERE id = ?`).run(requestId);
-      db.prepare(`UPDATE proofs SET status = 'FAILED', error = 'timed out', completed_at = ? WHERE request_id = ?`)
-        .run(nowIso(), requestId);
-      emitEvent("proof.failed", requestId, { request_id: requestId, error: "timed out", proof_ms: 0 });
+    if (Date.now() > ceiling) {
+      markFailed("proving exceeded the 15-minute absolute ceiling", null);
       return;
     }
     let res;
     try {
       res = await teeClient.proof(requestId);
-    } catch {
+    } catch (err) {
+      // A transient relay/daemon hiccup is NOT a proof failure — keep polling. A
+      // genuine PROVER_UNAVAILABLE surfaces as an EnclaveRejectionError code.
+      if (err instanceof EnclaveRejectionError && err.code === "PROVER_UNAVAILABLE") {
+        markFailed("PROVER_UNAVAILABLE during proving", null);
+        return;
+      }
       setTimeout(() => void poll(), 500);
       return;
     }
 
-    if (res.status === "PROVING") {
-      setTimeout(() => void poll(), 250);
+    // Mid-flight states: record the transition and keep polling. QUEUED renders as
+    // "waiting to prove"; GENERATED means a receipt exists but is NOT yet verified.
+    // Both the request row (the summary) AND the proofs row (what the /proof polling
+    // endpoint reads) are kept in step, so a poller sees the real five-state walk.
+    if (res.status === "QUEUED" || res.status === "PROVING" || res.status === "GENERATED") {
+      db.prepare(`UPDATE requests SET proof_status = ? WHERE id = ?`).run(res.status, requestId);
+      db.prepare(`UPDATE proofs SET status = ?, receipt_digest = COALESCE(?, receipt_digest) WHERE request_id = ?`).run(
+        res.status,
+        res.artifactDigest ?? null,
+        requestId
+      );
+      if (res.status !== lastStatus) {
+        lastStatus = res.status;
+        if (res.status === "PROVING") {
+          emitEvent("proof.started", requestId, {
+            request_id: requestId,
+            proof_system: "risc0",
+            guest_image_id: res.imageId ?? "",
+          });
+        } else if (res.status === "GENERATED") {
+          emitEvent("proof.generated", requestId, {
+            request_id: requestId,
+            proof_system: "risc0",
+            guest_image_id: res.imageId ?? "",
+            artifact_digest: res.artifactDigest ?? "",
+          });
+        }
+      }
+      setTimeout(() => void poll(), 400);
       return;
     }
 
     if (res.status === "FAILED") {
       // §59 — inference stays COMPLETE; the proof failure is recorded, not hidden.
-      db.prepare(`UPDATE requests SET proof_status = 'FAILED', proof_ms = ? WHERE id = ?`)
-        .run(res.proofMs ?? null, requestId);
-      db.prepare(
-        `UPDATE proofs SET status = 'FAILED', error = ?, proof_ms = ?, completed_at = ? WHERE request_id = ?`
-      ).run(res.error ?? "unknown", res.proofMs ?? null, nowIso(), requestId);
-      db.prepare(
-        `UPDATE requests SET trust_status = 'CONFIDENTIAL_PROOF_FAILED' WHERE id = ? AND privacy_mode = 'secure'`
-      ).run(requestId);
-      emitEvent("proof.failed", requestId, {
-        request_id: requestId,
-        error: res.error ?? "unknown",
-        proof_ms: res.proofMs ?? 0,
-      });
+      markFailed(res.error ?? "unknown", res.proofMs ?? null);
       return;
     }
 
-    const verified = res.status === "VERIFIED" && res.verification?.valid === true;
+    // VERIFIED — the reference verifier passed server-side. `proofVerified` is the
+    // enclave's own subprocess verdict; the coordinator does not re-decide it.
+    const verified = res.status === "VERIFIED" && res.proofVerified === true;
     db.prepare(`UPDATE requests SET proof_status = ?, proof_ms = ? WHERE id = ?`).run(
       verified ? "VERIFIED" : "GENERATED",
       res.proofMs ?? null,
@@ -1195,15 +1246,14 @@ function watchProof(requestId: string): void {
     );
     db.prepare(
       `UPDATE proofs SET status = ?, verified = ?, receipt_blob = ?, receipt_digest = ?, binding_json = ?,
-              proof_ms = ?, simulated_cost_ms = ?, completed_at = ? WHERE request_id = ?`
+              proof_ms = ?, completed_at = ? WHERE request_id = ?`
     ).run(
-      res.status,
+      verified ? "VERIFIED" : "GENERATED",
       verified ? 1 : 0,
-      JSON.stringify(res.proof),
-      res.digest ?? null,
+      res.artifact ? JSON.stringify(res.artifact) : null,
+      res.artifactDigest ?? null,
       res.binding ? JSON.stringify(res.binding) : null,
       res.proofMs ?? null,
-      res.simulatedCostMs ?? null,
       nowIso(),
       requestId
     );
@@ -1215,9 +1265,10 @@ function watchProof(requestId: string): void {
     }
     emitEvent("proof.completed", requestId, {
       request_id: requestId,
-      proof_system: res.proof?.proofSystem ?? "simulated-reexec",
-      guest_image_id: res.proof?.guestImageId ?? "",
-      receipt_digest: res.digest ?? "",
+      proof_system: "risc0",
+      guest_image_id: res.imageId ?? "",
+      artifact_digest: res.artifactDigest ?? "",
+      decision_receipt_digest: res.decisionReceiptDigest ?? "",
       proof_ms: res.proofMs ?? 0,
       verified,
     });
@@ -1237,11 +1288,16 @@ app.get("/v1/requests/:requestId/proof", async (request, reply) => {
   if (!req) return reply.code(404).send({ error: { code: "CTN_INTERNAL", message: "unknown request" } });
   if (!row) return { request_id: requestId, proof_status: "NOT_REQUIRED" };
 
-  const proof = row.receipt_blob ? JSON.parse(row.receipt_blob as string) : null;
+  // The stored blob is a real ProofArtifactWireV1 once GENERATED. Independent
+  // verification RE-RUNS the reference verifier in the enclave (not an ed25519
+  // seal check) — the digest a viewer sees is only trustworthy if this passes.
+  const artifact = row.receipt_blob
+    ? (JSON.parse(row.receipt_blob as string) as import("@ctn/protocol").ProofArtifactWireV1)
+    : null;
   let verification: unknown = null;
-  if (proof) {
+  if (artifact) {
     verification = await teeClient
-      .verify({ proof })
+      .verify({ artifact })
       .then((r) => r.proof)
       .catch(() => null);
   }
@@ -1250,15 +1306,17 @@ app.get("/v1/requests/:requestId/proof", async (request, reply) => {
     request_id: requestId,
     request_commitment: req.request_commitment,
     policy_id: req.policy_id,
-    decision: req.policy_result,
+    decision: req.policy_result ?? artifact?.decodedJournal.decision ?? null,
     proof_system: row.proof_system,
     guest_image_id: row.guest_image_id,
     proof_status: row.status,
+    proof_verified: row.verified === 1,
     proof_ms: row.proof_ms,
-    simulated_cost_ms: row.simulated_cost_ms,
     error: row.error,
-    receipt: proof,
-    receipt_digest: row.receipt_digest,
+    artifact_digest: row.receipt_digest,
+    decoded_journal: artifact?.decodedJournal ?? null,
+    artifact,
+    binding: row.binding_json ? JSON.parse(row.binding_json as string) : null,
     verification,
   };
 });
@@ -1283,12 +1341,14 @@ app.get("/v1/requests/:requestId/receipt", async (request, reply) => {
         enclaveSignature: receiptRow.signature as string,
       }
     : null;
-  const proof = proofRow?.receipt_blob ? JSON.parse(proofRow.receipt_blob as string) : undefined;
+  const artifact = proofRow?.receipt_blob
+    ? (JSON.parse(proofRow.receipt_blob as string) as import("@ctn/protocol").ProofArtifactWireV1)
+    : undefined;
   const binding = proofRow?.binding_json ? JSON.parse(proofRow.binding_json as string) : undefined;
 
   let verification: unknown = null;
   if (signedReceipt) {
-    verification = await teeClient.verify({ receipt: signedReceipt, proof, binding }).catch(() => null);
+    verification = await teeClient.verify({ receipt: signedReceipt, artifact, binding }).catch(() => null);
   }
 
   return {
@@ -1297,7 +1357,7 @@ app.get("/v1/requests/:requestId/receipt", async (request, reply) => {
     proof_status: req.proof_status,
     trust_status: req.trust_status,
     signed_receipt: signedReceipt,
-    proof,
+    proof_artifact: artifact,
     proof_binding: binding,
     verification,
   };
@@ -1364,8 +1424,11 @@ app.get("/v1/requests/:requestId", async (request, reply) => {
           proofSystem: proofRow.proof_system,
           guestImageId: proofRow.guest_image_id,
           proofMs: proofRow.proof_ms,
-          simulatedCostMs: proofRow.simulated_cost_ms,
-          digest: proofRow.receipt_digest,
+          artifactDigest: proofRow.receipt_digest,
+          decisionReceiptDigest: proofRow.binding_json
+            ? (JSON.parse(proofRow.binding_json as string) as import("@ctn/protocol").SignedProofBindingV2).binding
+                .decisionReceiptDigest
+            : null,
           error: proofRow.error,
         }
       : null,

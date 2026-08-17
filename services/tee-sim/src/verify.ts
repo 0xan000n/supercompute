@@ -7,8 +7,14 @@
  * (receipt validity, guest image id match, journal/commitment match, decision),
  * so replacing the proof system does not change any caller.
  */
-import { verifyCanonical, canonicalHash, verifyDigestHex } from "@ctn/protocol";
-import type { PolicyDecision, ProofReceipt, SignedComputeReceipt, SignedProofBinding } from "@ctn/protocol";
+import { verifyCanonical, verifyDigestHex, zkArtifactDigest } from "@ctn/protocol";
+import type {
+  PolicyDecision,
+  ProofArtifactV1,
+  ProofReceipt,
+  SignedComputeReceipt,
+  SignedProofBindingV2,
+} from "@ctn/protocol";
 
 export interface VerificationCheck {
   name: string;
@@ -114,8 +120,9 @@ export function verifyComputeReceipt(
   signed: SignedComputeReceipt,
   expected: {
     enclaveSigningPublicKey: string;
-    proof?: ProofReceipt;
-    binding?: SignedProofBinding;
+    /** Phase 2b — the real proof artifact (bincode receipt + decoded journal). */
+    artifact?: ProofArtifactV1;
+    binding?: SignedProofBindingV2;
   }
 ): VerificationResult {
   const checks: VerificationCheck[] = [];
@@ -130,18 +137,20 @@ export function verifyComputeReceipt(
     pass: signed.receipt.policy.decision === "ALLOW",
   });
 
-  if (expected.proof) {
-    const digest = "0x" + canonicalHash(expected.proof);
+  if (expected.artifact) {
+    const journal = expected.artifact.decodedJournal;
+    const artifactDigest = zkArtifactDigest(expected.artifact.receiptBytes);
 
-    // Rule 8 — the load-bearing check.
+    // Rule 8 — the load-bearing check: the proof and the receipt are about the
+    // SAME request and the SAME policy identity.
     checks.push({
       name: "proof journal commitment equals receipt commitment",
-      pass: expected.proof.journal.requestCommitment === signed.receipt.requestCommitment,
+      pass: journal.requestCommitment === signed.receipt.requestCommitment,
       detail: signed.receipt.requestCommitment,
     });
     checks.push({
       name: "proof policy id equals receipt policy id",
-      pass: expected.proof.journal.policyId === signed.receipt.policy.policyId,
+      pass: journal.policyId === signed.receipt.policy.policyId,
     });
 
     const embedded = signed.receipt.policy.zkReceiptDigest;
@@ -149,13 +158,13 @@ export function verifyComputeReceipt(
       checks.push({
         name: "receipt was signed before proving finished",
         pass: true,
-        detail: "expected: proving runs in parallel with inference; the digest is bound by the ProofBinding",
+        detail: "expected: proving runs in parallel with inference; the digest is bound by the ProofBindingV2",
       });
     } else {
       checks.push({
-        name: "receipt zkReceiptDigest matches the supplied proof",
-        pass: embedded === digest,
-        detail: digest,
+        name: "receipt zkReceiptDigest matches the artifact digest",
+        pass: embedded === artifactDigest,
+        detail: artifactDigest,
       });
     }
 
@@ -166,13 +175,17 @@ export function verifyComputeReceipt(
         pass: verifyCanonical(b, expected.binding.enclaveSignature, expected.enclaveSigningPublicKey),
       });
       checks.push({
-        name: "proof binding commits to this proof digest",
-        pass: b.zkReceiptDigest === digest,
-        detail: b.zkReceiptDigest,
+        name: "proof binding commits to this artifact digest",
+        pass: b.artifactDigest === artifactDigest,
+        detail: b.artifactDigest,
       });
       checks.push({
-        name: "proof binding commits to this receipt commitment",
-        pass: b.requestCommitment === signed.receipt.requestCommitment,
+        name: "proof binding decision id matches the receipt policy id",
+        pass: b.policyId === signed.receipt.policy.policyId,
+      });
+      checks.push({
+        name: "proof binding carries a decision-receipt digest",
+        pass: typeof b.decisionReceiptDigest === "string" && b.decisionReceiptDigest.length > 0,
       });
       checks.push({
         name: "proof binding reports the proof verified",

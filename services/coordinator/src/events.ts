@@ -298,6 +298,24 @@ function project(eventType: CtnEventType, payload: Record<string, unknown>): voi
       });
       break;
 
+    /**
+     * Phase 2b — the real five-state machine. `proof.queued` renders as "waiting
+     * to prove" (NOT cryptography running); `proof.started` is PROVING;
+     * `proof.generated` is GENERATED (a receipt exists but is NOT yet verified);
+     * `proof.completed` is VERIFIED (the reference verifier passed — the payload
+     * says so, never hardcoded); `proof.failed` is FAILED.
+     */
+    case "proof.queued":
+      upsertNode({
+        id: `proof:${s("request_id")}`,
+        type: "Proof",
+        label: "Policy Proof",
+        status: "QUEUED",
+        meta: { proofSystem: s("proof_system") ?? "", policyId: s("policy_id") ?? "" },
+      });
+      upsertLink(`req:${s("request_id")}`, `proof:${s("request_id")}`, "HAS_PROOF");
+      break;
+
     case "proof.started":
       upsertNode({
         id: `proof:${s("request_id")}`,
@@ -309,18 +327,37 @@ function project(eventType: CtnEventType, payload: Record<string, unknown>): voi
       upsertLink(`req:${s("request_id")}`, `proof:${s("request_id")}`, "HAS_PROOF");
       break;
 
+    case "proof.generated":
+      upsertNode({
+        id: `proof:${s("request_id")}`,
+        type: "Proof",
+        label: "Policy Proof",
+        // Decoded but NOT verified — the server-side verifier has not yet passed.
+        status: "GENERATED",
+        meta: {
+          proofSystem: s("proof_system") ?? "",
+          verified: false,
+          guestImageId: s("guest_image_id") ?? "",
+          artifactDigest: s("artifact_digest") ?? "",
+        },
+      });
+      break;
+
     case "proof.completed":
       upsertNode({
         id: `proof:${s("request_id")}`,
         type: "Proof",
         label: "Policy Proof",
-        status: "VERIFIED",
+        // VERIFIED carries the verified payload — no longer hardcoded. A proof that
+        // did not verify never emits proof.completed; it emits proof.failed.
+        status: (payload.verified as boolean) ? "VERIFIED" : "GENERATED",
         meta: {
           proofSystem: s("proof_system") ?? "",
-          verified: true,
+          verified: (payload.verified as boolean) ?? false,
           durationMs: n("proof_ms") ?? 0,
           guestImageId: s("guest_image_id") ?? "",
-          receiptDigest: s("receipt_digest") ?? "",
+          artifactDigest: s("artifact_digest") ?? "",
+          decisionReceiptDigest: s("decision_receipt_digest") ?? "",
         },
       });
       break;

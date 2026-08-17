@@ -12,6 +12,7 @@
  */
 import Fastify from "fastify";
 import {
+  artifactToWire,
   canonicalBytes,
   canonicalHash,
   canonicalJson,
@@ -27,7 +28,7 @@ import {
   type SecureRequestEnvelope,
   type SignedComputeReceipt,
   type SignedPolicyDecisionReceiptV1,
-  type SignedProofBinding,
+  type SignedProofBindingV2,
 } from "@ctn/protocol";
 import { hpkeSeal } from "@ctn/protocol";
 import { loadPolicyPackage } from "@ctn/policy";
@@ -42,17 +43,19 @@ import {
 } from "./authorize.js";
 import { buildRegistry, type ProviderOutcome } from "./providers.js";
 import { Prover, type ProofWitness } from "./prover.js";
-import { verifyAttestation, verifyProof, verifyComputeReceipt } from "./verify.js";
+import { verifyAttestation, verifyComputeReceipt } from "./verify.js";
+import { runReferenceVerify, type VerifierPaths } from "./proof-verify.js";
 import { enclaveSafe } from "./enclave-log.js";
 import { ProverClient, ProverUnavailableError, type ProverHealth } from "./prover-client.js";
 import { PendingGates } from "./pending-gates.js";
 import { randomUUID } from "node:crypto";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const PORT = Number(process.env.TEE_PORT ?? 4400);
 // Loopback locally; the hosted build binds all interfaces behind the platform router.
 const pkg = loadPolicyPackage();
 const tee = await SimulatedTEE.boot({ policyIds: ["safety-v1"], policyId: pkg.policyId });
-const prover = new Prover(tee, pkg);
 const registry = buildRegistry();
 const vaultKey = tee.unsealVaultKey();
 
@@ -63,6 +66,17 @@ const vaultKey = tee.unsealVaultKey();
 // ---------------------------------------------------------------------------
 const PROVER_URL = process.env.CTN_PROVER_URL ?? "http://127.0.0.1:4500";
 const proverClient = new ProverClient(PROVER_URL);
+
+// Paths to the reference offline verifier and the pinned manifest. The enclave
+// spawns `prover/verify` (no FFI) against `prover/release.json` before any proof
+// is allowed to reach VERIFIED (§4). Root is three levels up from this file.
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+const VERIFIER_PATHS: VerifierPaths = {
+  binPath: process.env.CTN_PROVER_VERIFY_BIN ?? join(REPO_ROOT, "prover", "verify", "target", "release", "prover-verify"),
+  releasePath: process.env.CTN_PROVER_RELEASE ?? join(REPO_ROOT, "prover", "release.json"),
+  policyDir: process.env.CTN_PROVER_POLICY_DIR ?? join(REPO_ROOT, "policy", "v1"),
+};
+const prover = new Prover(tee, pkg, { proverClient, verifierPaths: VERIFIER_PATHS });
 
 /**
  * The guest's authoritative identity, learned from `/health` — `POLICY_ID_V2`
@@ -475,6 +489,8 @@ function witnessFor(outcome: GateOutcome): ProofWitness {
     requestNonce: outcome.payload.requestNonce,
     requestCommitment: outcome.commitment,
     decision: outcome.decision,
+    // The signed decision this proof binds to (ProofBindingV2.decisionReceiptDigest).
+    decisionReceipt: outcome.decisionReceipt.receipt,
   };
 }
 
@@ -655,13 +671,17 @@ async function runDispatch(outcome: GateOutcome, candidates: CandidateRecord[]) 
   const providerSuccess = success.outcome;
   const totalMs = Math.round(performance.now() - t0);
 
-  // §30 — the compute receipt. Its `policy.policyId` stays the SIMULATED prover's
-  // preview identity (`pkg.policyId`) in this build phase so the proof↔receipt
-  // binding still verifies; Task 3 migrates the proof to the guest identity.
+  // §30 — the compute receipt. Phase 2b Task 3: `policy.policyId` is unified onto
+  // the GUEST `POLICY_ID_V2` (from the decision receipt), so a single policy
+  // identity now spans the decision receipt, the real proof journal, and this
+  // receipt. `zkReceiptDigest` normally reads "pending" — proving runs ~2 min in
+  // parallel and the receipt is signed as soon as inference finishes; the finished
+  // artifactDigest is bound by the separate signed ProofBindingV2.
+  const guestPolicyId = outcome.decisionReceipt.receipt.policyId;
   const proofRecord = prover.get(outcome.requestId);
   const zkReceiptDigest =
     proofRecord && (proofRecord.state.status === "GENERATED" || proofRecord.state.status === "VERIFIED")
-      ? proofRecord.state.digest
+      ? proofRecord.state.artifactDigest
       : "pending";
 
   const receipt: ComputeReceipt = {
@@ -669,7 +689,7 @@ async function runDispatch(outcome: GateOutcome, candidates: CandidateRecord[]) 
     requestId: outcome.requestId,
     requestCommitment: authorized.requestCommitment,
     tee: { mode: tee.mode, buildId: tee.buildId, attestationDigest: tee.attestationDigest() },
-    policy: { policyId: pkg.policyId, decision: "ALLOW", zkReceiptDigest },
+    policy: { policyId: guestPolicyId, decision: "ALLOW", zkReceiptDigest },
     route: {
       provider: success.provider,
       model: authorized.request.model,
@@ -821,40 +841,55 @@ app.post("/execute", async (request, reply) => {
   return await runDispatch(outcome, candidates ?? []);
 });
 
-/** §32 — proof state is polled because proving may finish after inference. */
+/**
+ * §32 — proof state is polled because proving may finish after inference. Phase
+ * 2b: the FIVE-state machine (QUEUED / PROVING / GENERATED / VERIFIED / FAILED).
+ * QUEUED means "waiting to prove," NOT "cryptography running." `proofVerified` is
+ * only ever true once the reference `prover/verify` subprocess passed (§4).
+ */
 app.get("/proofs/:requestId", async (request, reply) => {
   const { requestId } = request.params as { requestId: string };
   const record = prover.get(requestId);
   if (!record) return reply.code(404).send({ status: "NOT_REQUIRED" });
 
-  const base = { requestId, simulatedCostMs: record.simulatedCostMs };
-  if (record.state.status === "PROVING") {
-    return { ...base, status: "PROVING" };
+  const s = record.state;
+  const base = { requestId, proofSystem: "risc0" as const, proofNonce: record.proofNonce };
+
+  if (s.status === "QUEUED" || s.status === "PROVING") {
+    return { ...base, status: s.status, proofVerified: false };
   }
-  if (record.state.status === "FAILED") {
-    return { ...base, status: "FAILED", error: record.state.error, proofMs: record.state.proofMs };
+  if (s.status === "FAILED") {
+    return { ...base, status: "FAILED", proofVerified: false, error: s.error, proofMs: s.proofMs };
   }
-  const { proof, proofMs, digest } = record.state;
-  const verification = verifyProof(proof, {
-    expectedGuestImageId: pkg.guestImageId,
-    expectedPolicyId: pkg.policyId,
-    expectedCommitment: proof.journal.requestCommitment,
-    // DENY requests are gated and proved too; the decision was locked against the
-    // gate verdict at generation time, so re-verify against the journal's own.
-    expectedDecision: proof.journal.decision,
-    proverPublicKey: tee.proverPublicKey,
-  });
+  if (s.status === "GENERATED") {
+    // Decoded but NOT YET verified — the subprocess is still to run (or has just
+    // completed and the transition to VERIFIED/FAILED is imminent).
+    return {
+      ...base,
+      status: "GENERATED",
+      proofVerified: false,
+      proofMs: s.proofMs,
+      imageId: s.artifact.imageId,
+      decodedJournal: s.artifact.decodedJournal,
+      artifactDigest: s.artifactDigest,
+      artifact: artifactToWire(s.artifact),
+    };
+  }
+  // VERIFIED — the STARK checked out against the pinned manifest and the journal
+  // is bound to the gate journal.
   return {
     ...base,
-    status: record.state.status,
-    proof,
-    proofMs,
-    digest,
-    verification,
-    proverPublicKey: tee.proverPublicKey,
+    status: "VERIFIED",
+    proofVerified: true,
+    proofMs: s.proofMs,
+    imageId: s.artifact.imageId,
+    decodedJournal: s.artifact.decodedJournal,
+    artifactDigest: s.artifactDigest,
+    decisionReceiptDigest: s.decisionReceiptDigest,
+    verification: { ok: s.verification.ok, checks: s.verification.checks },
+    artifact: artifactToWire(s.artifact),
+    binding: s.binding,
     enclaveSigningPublicKey: tee.signingPublicKey,
-    // Rule 8 — present once proving settles; binds this proof to the receipt.
-    binding: record.state.status === "VERIFIED" ? record.state.binding : undefined,
   };
 });
 
@@ -887,11 +922,23 @@ app.post("/policy-test", async (request, reply) => {
 
   if (gate.decision === "ALLOW") {
     const w = gate.authorized.witness();
+    // Policy Lab is the PREVIEW surface, so the decision receipt it binds to
+    // carries the PREVIEW identity (pkg), labelled non-authoritative (Task 4). The
+    // proof itself is still real (the daemon proves w's canonical bytes).
+    const previewReceipt: PolicyDecisionReceiptV1 = {
+      requestId: testId,
+      requestCommitment: gate.commitment,
+      policyId: pkg.policyId,
+      decision: "ALLOW",
+      imageId: pkg.guestImageId,
+      timing: { gateWallMs: gate.policyMs },
+    };
     prover.start(testId, {
       canonicalRequest: w.canonicalRequest,
       requestNonce: w.requestNonce,
       requestCommitment: gate.commitment,
       decision: "ALLOW",
+      decisionReceipt: previewReceipt,
     });
   }
   return {
@@ -905,26 +952,42 @@ app.post("/policy-test", async (request, reply) => {
   };
 });
 
-/** Verification endpoint used by the receipt viewer and the CLI. */
+/**
+ * Verification endpoint used by the receipt viewer and the CLI. Phase 2b: a proof
+ * is a real STARK, so verifying it means RE-RUNNING the reference `prover/verify`
+ * subprocess against the pinned manifest (fast, ~tens of ms), NOT checking an
+ * ed25519 seal. The compute receipt's own signature + its binding to the artifact
+ * are checked in TypeScript.
+ */
 app.post("/verify", async (request) => {
   const body = request.body as {
-    proof?: Parameters<typeof verifyProof>[0];
+    artifact?: import("@ctn/protocol").ProofArtifactWireV1;
     receipt?: SignedComputeReceipt;
-    binding?: SignedProofBinding;
+    binding?: SignedProofBindingV2;
   };
   const result: Record<string, unknown> = {};
-  if (body.proof) {
-    result.proof = verifyProof(body.proof, {
-      expectedGuestImageId: pkg.guestImageId,
-      expectedPolicyId: pkg.policyId,
-      expectedCommitment: body.receipt?.receipt.requestCommitment ?? body.proof.journal.requestCommitment,
-      proverPublicKey: tee.proverPublicKey,
-    });
+  let artifact: import("@ctn/protocol").ProofArtifactV1 | undefined;
+  if (body.artifact) {
+    const { artifactFromWire } = await import("@ctn/protocol");
+    artifact = artifactFromWire(body.artifact);
+    const sub = await runReferenceVerify(
+      artifact.receiptBytes,
+      {
+        commitment: artifact.decodedJournal.requestCommitment,
+        decision: artifact.decodedJournal.decision,
+        proofNonce: artifact.decodedJournal.proofNonce,
+      },
+      VERIFIER_PATHS
+    );
+    result.proof = {
+      valid: sub.ok,
+      checks: sub.checks.map((c) => ({ name: c.name, pass: c.pass, detail: c.detail })),
+    };
   }
   if (body.receipt) {
     result.receipt = verifyComputeReceipt(body.receipt, {
       enclaveSigningPublicKey: tee.signingPublicKey,
-      proof: body.proof,
+      artifact,
       binding: body.binding,
     });
   }

@@ -7,7 +7,7 @@ import { Badge, Check, Empty, Field, Panel, SectionLabel } from "@/components/ui
 import { usePolled } from "@/lib/api";
 import { ms, num, shortHash, usd } from "@/lib/format";
 import { TONE_CLASS, TRUST_STATUS_META } from "@/lib/theme";
-import type { ProofReceipt, SignedComputeReceipt, SignedProofBinding } from "@ctn/protocol";
+import type { ProofArtifactWireV1, SignedComputeReceipt, SignedProofBindingV2 } from "@ctn/protocol";
 
 interface ReceiptResponse {
   request_id: string;
@@ -15,8 +15,8 @@ interface ReceiptResponse {
   proof_status: string;
   trust_status: string;
   signed_receipt: SignedComputeReceipt | null;
-  proof?: ProofReceipt;
-  proof_binding?: SignedProofBinding;
+  proof_artifact?: ProofArtifactWireV1;
+  proof_binding?: SignedProofBindingV2;
   verification: {
     receipt?: { valid: boolean; checks: Array<{ name: string; pass: boolean; detail?: string }> };
     proof?: { valid: boolean; checks: Array<{ name: string; pass: boolean; detail?: string }> };
@@ -135,8 +135,8 @@ export default function ReceiptPage({ params }: { params: Promise<{ requestId: s
                     <ChainStep
                       label="…proved by"
                       value={
-                        data.proof
-                          ? `${data.proof.proofSystem} · ${shortHash(data.proof.guestImageId, 8, 4)}`
+                        data.proof_artifact
+                          ? `${data.proof_artifact.proofSystem} · ${shortHash(data.proof_artifact.imageId, 8, 4)}`
                           : "pending"
                       }
                       detail={
@@ -187,12 +187,27 @@ export default function ReceiptPage({ params }: { params: Promise<{ requestId: s
                   </pre>
                 </Panel>
 
-                {data.proof && (
+                {data.proof_artifact && (
                   <Panel className="p-4">
                     <SectionLabel>Policy proof · public journal only</SectionLabel>
                     <pre className="mono mt-2 max-h-[360px] overflow-auto rounded-[10px] border border-hairline bg-abyss p-3 text-[11px] leading-relaxed text-ink-2">
-                      {JSON.stringify(data.proof, null, 2)}
+                      {JSON.stringify(
+                        {
+                          proofSystem: data.proof_artifact.proofSystem,
+                          risc0Version: data.proof_artifact.risc0Version,
+                          receiptCodec: data.proof_artifact.receiptCodec,
+                          imageId: data.proof_artifact.imageId,
+                          journalVersion: data.proof_artifact.journalVersion,
+                          decodedJournal: data.proof_artifact.decodedJournal,
+                        },
+                        null,
+                        2
+                      )}
                     </pre>
+                    <p className="mt-1.5 text-[11px] text-ink-4">
+                      The raw {data.proof_artifact.receiptCodec} receipt is omitted here — only the
+                      five-field public journal is shown. No prompt, no scores.
+                    </p>
                   </Panel>
                 )}
               </div>

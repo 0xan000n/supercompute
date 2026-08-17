@@ -8,10 +8,10 @@
 import type {
   SecureRequestEnvelope,
   SignedComputeReceipt,
-  SignedProofBinding,
+  SignedProofBindingV2,
   SignedPolicyDecisionReceiptV1,
   AttestationBundle,
-  ProofReceipt,
+  ProofArtifactWireV1,
 } from "@ctn/protocol";
 import type { Candidate } from "./routing.js";
 
@@ -157,9 +157,9 @@ export const teeClient = {
     }>("/policy-test", { method: "POST", body: JSON.stringify({ envelope }) }),
 
   verify: (body: {
-    proof?: ProofReceipt;
+    artifact?: ProofArtifactWireV1;
     receipt?: SignedComputeReceipt;
-    binding?: SignedProofBinding;
+    binding?: SignedProofBindingV2;
   }) =>
     call<{
       proof?: VerificationReport;
@@ -247,16 +247,32 @@ export interface ExecuteResult {
   debug?: unknown;
 }
 
+/**
+ * Phase 2b §4 — the FIVE-state proof lifecycle. `proofVerified` is only true once
+ * the enclave's reference `prover/verify` subprocess has passed. `artifact` is the
+ * real bincode receipt (base64) plus its decoded 5-field journal; `binding` binds
+ * the artifact digest to the decision-receipt digest.
+ */
 export interface ProofResponse {
   requestId: string;
-  status: "PROVING" | "GENERATED" | "VERIFIED" | "FAILED" | "NOT_REQUIRED";
-  proof?: ProofReceipt;
+  status: "QUEUED" | "PROVING" | "GENERATED" | "VERIFIED" | "FAILED" | "NOT_REQUIRED";
+  proofSystem?: "risc0";
+  proofNonce?: string;
+  proofVerified?: boolean;
   proofMs?: number;
-  digest?: string;
-  simulatedCostMs?: number;
   error?: string;
-  verification?: VerificationReport;
-  proverPublicKey?: string;
+  imageId?: string;
+  decodedJournal?: {
+    protocolVersion: 1;
+    requestCommitment: string;
+    policyId: string;
+    decision: "ALLOW" | "DENY";
+    proofNonce: string;
+  };
+  artifactDigest?: string;
+  decisionReceiptDigest?: string;
+  verification?: { ok: boolean; checks: Array<{ name: string; pass: boolean; detail?: string }> };
+  artifact?: ProofArtifactWireV1;
+  binding?: SignedProofBindingV2;
   enclaveSigningPublicKey?: string;
-  binding?: SignedProofBinding;
 }

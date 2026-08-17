@@ -32,7 +32,9 @@ interface TestResult {
 interface ProofResult {
   proof_status: string;
   proof_ms?: number;
-  receipt?: { journal: Record<string, unknown>; guestImageId: string; proofSystem: string };
+  proof_verified?: boolean;
+  // Phase 2b — the real receipt's decoded five-field journal.
+  decoded_journal?: Record<string, unknown> | null;
   verification?: { valid: boolean; checks: Array<{ name: string; pass: boolean; detail?: string }> };
   error?: string;
 }
@@ -227,11 +229,11 @@ export default function PolicyPage() {
                   </div>
                 )}
 
-                {proof?.receipt?.journal && (
+                {proof?.decoded_journal && (
                   <div className="mt-3 border-t border-hairline pt-2.5">
                     <SectionLabel>Public journal — all the proof reveals</SectionLabel>
                     <pre className="mono mt-2 overflow-x-auto rounded-[10px] border border-hairline bg-abyss p-3 text-[11px] leading-relaxed text-ink-2">
-                      {JSON.stringify(proof.receipt.journal, null, 2)}
+                      {JSON.stringify(proof.decoded_journal, null, 2)}
                     </pre>
                     <p className="mt-1.5 text-[11px] text-ink-4">
                       No prompt, no category scores, no matched phrases, no reason.
