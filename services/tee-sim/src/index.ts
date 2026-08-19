@@ -55,7 +55,10 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PORT = Number(process.env.TEE_PORT ?? 4400);
-// Loopback locally; the hosted build binds all interfaces behind the platform router.
+// Loopback locally; the hosted build binds all interfaces behind the platform
+// router. A container sets HOST=:: so coordinator can reach it over Railway's
+// IPv6 private network. The enclave never gets a public domain.
+const HOST = process.env.HOST ?? "127.0.0.1";
 const pkg = loadPolicyPackage();
 const tee = await SimulatedTEE.boot({ policyIds: ["safety-v1"], policyId: pkg.policyId });
 const registry = buildRegistry();
@@ -1064,8 +1067,8 @@ app.post("/verify", async (request) => {
 });
 
 app
-  .listen({ port: PORT, host: "127.0.0.1" })
-  .then(() => console.log(`[tee-sim] listening on http://127.0.0.1:${PORT} (${tee.mode})`))
+  .listen({ port: PORT, host: HOST })
+  .then(() => console.log(`[tee-sim] listening on http://${HOST}:${PORT} (${tee.mode})`))
   .catch((err) => {
     console.error(err);
     process.exit(1);

@@ -23,6 +23,9 @@ import {
 } from "./tee-client.js";
 
 const PORT = Number(process.env.COORDINATOR_PORT ?? 4200);
+// §deploy — bind loopback locally; a container sets HOST=:: so Railway's proxy
+// and private networking (IPv6) can reach it. Never widened in local dev.
+const HOST = process.env.HOST ?? "127.0.0.1";
 const CTN_ENV = process.env.CTN_ENV ?? "local";
 const pkg = loadPolicyPackage();
 
@@ -1587,10 +1590,10 @@ app.get("/v1/stats", async () => {
 });
 
 app
-  .listen({ port: PORT, host: "127.0.0.1" })
+  .listen({ port: PORT, host: HOST })
   .then(() => {
-    safeLog("info", "coordinator.listening", { port: PORT, env: CTN_ENV, policy_id: pkg.policyId });
-    console.log(`[coordinator] listening on http://127.0.0.1:${PORT} (env=${CTN_ENV})`);
+    safeLog("info", "coordinator.listening", { port: PORT, host: HOST, env: CTN_ENV, policy_id: pkg.policyId });
+    console.log(`[coordinator] listening on http://${HOST}:${PORT} (env=${CTN_ENV})`);
   })
   .catch((err) => {
     console.error(err);

@@ -28,6 +28,8 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PORT = Number(process.env.MOCK_PROVIDER_PORT ?? 4300);
+// Loopback locally; a container sets HOST=:: for Railway's IPv6 private network.
+const HOST = process.env.HOST ?? "127.0.0.1";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const CANARY_LOG = join(root, ".data", "mock-provider-received.log");
 mkdirSync(dirname(CANARY_LOG), { recursive: true });
@@ -143,8 +145,8 @@ app.post("/v1/chat/completions", async (request, response) => {
 });
 
 app
-  .listen({ port: PORT, host: "127.0.0.1" })
-  .then(() => console.log(`[mock-provider] listening on http://127.0.0.1:${PORT}`))
+  .listen({ port: PORT, host: HOST })
+  .then(() => console.log(`[mock-provider] listening on http://${HOST}:${PORT}`))
   .catch((err) => {
     console.error(err);
     process.exit(1);

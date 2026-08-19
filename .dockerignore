@@ -1,0 +1,13 @@
+# Build context hygiene. Everything a Dockerfile needs is source + manifests;
+# never ship build outputs, deps, secrets, or local state into the context.
+**/node_modules
+**/.next
+**/target
+**/*.tsbuildinfo
+.git
+.data
+.vercel
+.superpowers
+.env
+.env.local
+*.log
